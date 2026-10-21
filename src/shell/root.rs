@@ -144,7 +144,7 @@ fn shape_row(
     mono: bool,
 ) -> ShapedLine {
     let font = Font {
-        family: (if mono { crate::theme::FONT_MONO } else { crate::theme::FONT_PROSE }).into(),
+        family: (if mono { crate::theme::FONT_MONO } else { crate::theme::FONT_TEXT }).into(),
         features: FontFeatures::default(),
         fallbacks: None,
         weight,
@@ -1248,7 +1248,7 @@ impl RootView {
                                             .overflow_hidden()
                                             .children(row.segs.iter().map(|seg| {
                                                 div()
-                                                    .font_family(if seg.mono { crate::theme::FONT_MONO } else { crate::theme::FONT_PROSE })
+                                                    .font_family(if seg.mono { crate::theme::FONT_MONO } else { crate::theme::FONT_TEXT })
                                                     .text_size(px(seg.size))
                                                     .font_weight(seg.weight)
                                                     .text_color(rgba(seg.color))
@@ -1442,7 +1442,7 @@ impl RootView {
                             .font_weight(FontWeight(500.0))
                             .text_color(rgba(t.text_primary))
                             .mb(px(28.))
-                            .child("Welcome to Peekview"),
+                            .child("Welcome to Peeklet"),
                     )
                     .child(section("GET STARTED"))
                     .child(action_button("welcome-new", ICON_NEW_FILE, "New Tab", 0))

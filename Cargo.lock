@@ -3723,7 +3723,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "peekview"
+name = "peeklet"
 version = "0.1.0"
 dependencies = [
  "dirs",

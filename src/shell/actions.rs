@@ -5,7 +5,7 @@ use gpui::{Global, WeakEntity, actions};
 use super::root::RootView;
 
 actions!(
-    peekview,
+    peeklet,
     [
         Quit,
         ToggleTheme,

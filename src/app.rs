@@ -29,7 +29,7 @@ pub fn run() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(800.), px(500.))),
                 titlebar: Some(gpui::TitlebarOptions {
-                    title: Some("Peekview".into()),
+                    title: Some("Peeklet".into()),
                     appears_transparent: true,
                     traffic_light_position: None,
                 }),

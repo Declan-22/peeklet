@@ -386,8 +386,8 @@ impl gpui::RenderOnce for TabBar {
 // ---------- Bottom bar ----------
 
 /// The bottom bar is a placeholder. It used to hold the writing-related
-/// toggles (syntax layer, prose layer, word count, panel switches); all of
-/// those are gone. What lands here next is file-type aware: each viewer
+/// toggles (analysis layers, word count, panel switches); all of those are
+/// gone. What lands here next is file-type aware: each viewer
 /// (image, PDF, color palette, …) contributes its own controls.
 #[derive(IntoElement)]
 pub struct BottomBar {

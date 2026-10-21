@@ -4,7 +4,7 @@ use gpui::{BoxShadow, FontWeight, Point, px, rgba};
 pub const FONT_UI: &str = "Geist";
 pub const FONT_MONO: &str = "Paper Mono";
 // Default face for previewed text (overridable per file type).
-pub const FONT_PROSE: &str = "Geist";
+pub const FONT_TEXT: &str = "Geist";
 
 /// Emphasis weight for tabs and panel text: heavier than body, lighter
 /// than semibold.

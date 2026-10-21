@@ -23,10 +23,11 @@ pub struct Store {
 impl Store {
     pub fn open_default() -> Self {
         let dir = dirs::data_dir()
-            .map(|d| d.join("peekview"))
+            .map(|d| d.join("peeklet"))
             .unwrap_or_else(|| PathBuf::from("."));
         let _ = std::fs::create_dir_all(&dir);
-        let conn = rusqlite::Connection::open(dir.join("peekview.db")).expect("open peekview db");
+        let conn =
+            rusqlite::Connection::open(dir.join("peeklet.db")).expect("open peeklet db");
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS tabs (
                  position INTEGER PRIMARY KEY,
@@ -38,7 +39,7 @@ impl Store {
                  value TEXT NOT NULL
              );",
         )
-        .expect("init peekview db");
+        .expect("init peeklet db");
         Self { conn }
     }
 
