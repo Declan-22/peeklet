@@ -5,7 +5,7 @@ use gpui::{Global, WeakEntity, actions};
 use super::root::RootView;
 
 actions!(
-    prose,
+    peekview,
     [
         Quit,
         ToggleTheme,
@@ -17,8 +17,7 @@ actions!(
         Redo,
         Save,
         ShowWelcome,
-        ToggleProjectPanel,
-        ToggleStylingPanel,
+        ToggleFilesPanel,
     ]
 );
 

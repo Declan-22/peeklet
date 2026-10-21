@@ -33,104 +33,8 @@ impl DockView {
     }
 
     fn render_body(&self, cx: &mut App) -> AnyElement {
-        let t = *crate::theme::active(cx);
-        let muted = |s: &'static str| {
-            div()
-                .pl(px(8.))
-                .text_sm()
-                .font_weight(WEIGHT_MEDIUM)
-                .text_color(rgba(t.empty_text_primary))
-                .whitespace_nowrap()
-                .overflow_hidden()
-                .child(s)
-        };
-        // Rows run edge to edge — no right-side inset, so text crops
-        // exactly at the dock border.
         match self.visible {
-            PanelKind::Project => self.render_project(cx),
-            PanelKind::Outline => div()
-                .overflow_hidden()
-                .child(muted("No headings yet — headings appear here."))
-                .into_any_element(),
-            PanelKind::Styling => {
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.))
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .gap(px(4.))
-                            .pl(px(8.))
-                            .child(style_button("B"))
-                            .child(style_button("I"))
-                            .child(style_button("U")),
-                    )
-                    .children(["Emphasis", "Research note", "Needs revision"].into_iter().map(|name| {
-                        let root = self.root.clone();
-                        let key = match name {
-                            "Emphasis" => "E",
-                            "Research note" => "R",
-                            _ => "X",
-                        };
-                        div()
-                            .id(format!("style-row-{key}"))
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .justify_between()
-                            .px(px(8.))
-                            .py(px(4.))
-                            .rounded(px(6.))
-                            .cursor_pointer()
-                            .overflow_hidden()
-                            .hover(|s| s.bg(rgba(t.menu_hover_bg)))
-                            .on_mouse_down(MouseButton::Left, {
-                                let root = root.clone();
-                                move |_, _, cx| {
-                                    let _ = root.update(cx, |root, cx| {
-                                        root.toggle_preview_style(name, cx);
-                                    });
-                                }
-                            })
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(WEIGHT_MEDIUM)
-                                    .text_color(rgba(t.text_primary))
-                                    .whitespace_nowrap()
-                                    .overflow_hidden()
-                                    .child(name.to_string()),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(WEIGHT_MEDIUM)
-                                    .text_color(rgba(t.text_secondary))
-                                    .child(key.to_string()),
-                            )
-                    }))
-                    .into_any_element()
-            }
-            PanelKind::Inspector => div()
-                .flex()
-                .flex_col()
-                .gap(px(4.))
-                .overflow_hidden()
-                .child(muted("Words —"))
-                .child(muted("Reading time —"))
-                .child(muted("Diagnostics appear while you revise."))
-                .into_any_element(),
-            PanelKind::History => div()
-                .overflow_hidden()
-                .child(muted("No snapshots yet."))
-                .into_any_element(),
-            PanelKind::Comments => div()
-                .overflow_hidden()
-                .child(muted("No comment pins yet."))
-                .into_any_element(),
+            PanelKind::Files => self.render_project(cx),
         }
     }
 
@@ -220,23 +124,6 @@ fn project_row(root: WeakEntity<RootView>, entry: ProjectEntry, t: crate::theme:
         })
         .child(div().w(px(10.)).text_color(rgba(t.empty_text_secondary)).child(marker))
         .child(entry.name)
-        .into_any_element()
-}
-
-fn style_button(label: &'static str) -> AnyElement {
-    // Character buttons are inert until direct formatting lands; they only
-    // need to exist in layout for now.
-    div()
-        .w(px(28.))
-        .h(px(24.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(6.))
-        .cursor_pointer()
-        .text_sm()
-        .font_weight(WEIGHT_MEDIUM)
-        .child(label)
         .into_any_element()
 }
 

@@ -1,15 +1,14 @@
 //! Window chrome: top bar (hamburger menu + window controls), tab bar
-//! (undo/redo + tabs, active tab melting into the manuscript), bottom bar
-//! (panel icon toggles grouped by dock side + layer toggles).
+//! (undo/redo + tabs, active tab melting into the preview), bottom bar
+//! (placeholder for per-file-type controls).
 
 use gpui::{
-    AnyElement, App, FontWeight, MouseButton, WeakEntity, Window, WindowControlArea, div,
-    prelude::*, px, rgba, svg,
+    AnyElement, App, MouseButton, WeakEntity, Window, WindowControlArea, div, prelude::*, px,
+    rgba, svg,
 };
 
-use super::panels::{DockSide, PanelKind, ICON_PROSE_LAYER, ICON_SYNTAX};
 use super::root::{RootView, Tab};
-use crate::theme::{WEIGHT_MEDIUM, lerp_rgb};
+use crate::theme::WEIGHT_MEDIUM;
 
 pub const TOP_BAR_HEIGHT: f32 = 30.0;
 pub const TAB_BAR_HEIGHT: f32 = 32.0;
@@ -386,110 +385,20 @@ impl gpui::RenderOnce for TabBar {
 
 // ---------- Bottom bar ----------
 
+/// The bottom bar is a placeholder. It used to hold the writing-related
+/// toggles (syntax layer, prose layer, word count, panel switches); all of
+/// those are gone. What lands here next is file-type aware: each viewer
+/// (image, PDF, color palette, …) contributes its own controls.
 #[derive(IntoElement)]
 pub struct BottomBar {
+    /// Kept for the per-file-type controls that land here next.
+    #[allow(dead_code)]
     pub root: WeakEntity<RootView>,
-    pub left_panels: Vec<PanelKind>,
-    pub right_panels: Vec<PanelKind>,
-    pub visible_left: Option<PanelKind>,
-    pub visible_right: Option<PanelKind>,
-    pub dock_menu: Option<PanelKind>,
-    pub word_count: usize,
-    pub syntax_on: bool,
-    pub prose_on: bool,
-    pub syntax_menu_open: bool,
-    pub prose_menu_open: bool,
-    pub syntax_selected: [bool; 5],
-    pub prose_selected: [bool; 8],
 }
 
 impl gpui::RenderOnce for BottomBar {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl gpui::IntoElement {
         let t = *crate::theme::active(cx);
-
-        let toggle = |kind: PanelKind, is_visible: bool, popup_open: bool| {
-            let root = self.root.clone();
-            let icon_color = if is_visible { t.accent } else { t.text_secondary };
-            div()
-                .relative()
-                .child(
-                    div()
-                        .id(format!("panel-toggle-{}", kind.short_label()))
-                        .w(px(26.))
-                        .h(px(26.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(6.))
-                        .cursor_pointer()
-                        .bg(if popup_open {
-                            rgba(t.menu_hover_bg)
-                        } else {
-                            rgba(0x00000000)
-                        })
-                        .hover(|s| s.bg(rgba(t.menu_hover_bg)))
-                        // Left-click toggles visibility in its dock.
-                        .on_mouse_down(MouseButton::Left, {
-                            let root = root.clone();
-                            move |_, _, cx| {
-                                let _ = root.update(cx, |root, cx| root.toggle_panel(kind, cx));
-                            }
-                        })
-                        // Right-click opens the Dock Left / Dock Right popup.
-                        .on_mouse_down(MouseButton::Right, {
-                            let root = root.clone();
-                            move |_, _, cx| {
-                                let _ = root.update(cx, |root, cx| root.open_dock_menu(kind, cx));
-                                cx.stop_propagation();
-                            }
-                        })
-                        .child(
-                            svg()
-                                .data(kind.icon())
-                                .w(px(14.))
-                                .h(px(14.))
-                                .text_color(rgba(icon_color)),
-                        ),
-                )
-                .when(popup_open, |w| {
-                    w.child(dock_popup(kind, self.root.clone(), &self.left_panels, t, cx))
-                })
-        };
-
-        let layer = |id: &'static str, label: &'static str, icon: &'static [u8], on: bool, flag: u8, open: bool, selected: Vec<bool>| {
-            let root = self.root.clone();
-            div()
-                .relative()
-                .id(id)
-                .h(px(26.))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(5.))
-                .px(px(8.))
-                .rounded(px(6.))
-                .cursor_pointer()
-                .text_xs()
-                .font_weight(FontWeight::NORMAL)
-                .text_color(rgba(if on { t.accent } else { t.text_secondary }))
-                .hover(|s| s.bg(rgba(t.menu_hover_bg)))
-                .on_mouse_down(MouseButton::Left, {
-                    let root = root.clone();
-                    move |_, _, cx| {
-                        let _ = root.update(cx, |root, cx| root.toggle_layer(flag, cx));
-                        cx.stop_propagation();
-                    }
-                })
-                .child(
-                    svg()
-                        .data(icon)
-                        .w(px(13.))
-                        .h(px(13.))
-                        .text_color(rgba(if on { t.accent } else { t.text_secondary })),
-                )
-                .child(label)
-                .when(open, |w| w.child(layer_popup(self.root.clone(), flag, selected, t, cx)))
-        };
 
         div()
             .id("bottom-bar")
@@ -499,198 +408,8 @@ impl gpui::RenderOnce for BottomBar {
             .flex_row()
             .items_center()
             .px(px(6.))
-            .gap(px(2.))
             .bg(rgba(t.bg_secondary))
             .border_t_1()
             .border_color(rgba(t.chrome_border_color))
-            .on_mouse_down(MouseButton::Left, {
-                let root = self.root.clone();
-                move |_, _, cx| {
-                    let _ = root.update(cx, |root, cx| { root.close_dock_menu(cx); root.close_layer_menus(cx); });
-                }
-            })
-            // Left group: panels docked left.
-            .children(self.left_panels.iter().map(|k| {
-                toggle(*k, Some(*k) == self.visible_left, Some(*k) == self.dock_menu)
-            }))
-            .child(div().flex_1())
-            // Center: layer toggles + word count.
-            .child(layer("layer-syntax", "Syntax", ICON_SYNTAX, self.syntax_on, 0, self.syntax_menu_open, self.syntax_selected.to_vec()))
-            .child(layer("layer-prose", "Prose", ICON_PROSE_LAYER, self.prose_on, 1, self.prose_menu_open, self.prose_selected.to_vec()))
-            .child(
-                div()
-                    .px(px(8.))
-                    .text_xs()
-                    .font_weight(FontWeight::NORMAL)
-                    .text_color(rgba(t.text_secondary))
-                    .child(format!("{} words", self.word_count)),
-            )
-            .child(div().flex_1())
-            // Right group: panels docked right.
-            .children(self.right_panels.iter().map(|k| {
-                toggle(*k, Some(*k) == self.visible_right, Some(*k) == self.dock_menu)
-            }))
     }
-}
-
-fn layer_popup(root: WeakEntity<RootView>, layer: u8, selected: Vec<bool>, t: crate::theme::Theme, cx: &App) -> AnyElement {
-    let labels: Vec<&'static str> = if layer == 0 {
-        crate::syntax::Kind::ALL.iter().map(|k| k.label()).collect()
-    } else {
-        crate::prose::Kind::ALL.iter().map(|k| k.label()).collect()
-    };
-    div()
-        .absolute()
-        .bottom(px(30.))
-        .left(px(0.))
-        .w(px(190.))
-        .px(px(4.))
-        .py(px(4.))
-        .flex()
-        .flex_col()
-        .gap(px(2.))
-        .bg(rgba(t.bg_primary))
-        .border_1()
-        .border_color(rgba(t.menu_border_color))
-        .rounded(px(10.))
-        .shadow(vec![t.shadow_lg()])
-        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-        .children(labels.into_iter().enumerate().map(|(index, label)| {
-            let root = root.clone();
-            let on = selected.get(index).copied().unwrap_or(false);
-            let fade_id = format!("layerpopup-{layer}-{index}");
-            let k = root.upgrade().map(|s| s.read(cx).fade(&fade_id)).unwrap_or(0.0);
-            let bg = lerp_rgb(t.bg_primary, t.menu_hover_bg, k);
-            let color = if layer == 0 {
-                [t.accent, t.success, t.warning, t.error, t.info][index]
-            } else {
-                [t.warning, t.error, t.info, t.accent, t.success, t.warning, t.info, t.error][index]
-            };
-            div()
-                .id(format!("layer-check-{layer}-{index}"))
-                .h(px(24.))
-                .pl(px(4.))
-                .pr(px(4.))
-                .gap(px(8.))
-                .flex()
-                .flex_row()
-                .items_center()
-                .rounded(px(8.))
-                .cursor_pointer()
-                .text_sm()
-                .font_weight(WEIGHT_MEDIUM)
-                .text_color(rgba(t.text_primary))
-                .bg(rgba(bg))
-                .opacity(if on { 1.0 } else { 0.42 })
-                .on_hover({
-                    let root = root.clone();
-                    let fade_id = fade_id.clone();
-                    move |hovered, _, cx| {
-                        let _ = root.update(cx, |root, cx| {
-                            root.animate_fade(&fade_id, if *hovered { 1.0 } else { 0.0 }, cx);
-                        });
-                    }
-                })
-                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                    let _ = root.update(cx, |root, cx| root.toggle_check(layer, index, cx));
-                    cx.stop_propagation();
-                })
-                .child(div().w(px(8.)).h(px(8.)).rounded_full().bg(rgba(color)))
-                .child(label)
-        }))
-        .into_any_element()
-}
-
-/// Dock Left / Dock Right popup, anchored above its bottom-bar button.
-/// Styled identically to the top-bar dropdown: same panel, same rows,
-/// same background-only hover tweens. The active side shows a filled dot.
-fn dock_popup(
-    kind: PanelKind,
-    root: WeakEntity<RootView>,
-    left_panels: &[PanelKind],
-    t: crate::theme::Theme,
-    cx: &App,
-) -> AnyElement {
-    let current = if left_panels.contains(&kind) {
-        DockSide::Left
-    } else {
-        DockSide::Right
-    };
-    let row = |label: &'static str, side: DockSide| {
-        let root = root.clone();
-        let is_current = current == side;
-        // Hover tween, background-only like the dropdown entries.
-        let k = root
-            .upgrade()
-            .map(|s| s.read(cx).fade(&format!("dockpopup-{label}")))
-            .unwrap_or(0.0);
-        let bg = lerp_rgb(t.bg_primary, t.menu_hover_bg, k);
-        div()
-            .id(format!("dock-{label}-{}", kind.short_label()))
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .h(px(24.))
-            .pl(px(4.))
-            .pr(px(4.))
-            .rounded(px(8.))
-            .cursor_pointer()
-            .text_sm()
-            .font_weight(WEIGHT_MEDIUM)
-            .text_color(rgba(t.text_primary))
-            .bg(rgba(bg))
-            .on_hover({
-                let root = root.clone();
-                move |hovered, _, cx| {
-                    let _ = root.update(cx, |root, cx| {
-                        root.animate_fade(
-                            &format!("dockpopup-{label}"),
-                            if *hovered { 1.0 } else { 0.0 },
-                            cx,
-                        );
-                    });
-                }
-            })
-            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                let _ = root.update(cx, |root, cx| {
-                    root.set_dock(kind, side, cx);
-                    root.close_dock_menu(cx);
-                });
-                cx.stop_propagation();
-            })
-            .child(label)
-            .child(
-                div()
-                    .w(px(16.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .when(is_current, |slot| {
-                        slot.child(div().w(px(6.)).h(px(6.)).rounded_full().bg(rgba(t.accent)))
-                    }),
-            )
-    };
-
-    div()
-        .absolute()
-        .bottom(px(BOTTOM_BAR_HEIGHT))
-        .left(px(0.))
-        .w(px(140.))
-        .flex()
-        .flex_col()
-        .px(px(4.))
-        .py(px(4.))
-        .gap(px(2.))
-        .bg(rgba(t.bg_primary))
-        .border_1()
-        .border_color(rgba(t.menu_border_color))
-        .rounded(px(10.))
-        .shadow(vec![t.shadow_lg()])
-        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-        .child(row("Dock Left", DockSide::Left))
-        .child(row("Dock Right", DockSide::Right))
-        .into_any_element()
 }

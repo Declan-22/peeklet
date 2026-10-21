@@ -3,15 +3,12 @@ use gpui::{BoxShadow, FontWeight, Point, px, rgba};
 
 pub const FONT_UI: &str = "Geist";
 pub const FONT_MONO: &str = "Paper Mono";
-// Default manuscript face for the writing surface (overridable in settings).
+// Default face for previewed text (overridable per file type).
 pub const FONT_PROSE: &str = "Geist";
 
 /// Emphasis weight for tabs and panel text: heavier than body, lighter
 /// than semibold.
 pub const WEIGHT_MEDIUM: FontWeight = FontWeight(450.0);
-
-/// Heading weight for rendered Markdown structure.
-pub const WEIGHT_SEMIBOLD: FontWeight = FontWeight(600.0);
 
 // Fades an RGBA color's alpha byte in from transparent (0xRRGGBBAA colors).
 pub fn fade_in(color: u32, k: f32) -> u32 {

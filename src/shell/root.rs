@@ -1,4 +1,4 @@
-//! Root view: top bar, middle row (left dock + tab bar/manuscript +
+//! Root view: top bar, middle row (left dock + tab bar/preview +
 //! right dock), bottom bar, menu overlay. Owns tabs, dock layout, menus,
 //! hover tweens, and drag-resize state.
 
@@ -15,10 +15,9 @@ use super::chrome::{BOTTOM_BAR_HEIGHT, BottomBar, TAB_BAR_HEIGHT, TOP_BAR_HEIGHT
 use super::dock::{DOCK_DEFAULT_WIDTH, DockView};
 use super::dropdown::AppMenu;
 use super::panels::{DockSide, PanelKind};
-use crate::editor::{EditorState, SpanKind};
-use crate::{prose, syntax};
-use crate::persist::Store;
-use crate::theme::{WEIGHT_MEDIUM, WEIGHT_SEMIBOLD};
+use crate::editor::EditorState;
+use crate::persist::{Store, TabRecord};
+use crate::theme::WEIGHT_MEDIUM;
 
 /// Plus-in-document icon for New File.
 const ICON_NEW_FILE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
@@ -55,58 +54,35 @@ pub struct ProjectEntry {
     pub depth: usize,
 }
 
-/// Layer toggle flags for the bottom-bar cluster.
-pub const LAYER_SYNTAX: u8 = 0;
-pub const LAYER_PROSE: u8 = 1;
-
-const MANUSCRIPT_FONT_SIZE: f32 = 15.0;
-const MANUSCRIPT_LINE_HEIGHT: f32 = 24.0;
-const MANUSCRIPT_TOP_PAD: f32 = 24.0;
-const RULER_HEIGHT: f32 = 24.0;
+const PREVIEW_FONT_SIZE: f32 = 15.0;
+const PREVIEW_LINE_HEIGHT: f32 = 24.0;
+const PREVIEW_TOP_PAD: f32 = 24.0;
 const CARET_HEIGHT: f32 = 17.0;
-/// Logical pixels per ruler inch.
-const PX_PER_INCH: f32 = 96.0;
-/// Default manuscript measure (text width). Fixed once set — dock and
-/// window resizes never re-wrap the text.
-const DEFAULT_MEASURE: f32 = 720.0;
-const MIN_MEASURE: f32 = 80.0;
-const OVERFLOW_GUTTER: f32 = 6.0;
+/// Widest the text column ever gets; it stays centered in the viewport.
+const MAX_TEXT_WIDTH: f32 = 720.0;
+/// Smallest margin kept between the text column and the viewport edge.
+const MIN_COLUMN_MARGIN: f32 = 24.0;
 
-/// Which ruler stick is being dragged.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum MarginSide {
-    Left,
-    Right,
-}
-
-/// Resolved manuscript layout in center-column coordinates. Margins are
-/// always identical, so the text is always centered in the column.
-struct ManuscriptGeometry {
+/// Resolved preview layout in center-column coordinates. The text column is
+/// centered: it grows to `MAX_TEXT_WIDTH`, then the leftover space becomes
+/// equal margins.
+struct PreviewGeometry {
     /// Center-column width (window minus open docks).
     col_w: f32,
-    /// Effective margin on both sides. Derived, never stored.
+    /// Margin on both sides of the text column.
     margin: f32,
-    /// Text width; lines wrap to this. Fixed unless the sticks move.
+    /// Text width; lines wrap to this.
     measure: f32,
 }
 
-/// The measure is fixed: column changes eat the mirrored margins first.
-/// At zero margins the text simply overflows and clips symmetrically —
-/// it never re-wraps, and the column never auto-resizes.
-fn manuscript_geometry(
-    view_w: f32,
-    left_occ: f32,
-    right_occ: f32,
-    measure_base: f32,
-) -> ManuscriptGeometry {
+fn preview_geometry(view_w: f32, left_occ: f32, right_occ: f32) -> PreviewGeometry {
     let col = (view_w - left_occ - right_occ).max(0.0);
-    // Preserve a small readable left gutter once the column becomes
-    // narrower than the manuscript measure; further overflow clips right.
-    let margin = ((col - measure_base) / 2.0).max(OVERFLOW_GUTTER);
-    ManuscriptGeometry { col_w: col, margin, measure: measure_base }
+    let measure = (col - 2.0 * MIN_COLUMN_MARGIN).clamp(0.0, MAX_TEXT_WIDTH);
+    let margin = ((col - measure) / 2.0).max(0.0);
+    PreviewGeometry { col_w: col, margin, measure }
 }
 
-fn manuscript_text_left(geo: &ManuscriptGeometry) -> f32 {
+fn preview_text_left(geo: &PreviewGeometry) -> f32 {
     geo.margin
 }
 
@@ -119,17 +95,12 @@ struct SnapshotSeg {
     weight: FontWeight,
     mono: bool,
     color: u32,
-    code_bg: bool,
     src_start: usize,
     src_end: usize,
-    underline: Option<u32>,
-    background: Option<u32>,
 }
 
 struct BuiltRow {
-    buffer_line: usize,
     segs: Vec<SnapshotSeg>,
-    rule: bool,
 }
 
 struct SnapshotRow {
@@ -138,184 +109,16 @@ struct SnapshotRow {
     caret: Option<(f32, f32)>,
     /// Selection x-range (px) within the row, if any overlaps it.
     sel_px: Option<(f32, f32)>,
-    rule: bool,
-}
-
-/// Resolve a span kind to metrics. Colors resolve separately so metrics
-/// stay UI-agnostic.
-fn seg_metrics(kind: SpanKind, base_size: f32, base_weight: FontWeight) -> (f32, FontWeight, bool) {
-    match kind {
-        SpanKind::Plain => (base_size, base_weight, false),
-        SpanKind::Marker => (base_size, base_weight, false),
-        SpanKind::Bold => (base_size, FontWeight(700.0), false),
-        SpanKind::Italic => (base_size, base_weight, false),
-        SpanKind::Strike => (base_size, base_weight, false),
-        SpanKind::Code => (base_size, base_weight, true),
-    }
-}
-
-/// Resolve a span kind to display color + code wash. Metrics unaffected.
-fn seg_chrome(kind: SpanKind, t: crate::theme::Theme) -> (u32, bool) {
-    match kind {
-        SpanKind::Plain | SpanKind::Bold => (t.text_primary, false),
-        SpanKind::Marker => (t.accent, false),
-        SpanKind::Italic => (t.text_secondary, false),
-        SpanKind::Strike => (t.empty_text_secondary, false),
-        SpanKind::Code => (t.text_primary, true),
-    }
-}
-
-fn syntax_color(kind: syntax::Kind, t: crate::theme::Theme) -> u32 {
-    [t.accent, t.success, t.warning, t.error, t.info][kind.index()]
-}
-
-fn prose_color(kind: prose::Kind, t: crate::theme::Theme) -> u32 {
-    [t.warning, t.error, t.info, t.accent, t.success, t.warning, t.info, t.error][kind.index()]
-}
-
-fn prose_decoration(mark: &prose::Span, t: crate::theme::Theme) -> (Option<u32>, Option<u32>) {
-    if mark.kind == prose::Kind::SentenceRhythm {
-        let background = if mark.end.saturating_sub(mark.start) > 200 {
-            crate::theme::lerp_rgba(t.bg_primary, t.error, 0.28)
-        } else {
-            crate::theme::lerp_rgba(t.bg_primary, t.warning, 0.28)
-        };
-        (None, Some(background))
-    } else {
-        (Some(prose_color(mark.kind, t)), None)
-    }
-}
-
-/// Base type for a buffer line: headings render larger and semibold.
-fn base_measure(line_text: &str) -> (f32, FontWeight) {
-    match crate::editor::heading_level(line_text) {
-        1 => (21.0, WEIGHT_SEMIBOLD),
-        2 => (18.0, WEIGHT_SEMIBOLD),
-        3 => (16.0, WEIGHT_SEMIBOLD),
-        _ => (MANUSCRIPT_FONT_SIZE, FontWeight::NORMAL),
-    }
-}
-
-/// Lay out one buffer line into styled rows: parse (hiding markup unless
-/// the cursor is here), wrap the visible text, slice spans per row.
-/// `hidden` is false for the cursor's line (raw source view).
-fn layout_line(
-    line_no: usize,
-    line_text: &str,
-    hidden: bool,
-    measure: f32,
-    window: &mut Window,
-    t: crate::theme::Theme,
-    syntax_spans: &[syntax::Span],
-    prose_spans: &[prose::Span],
-) -> Vec<BuiltRow> {
-    if hidden && crate::editor::is_hr_line(line_text) {
-        return vec![BuiltRow { buffer_line: line_no, segs: Vec::new(), rule: true }];
-    }
-    let (base_size, base_weight) = base_measure(line_text);
-    let marker = if crate::editor::heading_level(line_text) > 0 {
-        crate::editor::heading_marker_len(line_text)
-    } else {
-        0
-    };
-    let spans = if hidden {
-        crate::editor::parse_line(line_text, true, marker)
-    } else {
-        crate::editor::parse_active_line(line_text, marker)
-    };
-    // Visible text + per-span visible offsets.
-    let mut visible = String::new();
-    let mut voffs: Vec<(usize, usize)> = Vec::new();
-    for s in spans.iter() {
-        let vstart = visible.len();
-        visible.push_str(&line_text[s.start..s.end]);
-        voffs.push((vstart, visible.len()));
-    }
-    let color = Hsla::from(rgba(t.text_primary));
-    // Styled width of a visible byte range (sums per-span slices).
-    let mut width_of = |a: usize, b: usize| -> f32 {
-        if a >= b {
-            return 0.0;
-        }
-        let mut w = 0.0;
-        for (idx, s) in spans.iter().enumerate() {
-            let (vs, ve) = voffs[idx];
-            let o0 = a.max(vs);
-            let o1 = b.min(ve);
-            if o0 >= o1 {
-                continue;
-            }
-            let (size, weight, mono) = seg_metrics(s.kind, base_size, base_weight);
-            w += measure_text(window, &visible[o0..o1], color, size, weight, mono);
-        }
-        w
-    };
-    crate::editor::wrap_visible(&visible, measure, &mut width_of)
-        .into_iter()
-        .map(|(a, b)| {
-            let mut segs = Vec::new();
-            for (idx, s) in spans.iter().enumerate() {
-                let (vs, ve) = voffs[idx];
-                let visible_start = a.max(vs);
-                let visible_end = b.min(ve);
-                if visible_start >= visible_end {
-                    continue;
-                }
-                let (size, weight, mono) = seg_metrics(s.kind, base_size, base_weight);
-                // Split the base Markdown span at every analysis boundary.
-                // Without this, one annotation on a line would style the
-                // entire line because Markdown parsing produces one plain span.
-                let mut cuts = vec![s.start + (visible_start - vs), s.start + (visible_end - vs)];
-                for mark in syntax_spans {
-                    if mark.start > cuts[0] && mark.start < cuts[1] { cuts.push(mark.start); }
-                    if mark.end > cuts[0] && mark.end < cuts[1] { cuts.push(mark.end); }
-                }
-                for mark in prose_spans {
-                    if mark.start > cuts[0] && mark.start < cuts[1] { cuts.push(mark.start); }
-                    if mark.end > cuts[0] && mark.end < cuts[1] { cuts.push(mark.end); }
-                }
-                cuts.sort_unstable();
-                cuts.dedup();
-                for pair in cuts.windows(2) {
-                    let (src_a, src_b) = (pair[0], pair[1]);
-                    if src_a >= src_b { continue; }
-                    let o0 = vs + (src_a - s.start);
-                    let o1 = vs + (src_b - s.start);
-                    let (mut color_u32, code_bg) = seg_chrome(s.kind, t);
-                    if let Some(mark) = syntax_spans.iter().find(|a| a.start < src_b && a.end > src_a) {
-                        color_u32 = syntax_color(mark.kind, t);
-                    }
-                    let decoration = prose_spans.iter().find(|a| a.start < src_b && a.end > src_a).map(|a| prose_decoration(a, t));
-                    let underline = decoration.and_then(|(underline, _)| underline);
-                    let background = decoration.and_then(|(_, background)| background);
-                    segs.push(SnapshotSeg {
-                        text: visible[o0..o1].to_string(),
-                        size,
-                        weight,
-                        mono,
-                        color: color_u32,
-                        code_bg,
-                        src_start: src_a,
-                        src_end: src_b,
-                        underline,
-                        background,
-                    });
-                }
-            }
-            BuiltRow { buffer_line: line_no, segs, rule: false }
-        })
-        .collect()
 }
 
 struct EditorSnapshot {
     rows: Vec<SnapshotRow>,
     can_undo: bool,
     can_redo: bool,
-    words: usize,
     has_selection: bool,
 }
 
-/// Shape-measured width of a manuscript string via the window text system.
+/// Shape-measured width of a preview string via the window text system.
 fn measure_text(
     window: &mut Window,
     text: &str,
@@ -330,7 +133,7 @@ fn measure_text(
     shape_row(window, text, color, size, weight, mono).width().as_f32()
 }
 
-/// Shape one manuscript run. Callers split edges from the returned layout
+/// Shape one preview run. Callers split edges from the returned layout
 /// so positions match rendered text exactly.
 fn shape_row(
     window: &mut Window,
@@ -370,16 +173,46 @@ fn locate_src(shaped: &[(SnapshotSeg, ShapedLine, f32)], src: usize) -> (f32, f3
         }
         x += w;
     }
-    let size = shaped.last().map(|(s, _, _)| s.size).unwrap_or(MANUSCRIPT_FONT_SIZE);
+    let size = shaped.last().map(|(s, _, _)| s.size).unwrap_or(PREVIEW_FONT_SIZE);
     (x, size)
+}
+
+/// Lay out one buffer line into rows: wrap the raw text to the measure and
+/// slice it into plain segments. No markup is interpreted — a preview shows
+/// the file exactly as it is stored.
+fn layout_line(
+    line_text: &str,
+    measure: f32,
+    window: &mut Window,
+    t: crate::theme::Theme,
+) -> Vec<BuiltRow> {
+    let color = Hsla::from(rgba(t.text_primary));
+    let mut width_of = |s: &str| {
+        measure_text(window, s, color, PREVIEW_FONT_SIZE, FontWeight::NORMAL, false)
+    };
+    crate::editor::wrap_line(0, line_text, measure, &mut width_of)
+        .into_iter()
+        .map(|row| {
+            let text = &line_text[row.start_byte..row.end_byte];
+            BuiltRow {
+                segs: vec![SnapshotSeg {
+                    text: text.to_string(),
+                    size: PREVIEW_FONT_SIZE,
+                    weight: FontWeight::NORMAL,
+                    mono: false,
+                    color: t.text_primary,
+                    src_start: row.start_byte,
+                    src_end: row.end_byte,
+                }],
+            }
+        })
+        .collect()
 }
 
 pub struct RootView {
     tabs: Vec<Tab>,
     active_tab: usize,
     next_tab_id: usize,
-    /// Explicit dock assignment per panel; defaults live in `default_dock`.
-    panel_dock: HashMap<PanelKind, DockSide>,
     visible_left: Option<PanelKind>,
     visible_right: Option<PanelKind>,
     left_width: f32,
@@ -387,15 +220,6 @@ pub struct RootView {
     /// Active dock drag: (side being resized, last cursor x, window width).
     /// Widths are unclamped; the only rule is the docks never overlap.
     drag: Option<(DockSide, f32, f32)>,
-    /// Panel whose Dock Left / Dock Right popup is open, if any.
-    dock_menu: Option<PanelKind>,
-    preview_style: Option<String>,
-    syntax_on: bool,
-    prose_on: bool,
-    syntax_menu_open: bool,
-    prose_menu_open: bool,
-    syntax_selected: [bool; 5],
-    prose_selected: [bool; 8],
     recent_files: Vec<String>,
     project_root: Option<std::path::PathBuf>,
     project_expanded: HashSet<std::path::PathBuf>,
@@ -403,26 +227,19 @@ pub struct RootView {
     store: Store,
     /// Buffers keyed by tab id, created lazily.
     editors: HashMap<usize, EditorState>,
-    /// Cached analyzer output keyed by line contents and enabled checks.
-    analysis_cache: HashMap<(String, u8, u8), (Vec<syntax::Span>, Vec<prose::Span>)>,
-    /// Manuscript focus follows the active tab.
+    /// Preview focus follows the active tab.
     pub focus: FocusHandle,
-    /// Manuscript measure base (text width). The only ruler quantity
-    /// that is stored; margins always derive from it.
-    measure_base: f32,
-    /// Active ruler-stick drag: (side, start x, start measure).
-    margin_drag: Option<(MarginSide, f32, f32)>,
     /// Caret blink state, toggled on a timer.
     caret_visible: bool,
     blink_started: bool,
-    /// Vertical scroll offset (px) of the manuscript viewport.
+    /// Vertical scroll offset (px) of the preview viewport.
     scroll_offset: f32,
     /// Scrollbar drag: (pointer start y, scroll offset at start).
     scroll_drag: Option<(f32, f32)>,
-    /// Number of rendered manuscript rows from the most recent frame.
+    /// Number of rendered preview rows from the most recent frame.
     scroll_content_rows: usize,
     scrollbar_hovered: bool,
-    /// True while the left button is held for manuscript mouse selection.
+    /// True while the left button is held for mouse selection.
     mouse_select: bool,
     // -- hamburger menu state (Parametric behavior) --
     pub menu_open: bool,
@@ -436,16 +253,6 @@ pub struct RootView {
     cursor_trail: Vec<(Point<gpui::Pixels>, Instant)>,
 }
 
-/// The Prose documents folder inside the user's documents, created on
-/// demand. New files land here.
-fn default_docs_dir() -> std::path::PathBuf {
-    let dir = dirs::document_dir()
-        .map(|d| d.join("Prose"))
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let _ = std::fs::create_dir_all(&dir);
-    dir
-}
-
 /// What `save_step` decided, so the app can run dialogs borrow-free.
 #[derive(Clone)]
 pub enum SaveStep {
@@ -456,32 +263,28 @@ pub enum SaveStep {
 
 impl RootView {
     pub fn new(cx: &mut Context<Self>, store: Store) -> Self {
-        // Restore tabs: `P<path>` reopens real files (content preloaded),
-        // `T<title>` restores untitled placeholders.
+        // Restore tabs: a tab with a path reopens its file (content
+        // preloaded), a tab without one is an empty placeholder.
         let mut tabs: Vec<Tab> = Vec::new();
         let mut next_tab_id = 0;
         let mut preloaded: HashMap<usize, String> = HashMap::new();
-        if let Some(saved) = store.get("tabs") {
-            for entry in saved.split('\n').filter(|s| !s.is_empty()) {
-                if let Some(path) = entry.strip_prefix('P') {
-                    let title = std::path::Path::new(path)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| path.to_string());
-                    let content = std::fs::read_to_string(path).unwrap_or_default();
-                    preloaded.insert(next_tab_id, content);
-                    tabs.push(Tab { id: next_tab_id, title, path: Some(path.to_string()) });
-                    next_tab_id += 1;
-                } else if let Some(title) = entry.strip_prefix('T') {
-                    tabs.push(Tab { id: next_tab_id, title: title.to_string(), path: None });
-                    next_tab_id += 1;
-                }
+        for record in store.tabs() {
+            if let Some(path) = record.path.as_ref() {
+                let title = std::path::Path::new(path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.to_string());
+                let content = std::fs::read_to_string(path).unwrap_or_default();
+                preloaded.insert(next_tab_id, content);
+                tabs.push(Tab { id: next_tab_id, title, path: Some(path.clone()) });
+            } else {
+                tabs.push(Tab { id: next_tab_id, title: record.title, path: None });
             }
+            next_tab_id += 1;
         }
         if tabs.is_empty() {
             tabs.push(Tab { id: 0, title: "Welcome".into(), path: None });
-            tabs.push(Tab { id: 1, title: "Untitled".into(), path: None });
-            next_tab_id = 2;
+            next_tab_id = 1;
         }
         let active_tab = store
             .get("tabs.active")
@@ -493,17 +296,7 @@ impl RootView {
             store.get(key).and_then(|v| v.parse::<f32>().ok()).unwrap_or(fallback)
         };
         let visible = |key: &str| store.get(key).and_then(|v| PanelKind::from_key(&v));
-        let mut panel_dock = HashMap::new();
-        for kind in PanelKind::all() {
-            if let Some(side) = store
-                .get(&format!("panels.dock.{}", kind.key()))
-                .map(|v| if v == "left" { DockSide::Left } else { DockSide::Right })
-            {
-                panel_dock.insert(kind, side);
-            }
-        }
 
-        let base_measure = width("manuscript.measure", DEFAULT_MEASURE);
         let recent_files: Vec<String> = store
             .get("recents")
             .map(|v| v.split('\n').filter(|s| !s.is_empty()).map(str::to_string).collect())
@@ -515,30 +308,18 @@ impl RootView {
             tabs,
             active_tab,
             next_tab_id,
-            panel_dock,
             visible_left: visible("panels.left.visible"),
             visible_right: visible("panels.right.visible"),
             left_width: width("panels.left.width", DOCK_DEFAULT_WIDTH),
             right_width: width("panels.right.width", DOCK_DEFAULT_WIDTH),
             drag: None,
-            dock_menu: None,
-            preview_style: None,
-            syntax_on: false,
-            prose_on: false,
-            syntax_menu_open: false,
-            prose_menu_open: false,
-            syntax_selected: [false; 5],
-            prose_selected: [false; 8],
             recent_files,
             project_root,
             project_expanded,
             hovered_tab: None,
             store,
             editors: HashMap::new(),
-            analysis_cache: HashMap::new(),
             focus: cx.focus_handle(),
-            measure_base: base_measure,
-            margin_drag: None,
             caret_visible: true,
             blink_started: false,
             scroll_offset: 0.0,
@@ -566,22 +347,11 @@ impl RootView {
         view
     }
 
-    fn default_dock(kind: PanelKind) -> DockSide {
+    /// Which dock a panel opens in.
+    fn dock_of(kind: PanelKind) -> DockSide {
         match kind {
-            PanelKind::Project | PanelKind::Outline => DockSide::Left,
-            PanelKind::Styling
-            | PanelKind::Inspector
-            | PanelKind::History
-            | PanelKind::Comments => DockSide::Right,
+            PanelKind::Files => DockSide::Left,
         }
-    }
-
-    pub fn dock_of(&self, kind: PanelKind) -> DockSide {
-        self.panel_dock.get(&kind).copied().unwrap_or(Self::default_dock(kind))
-    }
-
-    fn panels_on(&self, side: DockSide) -> Vec<PanelKind> {
-        PanelKind::all().into_iter().filter(|k| self.dock_of(*k) == side).collect()
     }
 
     fn save_layout(&self) {
@@ -590,27 +360,14 @@ impl RootView {
         self.store.set("panels.right.visible", opt(self.visible_right));
         self.store.set("panels.left.width", &self.left_width.to_string());
         self.store.set("panels.right.width", &self.right_width.to_string());
-        for kind in PanelKind::all() {
-            let side = if self.dock_of(kind) == DockSide::Left {
-                "left"
-            } else {
-                "right"
-            };
-            self.store
-                .set(&format!("panels.dock.{}", kind.key()), side);
-        }
-        let tabs: Vec<String> = self
+        self.store.set("tabs.active", &self.active_tab.to_string());
+        self.store.set("recents", &self.recent_files.join("\n"));
+        let records: Vec<TabRecord> = self
             .tabs
             .iter()
-            .map(|t| match t.path.as_ref() {
-                Some(p) => format!("P{p}"),
-                None => format!("T{}", t.title),
-            })
+            .map(|t| TabRecord { title: t.title.clone(), path: t.path.clone() })
             .collect();
-        self.store.set("tabs", &tabs.join("\n"));
-        self.store.set("tabs.active", &self.active_tab.to_string());
-        self.store.set("manuscript.measure", &self.measure_base.to_string());
-        self.store.set("recents", &self.recent_files.join("\n"));
+        self.store.set_tabs(&records);
     }
 
     // ----- tabs -----
@@ -646,26 +403,14 @@ impl RootView {
             self.close_tab(id, cx);
         }
     }
-    /// Create a real file in the Prose documents folder and open it.
-    pub fn new_file(&mut self, cx: &mut Context<Self>) {
-        let dir = default_docs_dir();
-        let mut n = 0;
-        let path = loop {
-            let name = if n == 0 {
-                "Untitled.md".to_string()
-            } else {
-                format!("Untitled {}.md", n + 1)
-            };
-            let candidate = dir.join(&name);
-            if !candidate.exists() {
-                break candidate;
-            }
-            n += 1;
-        };
-        if std::fs::write(&path, "").is_err() {
-            return;
-        }
-        self.open_file_path(path.to_string_lossy().into_owned(), cx);
+    /// Open a new empty tab. Nothing touches the disk until the tab is saved.
+    pub fn new_tab(&mut self, cx: &mut Context<Self>) {
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        self.tabs.push(Tab { id, title: "Untitled".into(), path: None });
+        self.active_tab = self.tabs.len() - 1;
+        self.save_layout();
+        cx.notify();
     }
 
     pub fn open_welcome(&mut self, cx: &mut Context<Self>) {
@@ -681,7 +426,7 @@ impl RootView {
         cx.notify();
     }
 
-    // ----- manuscript geometry + ruler -----
+    // ----- preview geometry -----
 
     fn dock_occupancy(&self) -> (f32, f32) {
         (
@@ -690,68 +435,10 @@ impl RootView {
         )
     }
 
-    fn geometry(&self, window: &mut Window) -> ManuscriptGeometry {
+    fn geometry(&self, window: &mut Window) -> PreviewGeometry {
         let view_w = window.viewport_size().width.as_f32();
         let (left_occ, right_occ) = self.dock_occupancy();
-        manuscript_geometry(view_w, left_occ, right_occ, self.measure_base)
-    }
-
-    pub fn begin_margin_drag(&mut self, side: MarginSide, x: f32, cx: &mut Context<Self>) {
-        self.margin_drag = Some((side, x, self.measure_base));
-        cx.notify();
-    }
-
-    fn standard_measure_label(measure: f32) -> Option<&'static str> {
-        const STANDARDS: &[(f32, &str)] = &[
-            (6.0, "Narrow"),
-            (6.5, "Standard"),
-            (6.75, "Manuscript"),
-            (7.0, "Wide"),
-            (7.5, "Extra Wide"),
-            (8.0, "Full Width"),
-        ];
-        STANDARDS
-            .iter()
-            .find(|(inches, _)| (measure - inches * PX_PER_INCH).abs() < 0.5)
-            .map(|(_, label)| *label)
-    }
-
-    fn measure_label(measure: f32) -> String {
-        if let Some(label) = Self::standard_measure_label(measure) {
-            return label.to_string();
-        }
-        let mut value = format!("{:.2}", measure / PX_PER_INCH);
-        while value.ends_with('0') {
-            value.pop();
-        }
-        if value.ends_with('.') {
-            value.pop();
-        }
-        format!("{} in", value)
-    }
-
-    /// Either stick sets the measure: dragging the left stick right or the
-    /// right stick left narrows the text, mirrored. Margins re-derive.
-    fn margin_drag_to(&mut self, x: f32, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((side, start_x, start_measure)) = self.margin_drag else {
-            return;
-        };
-        let geo = self.geometry(window);
-        let dx = x - start_x;
-        let delta = match side {
-            MarginSide::Left => dx * 2.0,
-            MarginSide::Right => -dx * 2.0,
-        };
-        let max = geo.col_w.max(MIN_MEASURE);
-        let raw = (start_measure + delta).clamp(MIN_MEASURE, max);
-        let next = [6.0_f32, 6.5, 6.75, 7.0, 7.5, 8.0]
-            .into_iter()
-            .map(|inches| inches * PX_PER_INCH)
-            .find(|candidate| (raw - candidate).abs() <= 2.0)
-            .unwrap_or(raw);
-        self.measure_base = next;
-        self.margin_drag = Some((side, x, next));
-        cx.notify();
+        preview_geometry(view_w, left_occ, right_occ)
     }
 
     // ----- undo / redo (active tab's buffer) -----
@@ -864,11 +551,13 @@ impl RootView {
         let geo = self.geometry(window);
         let ed = self.editors.entry(tab_id).or_insert_with(EditorState::new);
         let (cur_line, cur_byte) = ed.cursor_line_byte();
-        // Rows for the cursor line and its neighbors, with their type.
+        // Rows for the cursor line and its neighbors, all sharing the
+        // preview's uniform metrics.
         let mut rows: Vec<(crate::editor::VisualRow, f32, FontWeight)> = Vec::new();
         for line in cur_line.saturating_sub(1)..=(cur_line + 1).min(ed.len_lines().saturating_sub(1)) {
             let text = ed.line_text(line);
-            let (size, weight) = base_measure(&text);
+            let size = PREVIEW_FONT_SIZE;
+            let weight = FontWeight::NORMAL;
             let mut w = |s: &str| measure_text(window, s, color, size, weight, false);
             rows.extend(
                 crate::editor::wrap_line(line, &text, geo.measure, &mut w)
@@ -906,11 +595,11 @@ impl RootView {
         ed.set_cursor_line_byte(target_row.buffer_line, target_row.start_byte + lo, extend);
     }
 
-    /// Wheel scrolling over the manuscript viewport.
+    /// Wheel scrolling over the preview viewport.
     fn handle_wheel(&mut self, ev: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
         let dy = match ev.delta {
             ScrollDelta::Pixels(p) => p.y.as_f32(),
-            ScrollDelta::Lines(p) => p.y * MANUSCRIPT_LINE_HEIGHT,
+            ScrollDelta::Lines(p) => p.y * PREVIEW_LINE_HEIGHT,
         };
         if dy == 0.0 {
             return;
@@ -921,7 +610,7 @@ impl RootView {
     }
 
     fn begin_scroll_drag(&mut self, pointer_y: f32, thumb_top: f32, thumb_height: f32, track_h: f32, view_h: f32, cx: &mut Context<Self>) {
-        let track_y = TOP_BAR_HEIGHT + TAB_BAR_HEIGHT + RULER_HEIGHT;
+        let track_y = TOP_BAR_HEIGHT + TAB_BAR_HEIGHT;
         let local_y = pointer_y - track_y;
         let max = self.scroll_max_for_geometry(view_h, thumb_height);
         if local_y >= thumb_top && local_y <= thumb_top + thumb_height {
@@ -945,7 +634,7 @@ impl RootView {
     }
 
     fn scroll_max_for_geometry(&self, view_h: f32, thumb_height: f32) -> f32 {
-        let total_h = self.scroll_content_rows as f32 * MANUSCRIPT_LINE_HEIGHT;
+        let total_h = self.scroll_content_rows as f32 * PREVIEW_LINE_HEIGHT;
         let _ = thumb_height;
         (total_h - view_h).max(0.0)
     }
@@ -977,14 +666,15 @@ impl RootView {
         if x_col > geo.col_w - 18.0 {
             return;
         }
-        let y_view = y_win - (TOP_BAR_HEIGHT + TAB_BAR_HEIGHT + RULER_HEIGHT);
+        let y_view = y_win - (TOP_BAR_HEIGHT + TAB_BAR_HEIGHT);
         let view_h = Self::viewport_h(window);
         let ed = self.editors.entry(tab_id).or_insert_with(EditorState::new);
         // Rows carry their line's type for measurement.
         let mut rows: Vec<(crate::editor::VisualRow, f32, FontWeight)> = Vec::new();
         for line_no in 0..ed.len_lines() {
             let text = ed.line_text(line_no);
-            let (size, weight) = base_measure(&text);
+            let size = PREVIEW_FONT_SIZE;
+            let weight = FontWeight::NORMAL;
             let mut width_of = |s: &str| measure_text(window, s, color, size, weight, false);
             rows.extend(
                 crate::editor::wrap_line(line_no, &text, geo.measure, &mut width_of)
@@ -995,18 +685,18 @@ impl RootView {
         if rows.is_empty() {
             return;
         }
-        let total_h = rows.len() as f32 * MANUSCRIPT_LINE_HEIGHT;
+        let total_h = rows.len() as f32 * PREVIEW_LINE_HEIGHT;
         let max = (total_h - view_h).max(0.0);
         let offset = self.scroll_offset.min(max);
         let content_y = y_view + offset;
-        let idx = ((content_y - MANUSCRIPT_TOP_PAD) / MANUSCRIPT_LINE_HEIGHT)
+        let idx = ((content_y - PREVIEW_TOP_PAD) / PREVIEW_LINE_HEIGHT)
             .floor()
             .max(0.0) as usize;
         let idx = idx.min(rows.len() - 1);
         let (row, size, weight) = rows[idx].clone();
         // Keep the left edge visible when the column is wider than the
         // viewport: margins are consumed before the text itself is clipped.
-        let text_left = manuscript_text_left(&geo);
+        let text_left = preview_text_left(&geo);
         let x_text = x_col - text_left;
         let row_text = ed.line_text(row.buffer_line);
         let row_slice = &row_text[row.start_byte..row.end_byte.min(row_text.len())];
@@ -1201,8 +891,7 @@ impl RootView {
     // ----- panels -----
 
     pub fn toggle_panel(&mut self, kind: PanelKind, cx: &mut Context<Self>) {
-        self.dock_menu = None;
-        match self.dock_of(kind) {
+        match Self::dock_of(kind) {
             DockSide::Left => {
                 self.visible_left = if self.visible_left == Some(kind) { None } else { Some(kind) };
             }
@@ -1212,55 +901,6 @@ impl RootView {
             }
         }
         self.save_layout();
-        cx.notify();
-    }
-
-    pub fn set_dock(&mut self, kind: PanelKind, side: DockSide, cx: &mut Context<Self>) {
-        self.panel_dock.insert(kind, side);
-        match side {
-            DockSide::Left => {
-                self.visible_left = Some(kind);
-                if self.visible_right == Some(kind) {
-                    self.visible_right = None;
-                }
-            }
-            DockSide::Right => {
-                self.visible_right = Some(kind);
-                if self.visible_left == Some(kind) {
-                    self.visible_left = None;
-                }
-            }
-        }
-        self.save_layout();
-        cx.notify();
-    }
-
-    pub fn open_dock_menu(&mut self, kind: PanelKind, cx: &mut Context<Self>) {
-        self.dock_menu = Some(kind);
-        cx.notify();
-    }
-
-    pub fn close_dock_menu(&mut self, cx: &mut Context<Self>) {
-        if self.dock_menu.take().is_some() {
-            cx.notify();
-        }
-    }
-
-    pub fn toggle_preview_style(&mut self, name: &str, cx: &mut Context<Self>) {
-        self.preview_style = if self.preview_style.as_deref() == Some(name) {
-            None
-        } else {
-            Some(name.to_string())
-        };
-        cx.notify();
-    }
-
-    pub fn toggle_layer(&mut self, flag: u8, cx: &mut Context<Self>) {
-        match flag {
-            LAYER_SYNTAX => { self.syntax_menu_open = !self.syntax_menu_open; self.syntax_on = self.syntax_selected.iter().any(|v| *v); self.prose_menu_open = false; }
-            LAYER_PROSE => { self.prose_menu_open = !self.prose_menu_open; self.prose_on = self.prose_selected.iter().any(|v| *v); self.syntax_menu_open = false; }
-            _ => {}
-        }
         cx.notify();
     }
 
@@ -1320,16 +960,6 @@ impl RootView {
             self.project_expanded.remove(&path);
         }
         cx.notify();
-    }
-
-    pub fn toggle_check(&mut self, layer: u8, index: usize, cx: &mut Context<Self>) {
-        if layer == LAYER_SYNTAX { if let Some(v) = self.syntax_selected.get_mut(index) { *v = !*v; } self.syntax_on = self.syntax_selected.iter().any(|v| *v); }
-        if layer == LAYER_PROSE { if let Some(v) = self.prose_selected.get_mut(index) { *v = !*v; } self.prose_on = self.prose_selected.iter().any(|v| *v); }
-        cx.notify();
-    }
-
-    pub fn close_layer_menus(&mut self, cx: &mut Context<Self>) {
-        if self.syntax_menu_open || self.prose_menu_open { self.syntax_menu_open = false; self.prose_menu_open = false; cx.notify(); }
     }
 
     pub fn toggle_theme(&mut self, cx: &mut Context<Self>) {
@@ -1394,7 +1024,7 @@ impl RootView {
         if tab.title == "Welcome" || tab.title.is_empty() {
             return SaveStep::Nothing;
         }
-        SaveStep::AskDialog(format!("{}.md", tab.title))
+        SaveStep::AskDialog(format!("{}.txt", tab.title))
     }
 
     /// Apply a save: write the active buffer, adopting `path` first when
@@ -1441,9 +1071,7 @@ impl RootView {
     }
 
     fn end_drag(&mut self, cx: &mut Context<Self>) {
-        let was_dragging = self.drag.take().is_some()
-            || self.margin_drag.take().is_some()
-            || self.scroll_drag.take().is_some();
+        let was_dragging = self.drag.take().is_some() || self.scroll_drag.take().is_some();
         self.mouse_select = false;
         if was_dragging {
             self.save_layout();
@@ -1451,19 +1079,18 @@ impl RootView {
         }
     }
 
-    /// Viewport height: window minus top bar, tab bar, ruler, bottom bar.
+    /// Viewport height: window minus top bar, tab bar, bottom bar.
     fn viewport_h(window: &mut Window) -> f32 {
         (window.viewport_size().height.as_f32()
             - TOP_BAR_HEIGHT
             - TAB_BAR_HEIGHT
-            - RULER_HEIGHT
             - BOTTOM_BAR_HEIGHT)
             .max(0.0)
     }
 
     fn scrollbar_thumb_height(&self, window: &mut Window) -> f32 {
         let track_h = Self::viewport_h(window);
-        let total_h = self.scroll_content_rows as f32 * MANUSCRIPT_LINE_HEIGHT;
+        let total_h = self.scroll_content_rows as f32 * PREVIEW_LINE_HEIGHT;
         (track_h / total_h.max(1.0) * track_h)
             .max(24.0)
             .min(track_h)
@@ -1471,12 +1098,12 @@ impl RootView {
 
     // ----- render -----
 
-    fn render_manuscript(
+    fn render_preview(
         &self,
         root: WeakEntity<RootView>,
         snapshot: Option<EditorSnapshot>,
         focus: FocusHandle,
-        geo: &ManuscriptGeometry,
+        geo: &PreviewGeometry,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
@@ -1488,20 +1115,16 @@ impl RootView {
         let snap = snapshot.unwrap_or(EditorSnapshot {
             rows: vec![SnapshotRow {
                 segs: vec![SnapshotSeg {
-                    text: String::new(), size: MANUSCRIPT_FONT_SIZE,
+                    text: String::new(), size: PREVIEW_FONT_SIZE,
                     weight: FontWeight::NORMAL, mono: false,
-                    color: t.text_primary, code_bg: false,
+                    color: t.text_primary,
                     src_start: 0, src_end: 0,
-                    underline: None,
-                    background: None,
                 }],
                 caret: Some((0.0, CARET_HEIGHT)),
                 sel_px: None,
-                rule: false,
             }],
             can_undo: false,
             can_redo: false,
-            words: 0,
             has_selection: false,
         });
         // No caret while any selection is visible.
@@ -1510,7 +1133,7 @@ impl RootView {
         // Scrollbar geometry (Zed-style: thick low-opacity thumb + a 2px
         // accent line at the cursor row).
         let view_h = Self::viewport_h(window);
-        let total_h = snap.rows.len() as f32 * MANUSCRIPT_LINE_HEIGHT;
+        let total_h = snap.rows.len() as f32 * PREVIEW_LINE_HEIGHT;
         let offset = self.scroll_offset.min((total_h - view_h).max(0.0));
         let show_scroll = total_h > view_h;
         let track_h = view_h.max(0.0);
@@ -1531,7 +1154,7 @@ impl RootView {
         };
         let cursor_y = if show_scroll && total_h > 0.0 {
             let idx = snap.rows.iter().position(|r| r.caret.is_some()).unwrap_or(0);
-            ((idx as f32 * MANUSCRIPT_LINE_HEIGHT + MANUSCRIPT_LINE_HEIGHT / 2.0) / total_h)
+            ((idx as f32 * PREVIEW_LINE_HEIGHT + PREVIEW_LINE_HEIGHT / 2.0) / total_h)
                 * track_h
         } else {
             0.0
@@ -1547,10 +1170,9 @@ impl RootView {
             .overflow_hidden()
             .bg(rgba(t.bg_primary))
             .cursor_text()
-            .child(self.render_ruler(root.clone(), geo, t))
             .child(
                 div()
-                    .id("manuscript-viewport")
+                    .id("preview-viewport")
                     .relative()
                     .w_full()
                     .flex_1()
@@ -1605,10 +1227,10 @@ impl RootView {
                             .child(
                                 div()
                                     .w(px(geo.measure))
-                                    .ml(px(manuscript_text_left(geo)))
+                                    .ml(px(preview_text_left(geo)))
                                     .flex()
                                     .flex_col()
-                                    .pt(px(MANUSCRIPT_TOP_PAD))
+                                    .pt(px(PREVIEW_TOP_PAD))
                                     .children(snap.rows.iter().map(|row| {
                                         // The text always renders as one
                                         // unsplit run, so shaping (kerning,
@@ -1618,7 +1240,7 @@ impl RootView {
                                         div()
                                             .relative()
                                             .w_full()
-                                            .h(px(MANUSCRIPT_LINE_HEIGHT))
+                                            .h(px(PREVIEW_LINE_HEIGHT))
                                             .flex()
                                             .flex_row()
                                             .items_center()
@@ -1630,22 +1252,8 @@ impl RootView {
                                                     .text_size(px(seg.size))
                                                     .font_weight(seg.weight)
                                                     .text_color(rgba(seg.color))
-                                                    .when(seg.code_bg, |v| v.bg(rgba(t.bg_tertiary)))
-                                                    .when_some(seg.background, |v, color| v.bg(rgba(color)))
-                                                    .when(seg.underline.is_some(), |v| v.underline())
                                                     .child(seg.text.clone())
                                             }))
-                                            .when(row.rule, |r| {
-                                                r.child(
-                                                    div()
-                                                        .absolute()
-                                                        .left(px(0.))
-                                                        .right(px(0.))
-                                                        .top(px(MANUSCRIPT_LINE_HEIGHT / 2.0))
-                                                        .h(px(1.))
-                                                        .bg(rgba(t.text_secondary)),
-                                                )
-                                            })
                                             .when_some(row.sel_px, |r, range| {
                                                 let (x0, x1) = range;
                                                 r.child(
@@ -1666,7 +1274,7 @@ impl RootView {
                                                             .absolute()
                                                             .left(px(x))
                                                             .top(px(
-                                                                (MANUSCRIPT_LINE_HEIGHT - h)
+                                                                (PREVIEW_LINE_HEIGHT - h)
                                                                     / 2.0,
                                                             ))
                                                             .w(px(2.))
@@ -1743,161 +1351,6 @@ impl RootView {
             .into_any_element()
     }
 
-    /// Docs-style margin ruler: inch numbers and ticks across the column,
-    /// shaded outside-margin zones, and two blue margin markers that drag
-    /// the (mirrored) wrap margins. Markers always sit on the wrap edges.
-    fn render_ruler(
-        &self,
-        root: WeakEntity<RootView>,
-        geo: &ManuscriptGeometry,
-        t: crate::theme::Theme,
-    ) -> gpui::AnyElement {
-        let text_left = manuscript_text_left(geo);
-        let text_right = text_left + geo.measure;
-        let shade = rgba(t.bg_tertiary);
-        let tick = rgba(t.line_number);
-        let num = rgba(t.empty_text_primary);
-        let marker = rgba(t.text_secondary);
-        let drag_label = self.margin_drag.as_ref().map(|_| Self::measure_label(geo.measure));
-        let ruler_center = (RULER_HEIGHT - 1.0) / 2.0;
-
-        // Blue margin marker: a 2px rounded line, vertically centered,
-        // inside a wider invisible grab handle.
-        let marker_el = |side: MarginSide, x: f32| {
-            let root = root.clone();
-            div()
-                .id(match side {
-                    MarginSide::Left => "ruler-stick-left",
-                    MarginSide::Right => "ruler-stick-right",
-                })
-                .absolute()
-                .left(px(x - 6.))
-                .top(px(0.))
-                .bottom(px(0.))
-                .w(px(12.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor(gpui::CursorStyle::ResizeLeftRight)
-                .on_mouse_down(MouseButton::Left, move |ev: &gpui::MouseDownEvent, _, cx| {
-                    let _ = root.update(cx, |root, cx| {
-                        root.begin_margin_drag(side, ev.position.x.as_f32(), cx);
-                    });
-                })
-                .child(
-                    div()
-                        .w(px(2.))
-                        .h(px(14.))
-                        .rounded_full()
-                        .bg(marker),
-                )
-        };
-
-        // Inch numbers + ticks (96px per inch).
-        let inches = (geo.col_w / PX_PER_INCH) as usize;
-        let tick_count = (geo.col_w / 12.0) as usize;
-        div()
-            .relative()
-            .w_full()
-            .h(px(RULER_HEIGHT))
-            .bg(rgba(t.bg_primary))
-            .border_b_1()
-            .border_color(rgba(t.chrome_border_color))
-            .overflow_hidden()
-            // Outside-margin shading.
-            .child(
-                div()
-                    .absolute()
-                    .left(px(0.))
-                    .top(px(0.))
-                    .bottom(px(0.))
-                    .w(px(text_left.max(0.)))
-                    .bg(shade),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left(px(text_right))
-                    .top(px(0.))
-                    .bottom(px(0.))
-                    .right(px(0.))
-                    .bg(shade),
-            )
-            // Ticks every 1/8", medium every 1/2", tall every inch.
-            .children((0..=tick_count).map(|k| {
-                let x = k as f32 * 12.0;
-                let h = if x % PX_PER_INCH == 0.0 {
-                    8.
-                } else if x % 48.0 == 0.0 {
-                    5.
-                } else {
-                    3.
-                };
-                div()
-                    .absolute()
-                    .left(px(x))
-                    .bottom(px(0.))
-                    .w(px(1.))
-                    .h(px(h))
-                    .bg(tick)
-            }))
-            // Inch numbers in mono.
-            .children((1..=inches).map(|k| {
-                let x = k as f32 * PX_PER_INCH;
-                div()
-                    .absolute()
-                    .left(px(x - 16.))
-                    .top(px(1.))
-                    .w(px(32.))
-                    .text_center()
-                    .text_size(px(9.))
-                    .font_family(crate::theme::FONT_MONO)
-                    .text_color(num)
-                    .child(k.to_string())
-            }))
-            .when_some(drag_label, |r, label| {
-                r.child(
-                    div()
-                        .absolute()
-                        .left(px(text_left))
-                        .top(px(ruler_center))
-                        .w(px(geo.measure))
-                        .h(px(1.0))
-                        .overflow_hidden()
-                        .children((0..((geo.measure / 10.0).ceil() as usize)).map(|index| {
-                            div()
-                                .absolute()
-                                .left(px(index as f32 * 10.0))
-                                .top(px(0.0))
-                                .w(px(6.0))
-                                .h(px(1.0))
-                                .bg(rgba(t.text_secondary))
-                        })),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .left(px(text_left + geo.measure / 2.0 - 36.0))
-                        .top(px(3.0))
-                        .w(px(72.0))
-                        .h(px(18.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .bg(rgba(t.bg_primary))
-                        .border_1()
-                        .border_color(rgba(t.text_secondary))
-                        .font_family(crate::theme::FONT_MONO)
-                        .text_size(px(10.0))
-                        .text_color(rgba(t.text_secondary))
-                        .child(label),
-                )
-            })
-            .child(marker_el(MarginSide::Left, text_left))
-            .child(marker_el(MarginSide::Right, text_right))
-            .into_any_element()
-    }
-
     /// Zed-style welcome tab: big centered greeting, then a narrow
     /// left-aligned column of Get Started actions and recent files.
     fn render_welcome(&self, root: WeakEntity<RootView>, cx: &mut App) -> gpui::AnyElement {
@@ -1937,7 +1390,7 @@ impl RootView {
                 .hover(|s| s.bg(rgba(t.menu_hover_bg)))
                 .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                     if cmd == 0 {
-                        let _ = root.update(cx, |root, cx| root.new_file(cx));
+                        let _ = root.update(cx, |root, cx| root.new_tab(cx));
                     } else {
                         let root = root.clone();
                         window.defer(cx, move |_, cx| {
@@ -1989,14 +1442,14 @@ impl RootView {
                             .font_weight(FontWeight(500.0))
                             .text_color(rgba(t.text_primary))
                             .mb(px(28.))
-                            .child("Welcome back to Prose"),
+                            .child("Welcome to Peekview"),
                     )
                     .child(section("GET STARTED"))
-                    .child(action_button("welcome-new", ICON_NEW_FILE, "New File", 0))
-                    .child(action_button("welcome-open", ICON_OPEN_FILE, "Open File", 1))
+                    .child(action_button("welcome-new", ICON_NEW_FILE, "New Tab", 0))
+                    .child(action_button("welcome-open", ICON_OPEN_FILE, "Open File…", 1))
                     .child(div().h(px(20.)))
                     .when(!self.recent_files.is_empty(), |col| {
-                        col.child(section("RECENT PROJECTS")).children(
+                        col.child(section("RECENT FILES")).children(
                             self.recent_files.iter().map(|path| {
                                 let root = root.clone();
                                 let path = path.clone();
@@ -2077,23 +1530,18 @@ impl Render for RootView {
             width: self.right_width,
         });
 
-        let left_panels = self.panels_on(DockSide::Left);
-        let right_panels = self.panels_on(DockSide::Right);
-
-        // Geometry first: everything manuscript-related derives from it.
+        // Geometry first: everything preview-related derives from it.
         let geo = self.geometry(window);
 
         // Snapshot the active buffer once per frame: wrapped visual rows
-        // with caret/selection x-edges, history flags, word count.
-        // Welcome tabs have no buffer.
+        // with caret/selection x-edges and history flags. Welcome tabs have
+        // no buffer.
         let snapshot: Option<EditorSnapshot> = self
             .tabs
             .get(self.active_tab)
             .filter(|tab| tab.title != "Welcome")
             .map(|tab| tab.id)
             .map(|id| {
-                let syntax_mask = self.syntax_selected.iter().enumerate().fold(0u8, |mask, (i, on)| mask | ((*on as u8) << i));
-                let prose_mask = self.prose_selected.iter().enumerate().fold(0u8, |mask, (i, on)| mask | ((*on as u8) << i));
                 let ed = self.editors.entry(id).or_insert_with(EditorState::new);
                 let (cur_line, cur_byte) = ed.cursor_line_byte();
                 let sel_chars = ed.selection_range();
@@ -2115,19 +1563,7 @@ impl Render for RootView {
                             ))
                         }
                     });
-                    let cache_key = (text.clone(), syntax_mask, prose_mask);
-                    let (syntax_spans, prose_spans) = self.analysis_cache
-                        .entry(cache_key)
-                        .or_insert_with(|| {
-                            let syntax_spans = if syntax_mask == 0 { Vec::new() } else { syntax::find(&text, &self.syntax_selected) };
-                            let prose_spans = if prose_mask == 0 { Vec::new() } else { prose::find(&text, &self.prose_selected) };
-                            (syntax_spans, prose_spans)
-                        })
-                        .clone();
-                    if self.analysis_cache.len() > 4096 {
-                        self.analysis_cache.clear();
-                    }
-                    for built in layout_line(line_no, &text, line_no != cur_line, geo.measure, window, t, &syntax_spans, &prose_spans) {
+                    for built in layout_line(&text, geo.measure, window, t) {
                         let mut shaped = Vec::new();
                         for seg in &built.segs {
                             let color = Hsla::from(rgba(seg.color));
@@ -2144,12 +1580,11 @@ impl Render for RootView {
                         };
                         let caret = if !caret_placed
                             && line_no == cur_line
-                            && !built.rule
                             && row_contains_cursor
                         {
                             let (x, size) = locate_src(&shaped, cur_byte);
                             caret_placed = true;
-                            Some((x, (size + 4.0).min(MANUSCRIPT_LINE_HEIGHT - 2.0)))
+                            Some((x, (size + 4.0).min(PREVIEW_LINE_HEIGHT - 2.0)))
                         } else { None };
                         let sel_px = sel_bytes.and_then(|(s0, s1)| {
                             let mut x0 = None;
@@ -2168,20 +1603,18 @@ impl Render for RootView {
                             }
                             x0.zip(x1)
                         });
-                        rows.push(SnapshotRow { segs: built.segs, caret, sel_px, rule: built.rule });
+                        rows.push(SnapshotRow { segs: built.segs, caret, sel_px });
                     }
                 }
                 EditorSnapshot {
                     rows,
                     can_undo: ed.can_undo(),
                     can_redo: ed.can_redo(),
-                    words: ed.word_count(),
                     has_selection: ed.selection_range().is_some(),
                 }
             });
         let can_undo = snapshot.as_ref().is_some_and(|s| s.can_undo);
         let can_redo = snapshot.as_ref().is_some_and(|s| s.can_redo);
-        let word_count = snapshot.as_ref().map(|s| s.words).unwrap_or(0);
         self.scroll_content_rows = snapshot.as_ref().map(|s| s.rows.len()).unwrap_or(0);
 
         div()
@@ -2197,7 +1630,7 @@ impl Render for RootView {
                 menu_open: self.menu_open,
                 icon_animation: self.icon_animation,
             })
-            // Middle row: docks flank the tab bar + manuscript column, and
+            // Middle row: docks flank the tab bar + preview column, and
             // span exactly that height (below top bar, above bottom bar).
             .child(
                 div()
@@ -2208,12 +1641,9 @@ impl Render for RootView {
                     .min_h(px(0.))
                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                         this.close_menu(cx);
-                        this.close_dock_menu(cx);
-                        this.close_layer_menus(cx);
                     }))
                     .on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, window, cx| {
                         this.drag_to(ev.position.x.as_f32(), cx);
-                        this.margin_drag_to(ev.position.x.as_f32(), window, cx);
                         let thumb_h = this.scrollbar_thumb_height(window);
                         let view_h = Self::viewport_h(window);
                         this.scroll_drag_to(ev.position.y.as_f32(), view_h, view_h, thumb_h, cx);
@@ -2237,7 +1667,7 @@ impl Render for RootView {
                                 can_undo,
                                 can_redo,
                             })
-                            .child(self.render_manuscript(
+                            .child(self.render_preview(
                                 root.clone(),
                                 snapshot,
                                 self.focus.clone(),
@@ -2248,21 +1678,7 @@ impl Render for RootView {
                     )
                     .when_some(right_dock, |row, dock| row.child(dock)),
             )
-            .child(BottomBar {
-                root: root.clone(),
-                left_panels,
-                right_panels,
-                visible_left: self.visible_left,
-                visible_right: self.visible_right,
-                dock_menu: self.dock_menu,
-                word_count,
-                syntax_on: self.syntax_on,
-                prose_on: self.prose_on,
-                syntax_menu_open: self.syntax_menu_open,
-                prose_menu_open: self.prose_menu_open,
-                syntax_selected: self.syntax_selected,
-                prose_selected: self.prose_selected,
-            })
+            .child(BottomBar { root: root.clone() })
             // Menu overlay, painted last so it sits above the middle row:
             // click-away catcher first, dropdown panel after.
             .when(self.menu_open, |d| {

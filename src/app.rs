@@ -29,7 +29,7 @@ pub fn run() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(800.), px(500.))),
                 titlebar: Some(gpui::TitlebarOptions {
-                    title: Some("Prose".into()),
+                    title: Some("Peekview".into()),
                     appears_transparent: true,
                     traffic_light_position: None,
                 }),
@@ -38,7 +38,7 @@ pub fn run() {
             |window, cx| {
                 let store = Store::open_default();
                 let view = cx.new(|cx| RootView::new(cx, store));
-                // Manuscript takes keyboard focus immediately; clicking it
+                // The preview takes keyboard focus immediately; clicking it
                 // re-focuses later.
                 let focus = view.read(cx).focus.clone();
                 window.focus(&focus, cx);
@@ -73,7 +73,7 @@ fn register_action_handlers(cx: &mut App) {
         with_root(cx, |root, cx| root.toggle_theme(cx));
     });
     cx.on_action(|_: &NewTab, cx| {
-        with_root(cx, |root, cx| root.new_file(cx));
+        with_root(cx, |root, cx| root.new_tab(cx));
     });
     cx.on_action(|_: &CloseTab, cx| {
         with_root(cx, |root, cx| root.close_active_tab(cx));
@@ -145,11 +145,8 @@ fn register_action_handlers(cx: &mut App) {
     cx.on_action(|_: &ShowWelcome, cx| {
         with_root(cx, |root, cx| root.open_welcome(cx));
     });
-    cx.on_action(|_: &ToggleProjectPanel, cx| {
-        with_root(cx, |root, cx| root.toggle_panel(PanelKind::Project, cx));
-    });
-    cx.on_action(|_: &ToggleStylingPanel, cx| {
-        with_root(cx, |root, cx| root.toggle_panel(PanelKind::Styling, cx));
+    cx.on_action(|_: &ToggleFilesPanel, cx| {
+        with_root(cx, |root, cx| root.toggle_panel(PanelKind::Files, cx));
     });
 }
 
