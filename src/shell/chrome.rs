@@ -2,8 +2,8 @@
 //! (placeholder for per-file-type controls).
 
 use gpui::{
-    AnyElement, App, MouseButton, WeakEntity, Window, WindowControlArea, div, prelude::*, px, rgba,
-    svg,
+    AnyElement, App, MouseButton, WeakEntity, Window, WindowControlArea, canvas, div, prelude::*, px,
+    rgba, svg,
 };
 
 use super::panels::{ICON_INFO, PanelKind};
@@ -90,6 +90,136 @@ fn tab_icon(tab: &Tab) -> &'static [u8] {
     }
 }
 
+// ---------- Folder tab variant (ported from gpui-kit PR #3415) ----------
+
+const FOLDER_TAB_GAP: f32 = 4.0;
+const FOLDER_RADIUS: f32 = 8.0;
+const FOLDER_TOP_PADDING: f32 = 4.0;
+const FOLDER_PADDING_X: f32 = 10.0;
+const FOLDER_SEPARATOR_HEIGHT: f32 = 16.0;
+
+/// Adds a quarter circle from `from` to `to`, whose tangents meet at `corner`.
+fn quarter_circle_to(
+    path: &mut gpui::PathBuilder,
+    from: gpui::Point<gpui::Pixels>,
+    corner: gpui::Point<gpui::Pixels>,
+    to: gpui::Point<gpui::Pixels>,
+) {
+    const K: f32 = 0.552_284_8;
+    path.cubic_bezier_to(to, from + (corner - from) * K, to + (corner - to) * K);
+}
+
+/// The selected folder tab: rounded on top, curving out at the bottom into the
+/// content below. Painted as a canvas so the curves can overhang the tab.
+fn folder_tab_shape(bg: u32) -> impl gpui::IntoElement {
+    let curve = gpui::px(FOLDER_RADIUS);
+    canvas(
+        |_, _, _| {},
+        move |bounds, _, window, _| {
+            let (top, bottom) = (bounds.top(), bounds.bottom());
+            let (left, right) = (bounds.left(), bounds.right());
+            let (tab_left, tab_right) = (left + curve, right - curve);
+            // Keep at least a third of the top flat on narrow tabs.
+            let radius = ((bounds.size.width - curve * 2.0) / 3.0)
+                .clamp(gpui::px(0.), curve);
+
+            let mut path = gpui::PathBuilder::fill()
+                .with_style(gpui::PathStyle::Fill(gpui::FillOptions::tolerance(0.02)));
+            path.move_to(gpui::point(left, bottom));
+            quarter_circle_to(
+                &mut path,
+                gpui::point(left, bottom),
+                gpui::point(tab_left, bottom),
+                gpui::point(tab_left, bottom - curve),
+            );
+            path.line_to(gpui::point(tab_left, top + radius));
+            quarter_circle_to(
+                &mut path,
+                gpui::point(tab_left, top + radius),
+                gpui::point(tab_left, top),
+                gpui::point(tab_left + radius, top),
+            );
+            path.line_to(gpui::point(tab_right - radius, top));
+            quarter_circle_to(
+                &mut path,
+                gpui::point(tab_right - radius, top),
+                gpui::point(tab_right, top),
+                gpui::point(tab_right, top + radius),
+            );
+            path.line_to(gpui::point(tab_right, bottom - curve));
+            quarter_circle_to(
+                &mut path,
+                gpui::point(tab_right, bottom - curve),
+                gpui::point(tab_right, bottom),
+                gpui::point(right, bottom),
+            );
+            path.close();
+            if let Ok(path) = path.build() {
+                window.paint_path(path, gpui::rgba(bg));
+            }
+        },
+    )
+    .absolute()
+    .top_0()
+    .bottom_0()
+    .left(gpui::px(-FOLDER_RADIUS))
+    .right(gpui::px(-FOLDER_RADIUS))
+}
+
+/// Outline for the active folder tab: rides up the convex corners and over the
+/// tab, leaving the bottom edge open so it connects to the content below.
+fn folder_tab_outline(color: u32) -> impl gpui::IntoElement {
+    let curve = gpui::px(FOLDER_RADIUS);
+    canvas(
+        |_, _, _| {},
+        move |bounds, _, window, _| {
+            let (top, bottom) = (bounds.top(), bounds.bottom());
+            let (left, right) = (bounds.left(), bounds.right());
+            let (tab_left, tab_right) = (left + curve, right - curve);
+            let radius = ((bounds.size.width - curve * 2.0) / 3.0)
+                .clamp(gpui::px(0.), curve);
+
+            let mut path = gpui::PathBuilder::stroke(gpui::px(1.0));
+            path.move_to(gpui::point(left, bottom));
+            quarter_circle_to(
+                &mut path,
+                gpui::point(left, bottom),
+                gpui::point(tab_left, bottom),
+                gpui::point(tab_left, bottom - curve),
+            );
+            path.line_to(gpui::point(tab_left, top + radius));
+            quarter_circle_to(
+                &mut path,
+                gpui::point(tab_left, top + radius),
+                gpui::point(tab_left, top),
+                gpui::point(tab_left + radius, top),
+            );
+            path.line_to(gpui::point(tab_right - radius, top));
+            quarter_circle_to(
+                &mut path,
+                gpui::point(tab_right - radius, top),
+                gpui::point(tab_right, top),
+                gpui::point(tab_right, top + radius),
+            );
+            path.line_to(gpui::point(tab_right, bottom - curve));
+            quarter_circle_to(
+                &mut path,
+                gpui::point(tab_right, bottom - curve),
+                gpui::point(tab_right, bottom),
+                gpui::point(right, bottom),
+            );
+            if let Ok(path) = path.build() {
+                window.paint_path(path, gpui::rgba(color));
+            }
+        },
+    )
+    .absolute()
+    .top_0()
+    .bottom_0()
+    .left(gpui::px(-FOLDER_RADIUS))
+    .right(gpui::px(-FOLDER_RADIUS))
+}
+
 // ---------- Top bar ----------
 
 #[derive(IntoElement)]
@@ -115,7 +245,10 @@ impl gpui::RenderOnce for TopBar {
             .flex()
             .flex_row()
             .items_center()
+            .relative()
             .bg(rgba(t.bg_secondary))
+            // Bottom border is painted as a child layer so tabs can cover it
+            // under the active tab (see below).
             // Clicking anywhere else on the title bar dismisses the menu.
             .on_mouse_down(MouseButton::Left, {
                 let root = self.root.clone();
@@ -123,6 +256,15 @@ impl gpui::RenderOnce for TopBar {
                     let _ = root.update(cx, |root, cx| root.close_menu(cx));
                 }
             })
+            .child(
+                div()
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(1.))
+                    .bg(rgba(t.chrome_border_color)),
+            )
             .child(render_menu_button(
                 self.menu_open,
                 self.icon_animation,
@@ -130,7 +272,7 @@ impl gpui::RenderOnce for TopBar {
                 self.root.clone(),
                 cx,
             ))
-            .child(divider(t.chrome_border_color))
+            .child(tab_divider(t.chrome_border_color))
             .child(TabBar {
                 root: self.root.clone(),
                 tabs: self.tabs,
@@ -143,7 +285,7 @@ impl gpui::RenderOnce for TopBar {
             // swallow the menu or close / min / max hitboxes.
             .child(
                 div()
-                    .flex_1()
+                    .w(px(40.))
                     .h_full()
                     .window_control_area(WindowControlArea::Drag),
             )
@@ -158,6 +300,16 @@ fn divider(color: u32) -> AnyElement {
         .my(px(4.))
         .mx(px(6.))
         .rounded(px(2.))
+        .bg(rgba(color))
+        .into_any_element()
+}
+
+fn tab_divider(color: u32) -> AnyElement {
+    div()
+        .w(px(1.5))
+        .h(px(FOLDER_SEPARATOR_HEIGHT))
+        .my(px((TOP_BAR_HEIGHT - FOLDER_SEPARATOR_HEIGHT) / 2.))
+        .mx(px(6.))
         .bg(rgba(color))
         .into_any_element()
 }
@@ -331,14 +483,16 @@ impl gpui::RenderOnce for TabBar {
         let root_for_up = self.root.clone();
         div()
             .id("tab-bar")
-            .flex_1()
+            .flex_grow(2.0)
+            .flex_shrink_1()
+            .flex_basis(px(0.))
             .min_w(px(0.))
             .h_full()
             .flex_shrink_0()
             .flex()
             .flex_row()
             .items_stretch()
-            .bg(rgba(t.bg_secondary))
+            .bg(rgba(0x00000000))
             .child(
                 div()
                     .flex()
@@ -346,7 +500,7 @@ impl gpui::RenderOnce for TabBar {
                     .items_stretch()
                     .child(undo("tab-undo", "↩", self.can_undo))
                     .child(undo("tab-redo", "↪", self.can_redo))
-                    .child(divider(t.chrome_border_color)),
+                    .child(tab_divider(t.chrome_border_color)),
             )
             .child(
                 div()
@@ -354,6 +508,7 @@ impl gpui::RenderOnce for TabBar {
                     .flex_1()
                     .min_w(px(0.))
                     .h_full()
+                    .pr(px(8.))
                     .overflow_hidden()
                     .on_mouse_down(
                         MouseButton::Middle,
@@ -386,12 +541,20 @@ impl gpui::RenderOnce for TabBar {
                             .flex()
                             .flex_row()
                             .items_end()
-                            .pl(px(8.))
+                            .px(px(24.))
                             .children(self.tabs.iter().enumerate().map(|(i, tab)| {
                                 let root = self.root.clone();
                                 let tab_id = tab.id;
                                 let is_active = i == self.active;
                                 let is_hovered = self.hovered == Some(tab_id);
+                                let hovered_ix = self
+                                    .hovered
+                                    .and_then(|hid| self.tabs.iter().position(|t| t.id == hid));
+                                let has_shape = |ix: usize| {
+                                    ix == self.active || hovered_ix == Some(ix)
+                                };
+                                let separator =
+                                    i + 1 < self.tabs.len() && !has_shape(i) && !has_shape(i + 1);
                                 // Constant geometry in both states: the outer shell always
                                 // carries side borders, the inner row always carries the
                                 // bottom border — only colors change. Inactive sides are
@@ -409,21 +572,10 @@ impl gpui::RenderOnce for TabBar {
                                     .flex_row()
                                     .items_stretch()
                                     .cursor_pointer()
-                                    .rounded_tl(px(9.))
-                                    .rounded_tr(px(9.))
-                                    .border_l_1()
-                                    .border_r_1()
-                                    .border_t_1()
-                                    .border_color(rgba(if is_active {
-                                        t.chrome_border_color
-                                    } else {
-                                        0x00000000
-                                    }))
-                                    .bg(rgba(if is_active {
-                                        0x00000000
-                                    } else {
-                                        t.bg_secondary
-                                    }))
+                                    .rounded_tl(px(FOLDER_RADIUS))
+                                    .rounded_tr(px(FOLDER_RADIUS))
+                                    .relative()
+                                    .bg(rgba(0x00000000))
                                     .hover(|s| {
                                         if is_active {
                                             s
@@ -446,37 +598,26 @@ impl gpui::RenderOnce for TabBar {
                                         let _ = root
                                             .update(cx, |root, cx| root.activate_tab(tab_id, cx));
                                     })
+                                    .when(is_hovered && !is_active, |tab| {
+                                        tab.child(folder_tab_shape(t.menu_hover_bg))
+                                    })
                                     .when(is_active, |tab| {
+                                        tab.child(folder_tab_shape(t.bg_primary))
+                                            .child(folder_tab_outline(t.chrome_border_color))
+                                    })
+                                    .when(separator, |tab| {
                                         tab.child(
                                             div()
                                                 .absolute()
-                                                .left(px(5.))
-                                                .right(px(5.))
-                                                .top(px(0.))
-                                                .bottom(px(0.))
-                                                .rounded_tl(px(8.))
-                                                .rounded_tr(px(8.))
-                                                .bg(rgba(t.bg_primary)),
-                                        )
-                                        .child(
-                                            div()
-                                                .absolute()
-                                                .left(px(0.))
-                                                .bottom(px(-1.))
-                                                .w(px(12.))
-                                                .h(px(12.))
-                                                .rounded(px(12.))
-                                                .bg(rgba(t.bg_primary)),
-                                        )
-                                        .child(
-                                            div()
-                                                .absolute()
-                                                .right(px(0.))
-                                                .bottom(px(-1.))
-                                                .w(px(12.))
-                                                .h(px(12.))
-                                                .rounded(px(12.))
-                                                .bg(rgba(t.bg_primary)),
+                                                .right(px(-FOLDER_TAB_GAP / 2.0))
+                                                .top(px(
+                                                    (TOP_BAR_HEIGHT - 6. - FOLDER_TOP_PADDING
+                                                        - FOLDER_SEPARATOR_HEIGHT)
+                                                        / 2.0,
+                                                ))
+                                                .w(px(1.5))
+                                                .h(px(FOLDER_SEPARATOR_HEIGHT))
+                                                .bg(rgba(t.chrome_border_color)),
                                         )
                                     })
                                     .child(
@@ -490,8 +631,9 @@ impl gpui::RenderOnce for TabBar {
                                             .flex()
                                             .flex_row()
                                             .items_center()
-                                            .pl(px(9.))
-                                            .pr(px(7.))
+                                            .pl(px(FOLDER_PADDING_X))
+                                            .pr(px(20.))
+                                            .pb(px(FOLDER_TOP_PADDING))
                                             .on_hover({
                                                 let root = self.root.clone();
                                                 move |hovered, _, cx| {
@@ -507,27 +649,6 @@ impl gpui::RenderOnce for TabBar {
                                                     });
                                                 }
                                             })
-                                            .child(
-                                                div()
-                                                    .w(px(14.))
-                                                    .h(px(14.))
-                                                    .mt(px(1.))
-                                                    .mr(px(6.))
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .child(
-                                                        svg()
-                                                            .data(tab_icon(tab))
-                                                            .w(px(14.))
-                                                            .h(px(14.))
-                                                            .text_color(rgba(if is_active {
-                                                                t.accent
-                                                            } else {
-                                                                t.text_secondary
-                                                            })),
-                                                    ),
-                                            )
                                             .child(
                                                 div()
                                                     .min_w(px(0.))
@@ -567,8 +688,8 @@ impl gpui::RenderOnce for TabBar {
                                                 // is always mounted so hover timing cannot hide it.
                                                 div()
                                                     .absolute()
-                                                    .right(px(2.))
-                                                    .top(px(0.))
+                                                    .right(px(3.))
+                                                    .top(px(-2.))
                                                     .bottom(px(0.))
                                                     .w(px(16.))
                                                     .opacity(if is_hovered { 1.0 } else { 0.0 })
