@@ -3,8 +3,8 @@
 //! dwell-to-switch, cursor-velocity tracking, fade tweens, shortcut keycaps.
 
 use gpui::{
-    App, MouseButton, Point, SharedString, WeakEntity, Window, div, point, prelude::*, px, rgba,
-    svg,
+    App, FontWeight, MouseButton, Point, SharedString, WeakEntity, Window, div, point,
+    prelude::*, px, rgba, svg,
 };
 
 use super::chrome::TOP_BAR_HEIGHT;
@@ -21,6 +21,7 @@ pub const PANEL_PADDING_Y: f32 = 4.0;
 pub const PANEL_PADDING_X: f32 = 4.0;
 const SUBMENU_OVERLAP: f32 = 1.0;
 const ITEM_GAP: f32 = 2.0;
+const ITEM_PADDING_LEFT: f32 = 6.0;
 
 /// Chevron marking entries that open a submenu flyout.
 const ICON_CHEVRON: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
@@ -104,7 +105,7 @@ impl AppMenu {
             .items_center()
             .justify_between()
             .h(px(ENTRY_HEIGHT))
-            .pl(px(4.))
+            .pl(px(ITEM_PADDING_LEFT))
             .pr(px(4.))
             .rounded(px(8.))
             .text_sm()
@@ -255,7 +256,7 @@ fn render_item(
                 .items_center()
                 .justify_between()
                 .h(px(ENTRY_HEIGHT))
-                .pl(px(4.))
+                .pl(px(ITEM_PADDING_LEFT))
                 .pr(px(4.))
                 .rounded(px(8.))
                 .text_sm()
@@ -299,26 +300,12 @@ fn shortcut_hint(shortcut: SharedString, t: Theme) -> gpui::AnyElement {
         .split('+')
         .collect::<Vec<_>>()
         .join(" + ");
-    let width = (18. + pretty.len() as f32 * 5.).max(18.);
     div()
-        .min_w(px(18.))
-        .w(px(width))
-        .h(px(18.))
-        .px(px(4.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(4.))
-        .bg(rgba(t.menu_bg))
-        .border_1()
-        .border_color(rgba(t.menu_border_color))
-        .child(
-            div()
-                .text_xs()
-                .font_family(crate::theme::FONT_UI)
-                .text_color(rgba(t.empty_text_primary))
-                .child(pretty),
-        )
+        .text_xs()
+        .font_family(crate::theme::FONT_UI)
+        .font_weight(FontWeight::NORMAL)
+        .text_color(rgba(t.empty_text_primary))
+        .child(pretty)
         .into_any_element()
 }
 

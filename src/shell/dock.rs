@@ -35,7 +35,35 @@ impl DockView {
     fn render_body(&self, cx: &mut App) -> AnyElement {
         match self.visible {
             PanelKind::Files => self.render_project(cx),
+            PanelKind::Info => self.render_info(cx),
         }
+    }
+
+    fn render_info(&self, cx: &mut App) -> AnyElement {
+        let Some(entity) = self.root.upgrade() else {
+            return div().into_any_element();
+        };
+        let info = entity.read(cx).active_file_info();
+        let t = *crate::theme::active(cx);
+        let mut rows = vec![
+            info_row("File Name", info.name, t),
+            info_row("File Size", info.size, t),
+            info_row("Modified", info.modified, t),
+        ];
+        if let Some(dimensions) = info.dimensions {
+            rows.push(info_row("Resolution", dimensions, t));
+        }
+        if let Some(dpi) = info.dpi {
+            rows.push(info_row("DPI", dpi, t));
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .px(px(10.))
+            .overflow_hidden()
+            .children(rows)
+            .into_any_element()
     }
 
     fn render_project(&self, cx: &mut App) -> AnyElement {
@@ -89,6 +117,34 @@ impl DockView {
             .children(entries.into_iter().map(move |entry| project_row(weak.clone(), entry, t)))
             .into_any_element()
     }
+}
+
+fn info_row(label: &'static str, value: String, t: crate::theme::Theme) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .min_w(px(0.))
+        .gap(px(3.))
+        .whitespace_nowrap()
+        .child(
+            div()
+                .font_family(crate::theme::FONT_MONO)
+                .text_xs()
+                .font_weight(WEIGHT_MEDIUM)
+                .text_color(rgba(t.text_secondary))
+                .child(label),
+        )
+        .child(
+            div()
+                .w_full()
+                .min_w(px(0.))
+                .overflow_hidden()
+                .text_ellipsis()
+                .text_sm()
+                .text_color(rgba(t.text_primary))
+                .child(value),
+        )
+        .into_any_element()
 }
 
 fn project_row(root: WeakEntity<RootView>, entry: ProjectEntry, t: crate::theme::Theme) -> AnyElement {

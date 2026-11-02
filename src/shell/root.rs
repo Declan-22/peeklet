@@ -3,32 +3,28 @@
 //! hover tweens, and drag-resize state.
 
 use std::collections::{HashMap, HashSet};
+use std::io::Cursor;
+use std::sync::Arc;
+
+use image::ImageDecoder;
+use chrono::Datelike;
 use std::time::{Duration, Instant};
 
 use gpui::{
     App, ClipboardItem, Context, FocusHandle, Font, FontFeatures, FontStyle, FontWeight, Hsla,
-    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, Point, Render, ScrollDelta,
-    ScrollWheelEvent, ShapedLine, TextRun, WeakEntity, Window, div, prelude::*, px, rgba, svg,
+    ImageSource, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseExitEvent, ObjectFit,
+    Point, Render,
+    ScrollDelta, ScrollWheelEvent, ShapedLine, TextRun, WeakEntity, Window, div, img, prelude::*,
+    px, rgba, svg,
 };
 
-use super::chrome::{BOTTOM_BAR_HEIGHT, BottomBar, TAB_BAR_HEIGHT, TOP_BAR_HEIGHT, TabBar, TopBar};
+use super::chrome::{BOTTOM_BAR_HEIGHT, BottomBar, TOP_BAR_HEIGHT, TopBar};
 use super::dock::{DOCK_DEFAULT_WIDTH, DockView};
 use super::dropdown::AppMenu;
 use super::panels::{DockSide, PanelKind};
 use crate::editor::EditorState;
 use crate::persist::{Store, TabRecord};
 use crate::theme::WEIGHT_MEDIUM;
-
-/// Plus-in-document icon for New File.
-const ICON_NEW_FILE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
-	<path d="M0 0h24v24H0z" fill="none" />
-	<g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5">
-		<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-		<path d="M14 2v6h6" />
-		<path d="M12 18v-6" />
-		<path d="M9 15h6" />
-	</g>
-</svg>"#;
 
 /// Folder icon for Open File.
 const ICON_OPEN_FILE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
@@ -44,6 +40,92 @@ pub struct Tab {
     pub title: String,
     /// Backing file path, if any. Write-through keeps it in sync.
     pub path: Option<String>,
+}
+
+#[derive(Clone)]
+pub(crate) struct FileInfo {
+    pub name: String,
+    pub size: String,
+    pub dimensions: Option<String>,
+    pub dpi: Option<String>,
+    pub modified: String,
+}
+
+impl FileInfo {
+    fn empty() -> Self {
+        Self {
+            name: "No file selected".into(),
+            size: "—".into(),
+            dimensions: None,
+            dpi: None,
+            modified: "—".into(),
+        }
+    }
+}
+
+pub(crate) const ACCEPTED_FILE_EXTENSIONS: &[&str] = &[
+    "txt", "md", "markdown", "rs", "toml", "json", "yaml", "yml", "xml", "html", "css",
+    "js", "ts", "jsx", "tsx", "py", "go", "java", "c", "h", "cpp", "hpp", "sql", "ini",
+    "conf", "csv", "tsv", "png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "ico",
+    "svg", "pdf", "mp3", "wav", "flac", "ogg", "m4a", "aac", "mp4", "mov",
+    "avi", "mkv", "webm", "m4v", "obj", "fbx", "gltf", "glb", "stl", "ply", "3ds", "dae",
+    "blend",
+];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewerKind {
+    Text,
+    Image,
+    Pdf,
+    Audio,
+    Video,
+    ThreeD,
+    Svg,
+    Csv,
+    Unknown,
+}
+
+fn viewer_kind(path: Option<&str>) -> ViewerKind {
+    let Some(path) = path else {
+        return ViewerKind::Text;
+    };
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "ico" => {
+            ViewerKind::Image
+        }
+        "pdf" => ViewerKind::Pdf,
+        "mp3" | "wav" | "flac" | "ogg" | "m4a" | "aac" => ViewerKind::Audio,
+        "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" => ViewerKind::Video,
+        "obj" | "fbx" | "gltf" | "glb" | "stl" | "ply" | "3ds" | "dae" | "blend" => {
+            ViewerKind::ThreeD
+        }
+        "svg" => ViewerKind::Svg,
+        "csv" | "tsv" => ViewerKind::Csv,
+        "txt" | "md" | "markdown" | "rs" | "toml" | "json" | "yaml" | "yml" | "xml"
+        | "html" | "css" | "js" | "ts" | "jsx" | "tsx" | "py" | "go" | "java"
+        | "c" | "h" | "cpp" | "hpp" | "sql" | "ini" | "conf" => ViewerKind::Text,
+        _ => ViewerKind::Unknown,
+    }
+}
+
+fn format_file_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 #[derive(Clone)]
@@ -224,7 +306,17 @@ pub struct RootView {
     project_root: Option<std::path::PathBuf>,
     project_expanded: HashSet<std::path::PathBuf>,
     hovered_tab: Option<usize>,
+    pub(crate) tab_scroll_offset: f32,
+    tab_scroll_drag: Option<(f32, f32)>,
+    pub(crate) hovered_close_tab: Option<usize>,
     store: Store,
+    image_assets: HashMap<String, (Arc<gpui::Image>, u32, u32)>,
+    image_zoom: f32,
+    image_zoom_target: f32,
+    image_pan: (f32, f32),
+    image_pan_target: (f32, f32),
+    image_zoom_tween_active: bool,
+    image_drag: Option<(MouseButton, f32, f32, f32, f32)>,
     /// Buffers keyed by tab id, created lazily.
     editors: HashMap<usize, EditorState>,
     /// Preview focus follows the active tab.
@@ -317,7 +409,17 @@ impl RootView {
             project_root,
             project_expanded,
             hovered_tab: None,
+            tab_scroll_offset: 0.0,
+            tab_scroll_drag: None,
+            hovered_close_tab: None,
             store,
+            image_assets: HashMap::new(),
+            image_zoom: 1.0,
+            image_zoom_target: 1.0,
+            image_pan: (0.0, 0.0),
+            image_pan_target: (0.0, 0.0),
+            image_zoom_tween_active: false,
+            image_drag: None,
             editors: HashMap::new(),
             focus: cx.focus_handle(),
             caret_visible: true,
@@ -351,7 +453,57 @@ impl RootView {
     fn dock_of(kind: PanelKind) -> DockSide {
         match kind {
             PanelKind::Files => DockSide::Left,
+            PanelKind::Info => DockSide::Right,
         }
+    }
+
+    pub(crate) fn active_file_info(&self) -> FileInfo {
+        let Some(path) = self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|tab| tab.path.as_deref())
+        else {
+            return FileInfo::empty();
+        };
+        let path_obj = std::path::Path::new(path);
+        let name = path_obj
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string());
+        let Ok(metadata) = std::fs::metadata(path_obj) else {
+            return FileInfo { name, ..FileInfo::empty() };
+        };
+        let size = format_file_size(metadata.len());
+        let modified = metadata
+            .modified()
+            .ok()
+            .map(|time| {
+                let date = chrono::DateTime::<chrono::Local>::from(time);
+                let month = date.format("%B");
+                let clock = date.format("%I:%M %p").to_string();
+                format!(
+                    "{} {}, {} · {}",
+                    month,
+                    date.day(),
+                    date.year(),
+                    clock.trim_start_matches('0')
+                )
+            })
+            .unwrap_or_else(|| "—".into());
+        let (dimensions, dpi) = if viewer_kind(Some(path)) == ViewerKind::Image {
+            image::ImageReader::open(path)
+                .ok()
+                .and_then(|reader| reader.with_guessed_format().ok())
+                .and_then(|reader| reader.into_decoder().ok())
+                .map(|decoder| {
+                    let (width, height) = decoder.dimensions();
+                    (Some(format!("{width} × {height}")), Some("—".into()))
+                })
+                .unwrap_or((None, None))
+        } else {
+            (None, None)
+        };
+        FileInfo { name, size, dimensions, dpi, modified }
     }
 
     fn save_layout(&self) {
@@ -375,6 +527,11 @@ impl RootView {
     pub fn activate_tab(&mut self, id: usize, cx: &mut Context<Self>) {
         if let Some(i) = self.tabs.iter().position(|t| t.id == id) {
             self.active_tab = i;
+            self.image_zoom = 1.0;
+            self.image_zoom_target = 1.0;
+            self.image_pan = (0.0, 0.0);
+            self.image_pan_target = (0.0, 0.0);
+            self.image_drag = None;
             self.save_layout();
             cx.notify();
         }
@@ -403,16 +560,6 @@ impl RootView {
             self.close_tab(id, cx);
         }
     }
-    /// Open a new empty tab. Nothing touches the disk until the tab is saved.
-    pub fn new_tab(&mut self, cx: &mut Context<Self>) {
-        let id = self.next_tab_id;
-        self.next_tab_id += 1;
-        self.tabs.push(Tab { id, title: "Untitled".into(), path: None });
-        self.active_tab = self.tabs.len() - 1;
-        self.save_layout();
-        cx.notify();
-    }
-
     pub fn open_welcome(&mut self, cx: &mut Context<Self>) {
         if let Some(i) = self.tabs.iter().position(|t| t.title == "Welcome") {
             self.active_tab = i;
@@ -610,7 +757,7 @@ impl RootView {
     }
 
     fn begin_scroll_drag(&mut self, pointer_y: f32, thumb_top: f32, thumb_height: f32, track_h: f32, view_h: f32, cx: &mut Context<Self>) {
-        let track_y = TOP_BAR_HEIGHT + TAB_BAR_HEIGHT;
+        let track_y = TOP_BAR_HEIGHT;
         let local_y = pointer_y - track_y;
         let max = self.scroll_max_for_geometry(view_h, thumb_height);
         if local_y >= thumb_top && local_y <= thumb_top + thumb_height {
@@ -666,7 +813,7 @@ impl RootView {
         if x_col > geo.col_w - 18.0 {
             return;
         }
-        let y_view = y_win - (TOP_BAR_HEIGHT + TAB_BAR_HEIGHT);
+        let y_view = y_win - TOP_BAR_HEIGHT;
         let view_h = Self::viewport_h(window);
         let ed = self.editors.entry(tab_id).or_insert_with(EditorState::new);
         // Rows carry their line's type for measurement.
@@ -796,6 +943,46 @@ impl RootView {
         .detach();
     }
 
+    fn start_image_zoom_animation(&mut self, cx: &mut Context<Self>) {
+        if self.image_zoom_tween_active {
+            return;
+        }
+        self.image_zoom_tween_active = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(12))
+                    .await;
+                let mut done = false;
+                let _ = this.update(cx, |root, cx| {
+                    let zoom_delta = root.image_zoom_target - root.image_zoom;
+                    let pan_x_delta = root.image_pan_target.0 - root.image_pan.0;
+                    let pan_y_delta = root.image_pan_target.1 - root.image_pan.1;
+                    if zoom_delta.abs() < 0.001
+                        && pan_x_delta.abs() < 0.05
+                        && pan_y_delta.abs() < 0.05
+                    {
+                        root.image_zoom = root.image_zoom_target;
+                        root.image_pan = root.image_pan_target;
+                        root.image_zoom_tween_active = false;
+                        done = true;
+                    } else {
+                        // Exponential easing keeps the motion smooth while
+                        // still allowing rapid wheel input to retarget it.
+                        root.image_zoom += zoom_delta * 0.24;
+                        root.image_pan.0 += pan_x_delta * 0.24;
+                        root.image_pan.1 += pan_y_delta * 0.24;
+                    }
+                    cx.notify();
+                });
+                if done {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
     pub fn start_menu_animation(&mut self, cx: &mut Context<Self>) {
         self.menu_animation = 0.0;
         cx.spawn(async move |this, cx| {
@@ -888,6 +1075,22 @@ impl RootView {
         }
     }
 
+    pub fn begin_tab_scroll(&mut self, x: f32) {
+        self.tab_scroll_drag = Some((x, self.tab_scroll_offset));
+    }
+
+    pub fn update_tab_scroll(&mut self, x: f32, cx: &mut Context<Self>) {
+        let Some((start_x, start_offset)) = self.tab_scroll_drag else { return };
+        self.tab_scroll_offset = (start_offset + start_x - x).max(0.0);
+        cx.notify();
+    }
+
+    pub fn end_tab_scroll(&mut self, cx: &mut Context<Self>) {
+        if self.tab_scroll_drag.take().is_some() {
+            cx.notify();
+        }
+    }
+
     // ----- panels -----
 
     pub fn toggle_panel(&mut self, kind: PanelKind, cx: &mut Context<Self>) {
@@ -902,6 +1105,13 @@ impl RootView {
         }
         self.save_layout();
         cx.notify();
+    }
+
+    pub(crate) fn panel_visible(&self, kind: PanelKind) -> bool {
+        match Self::dock_of(kind) {
+            DockSide::Left => self.visible_left == Some(kind),
+            DockSide::Right => self.visible_right == Some(kind),
+        }
     }
 
     pub fn project_entries(&self) -> Vec<ProjectEntry> {
@@ -980,7 +1190,12 @@ impl RootView {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.clone());
-        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        let content = match viewer_kind(Some(&path)) {
+            ViewerKind::Text | ViewerKind::Csv | ViewerKind::Svg => {
+                std::fs::read_to_string(&path).unwrap_or_default()
+            }
+            _ => String::new(),
+        };
         self.recent_files.retain(|p| p != &path);
         self.recent_files.insert(0, path.clone());
         self.recent_files.truncate(12);
@@ -988,6 +1203,11 @@ impl RootView {
         self.next_tab_id += 1;
         self.tabs.push(Tab { id, title, path: Some(path) });
         self.active_tab = self.tabs.len() - 1;
+        self.image_zoom = 1.0;
+        self.image_zoom_target = 1.0;
+        self.image_pan = (0.0, 0.0);
+        self.image_pan_target = (0.0, 0.0);
+        self.image_drag = None;
         self.editors
             .entry(id)
             .or_insert_with(EditorState::new)
@@ -1079,11 +1299,10 @@ impl RootView {
         }
     }
 
-    /// Viewport height: window minus top bar, tab bar, bottom bar.
+    /// Viewport height: window minus top and bottom bars.
     fn viewport_h(window: &mut Window) -> f32 {
         (window.viewport_size().height.as_f32()
             - TOP_BAR_HEIGHT
-            - TAB_BAR_HEIGHT
             - BOTTOM_BAR_HEIGHT)
             .max(0.0)
     }
@@ -1099,7 +1318,7 @@ impl RootView {
     // ----- render -----
 
     fn render_preview(
-        &self,
+        &mut self,
         root: WeakEntity<RootView>,
         snapshot: Option<EditorSnapshot>,
         focus: FocusHandle,
@@ -1107,9 +1326,19 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let title = self.tabs.get(self.active_tab).map(|t| t.title.clone()).unwrap_or_default();
+        let (title, image_path) = self
+            .tabs
+            .get(self.active_tab)
+            .map(|tab| (tab.title.clone(), tab.path.clone()))
+            .unwrap_or_default();
         if title == "Welcome" {
             return self.render_welcome(root, cx);
+        }
+        if viewer_kind(image_path.as_deref()) == ViewerKind::Image {
+            let Some(path) = image_path.as_deref() else {
+                unreachable!("image viewer requires a file path");
+            };
+            return self.render_image_preview(path, root, window, cx);
         }
         let t = *crate::theme::active(cx);
         let snap = snapshot.unwrap_or(EditorSnapshot {
@@ -1351,6 +1580,216 @@ impl RootView {
             .into_any_element()
     }
 
+    fn render_image_preview(
+        &mut self,
+        path: &str,
+        root: WeakEntity<RootView>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> gpui::AnyElement {
+        let t = *crate::theme::active(cx);
+        let image = if let Some(image) = self.image_assets.get(path) {
+            Some(image.clone())
+        } else {
+            let image = std::fs::read(path).ok().and_then(|bytes| {
+                let reader = image::ImageReader::new(Cursor::new(bytes))
+                    .with_guessed_format()
+                    .ok()?;
+                let mut decoder = reader.into_decoder().ok()?;
+                let orientation = decoder.orientation().ok()?;
+                let mut decoded = image::DynamicImage::from_decoder(decoder).ok()?;
+                decoded.apply_orientation(orientation);
+                const MAX_IMAGE_EDGE: u32 = 4096;
+                if decoded.width().max(decoded.height()) > MAX_IMAGE_EDGE {
+                    decoded = decoded.thumbnail(MAX_IMAGE_EDGE, MAX_IMAGE_EDGE);
+                }
+                let mut encoded = Cursor::new(Vec::new());
+                decoded
+                    .write_to(&mut encoded, image::ImageFormat::Png)
+                    .ok()?;
+                Some((
+                    Arc::new(gpui::Image::from_bytes(
+                        gpui::ImageFormat::Png,
+                        encoded.into_inner(),
+                    )),
+                    decoded.width(),
+                    decoded.height(),
+                ))
+            });
+            if let Some(image) = &image {
+                self.image_assets
+                    .insert(path.to_string(), image.clone());
+            }
+            image
+        };
+
+        let Some((image, image_w, image_h)) = image else {
+            return div()
+                .id("image-preview")
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgba(t.bg_primary))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgba(t.text_secondary))
+                        .child("Unable to preview this image"),
+                )
+                .into_any_element();
+        };
+
+        let viewport = window.viewport_size();
+        let (left_occ, right_occ) = self.dock_occupancy();
+        let view_w = (viewport.width.as_f32() - left_occ - right_occ).max(1.0);
+        let view_h = Self::viewport_h(window).max(1.0);
+        let image_w = image_w as f32;
+        let image_h = image_h as f32;
+        const CANVAS_MARGIN: f32 = 16.0;
+        let fit_w = (view_w - CANVAS_MARGIN * 2.0).max(1.0);
+        let fit_h = (view_h - CANVAS_MARGIN * 2.0).max(1.0);
+        let fit = (fit_w / image_w).min(fit_h / image_h);
+        let draw_w = image_w * fit * self.image_zoom;
+        let draw_h = image_h * fit * self.image_zoom;
+        // The inset is only used to establish the fully-fitted image size.
+        // Once zooming starts, pan against the actual canvas edges instead of
+        // carrying that fit inset into the zoomed layout.
+        let max_pan_x = if self.image_zoom <= 1.0 {
+            0.0
+        } else {
+            (draw_w - view_w).abs() / 2.0
+        };
+        let max_pan_y = if self.image_zoom <= 1.0 {
+            0.0
+        } else {
+            (draw_h - view_h).abs() / 2.0
+        };
+        let left = (view_w - draw_w) / 2.0 + self.image_pan.0;
+        let top = (view_h - draw_h) / 2.0 + self.image_pan.1;
+        div()
+            .id("image-preview")
+            .size_full()
+            .relative()
+            .overflow_hidden()
+            .bg(rgba(t.bg_primary))
+            .on_mouse_down(MouseButton::Right, {
+                let root = root.clone();
+                move |event: &MouseDownEvent, _, cx| {
+                    let _ = root.update(cx, |root, _| {
+                        root.image_zoom_target = root.image_zoom;
+                        root.image_pan_target = root.image_pan;
+                        root.image_drag = Some((
+                            MouseButton::Right,
+                            event.position.x.as_f32(),
+                            event.position.y.as_f32(),
+                            root.image_pan.0,
+                            root.image_pan.1,
+                        ));
+                    });
+                    cx.stop_propagation();
+                }
+            })
+            .on_mouse_down(MouseButton::Middle, {
+                let root = root.clone();
+                move |event: &MouseDownEvent, _, cx| {
+                    let _ = root.update(cx, |root, _| {
+                        root.image_zoom_target = root.image_zoom;
+                        root.image_pan_target = root.image_pan;
+                        root.image_drag = Some((
+                            MouseButton::Middle,
+                            event.position.x.as_f32(),
+                            event.position.y.as_f32(),
+                            root.image_pan.0,
+                            root.image_pan.1,
+                        ));
+                    });
+                    cx.stop_propagation();
+                }
+            })
+            .on_mouse_move({
+                let root = root.clone();
+                move |event: &gpui::MouseMoveEvent, _, cx| {
+                    let _ = root.update(cx, |root, cx| {
+                        if let Some((_, start_x, start_y, pan_x, pan_y)) = root.image_drag {
+                            root.image_pan = (
+                                (pan_x + event.position.x.as_f32() - start_x)
+                                    .clamp(-max_pan_x, max_pan_x),
+                                (pan_y + event.position.y.as_f32() - start_y)
+                                    .clamp(-max_pan_y, max_pan_y),
+                            );
+                            root.image_pan_target = root.image_pan;
+                            cx.notify();
+                        }
+                    });
+                }
+            })
+            .on_mouse_exit({
+                let root = root.clone();
+                move |_event: &MouseExitEvent, _, cx| {
+                    let _ = root.update(cx, |root, _| root.image_drag = None);
+                }
+            })
+            .on_mouse_up(MouseButton::Right, {
+                let root = root.clone();
+                move |_, _, cx| {
+                    let _ = root.update(cx, |root, _| root.image_drag = None);
+                }
+            })
+            .on_mouse_up(MouseButton::Middle, {
+                let root = root.clone();
+                move |_, _, cx| {
+                    let _ = root.update(cx, |root, _| root.image_drag = None);
+                }
+            })
+            .on_scroll_wheel({
+                let root = root.clone();
+                move |event: &ScrollWheelEvent, _, cx| {
+                    let delta = event.delta.pixel_delta(px(20.)).y.as_f32();
+                    if delta == 0.0 {
+                        return;
+                    }
+                    let _ = root.update(cx, |root, cx| {
+                        let old_zoom = root.image_zoom;
+                        let step = (delta.abs() * 0.005).clamp(0.08, 0.5);
+                        let factor = if delta >= 0.0 { 1.0 + step } else { 1.0 / (1.0 + step) };
+                        let new_zoom = (root.image_zoom_target * factor).clamp(1.0, 16.0);
+                        let cursor_x = event.position.x.as_f32() - left_occ - view_w / 2.0;
+                        let cursor_y = event.position.y.as_f32()
+                            - TOP_BAR_HEIGHT
+                            - view_h / 2.0;
+                        root.image_zoom_target = new_zoom;
+                        if new_zoom <= 1.0 {
+                            root.image_pan_target = (0.0, 0.0);
+                        } else if new_zoom != old_zoom {
+                            let scale = new_zoom / root.image_zoom;
+                            root.image_pan_target.0 =
+                                cursor_x - (cursor_x - root.image_pan.0) * scale;
+                            root.image_pan_target.1 =
+                                cursor_y - (cursor_y - root.image_pan.1) * scale;
+                        }
+                        root.start_image_zoom_animation(cx);
+                        cx.notify();
+                    });
+                }
+            })
+            .child(
+                div()
+                    .id("image-preview-content")
+                    .absolute()
+                    .left(px(left))
+                    .top(px(top))
+                    .w(px(draw_w))
+                    .h(px(draw_h))
+                    .child(
+                        img(ImageSource::from(image))
+                            .size_full()
+                            .object_fit(ObjectFit::Fill),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// Zed-style welcome tab: big centered greeting, then a narrow
     /// left-aligned column of Get Started actions and recent files.
     fn render_welcome(&self, root: WeakEntity<RootView>, cx: &mut App) -> gpui::AnyElement {
@@ -1375,7 +1814,7 @@ impl RootView {
                 .child(div().flex_1().h(px(1.)).bg(rgba(t.chrome_border_color)))
         };
 
-        let action_button = |id: &'static str, icon: &'static [u8], label: &'static str, cmd: u8| {
+        let action_button = |id: &'static str, icon: &'static [u8], label: &'static str| {
             let root = root.clone();
             div()
                 .id(id)
@@ -1388,19 +1827,24 @@ impl RootView {
                 .rounded(px(6.))
                 .cursor_pointer()
                 .hover(|s| s.bg(rgba(t.menu_hover_bg)))
-                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                    if cmd == 0 {
-                        let _ = root.update(cx, |root, cx| root.new_tab(cx));
-                    } else {
-                        let root = root.clone();
-                        window.defer(cx, move |_, cx| {
-                            if let Some(path) = rfd::FileDialog::new().pick_file() {
-                                let _ = root.update(cx, |root, cx| {
-                                    root.open_file_path(path.to_string_lossy().into_owned(), cx);
-                                });
-                            }
-                        });
-                    }
+                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                    let root = root.clone();
+                    cx.spawn(async move |cx| {
+                        let path = cx
+                            .background_executor()
+                            .spawn(async {
+                                rfd::FileDialog::new()
+                                    .add_filter("Supported files", ACCEPTED_FILE_EXTENSIONS)
+                                    .pick_file()
+                            })
+                            .await;
+                        if let Some(path) = path {
+                            let _ = root.update(cx, |root, cx| {
+                                root.open_file_path(path.to_string_lossy().into_owned(), cx);
+                            });
+                        }
+                    })
+                    .detach();
                 })
                 .child(
                     svg()
@@ -1444,9 +1888,8 @@ impl RootView {
                             .mb(px(28.))
                             .child("Welcome to Peeklet"),
                     )
-                    .child(section("GET STARTED"))
-                    .child(action_button("welcome-new", ICON_NEW_FILE, "New Tab", 0))
-                    .child(action_button("welcome-open", ICON_OPEN_FILE, "Open File…", 1))
+                    .child(section("OPEN A FILE"))
+                    .child(action_button("welcome-open", ICON_OPEN_FILE, "Open File…"))
                     .child(div().h(px(20.)))
                     .when(!self.recent_files.is_empty(), |col| {
                         col.child(section("RECENT FILES")).children(
@@ -1625,10 +2068,25 @@ impl Render for RootView {
             .font_weight(FontWeight::NORMAL)
             .bg(rgba(t.bg_primary))
             .text_color(rgba(t.text_primary))
+            // Clear canvas drags even when the button is released over a
+            // dock, bar, or another child that is not the image surface.
+            .on_mouse_up(MouseButton::Right, cx.listener(|this, _, _, cx| {
+                this.image_drag = None;
+                cx.notify();
+            }))
+            .on_mouse_up(MouseButton::Middle, cx.listener(|this, _, _, cx| {
+                this.image_drag = None;
+                cx.notify();
+            }))
             .child(TopBar {
                 root: root.clone(),
                 menu_open: self.menu_open,
                 icon_animation: self.icon_animation,
+                tabs: self.tabs.clone(),
+                active: self.active_tab,
+                hovered: self.hovered_tab,
+                can_undo,
+                can_redo,
             })
             // Middle row: docks flank the tab bar + preview column, and
             // span exactly that height (below top bar, above bottom bar).
@@ -1659,14 +2117,6 @@ impl Render for RootView {
                             .flex()
                             .flex_col()
                             .min_h(px(0.))
-                            .child(TabBar {
-                                root: root.clone(),
-                                tabs: self.tabs.clone(),
-                                active: self.active_tab,
-                                hovered: self.hovered_tab,
-                                can_undo,
-                                can_redo,
-                            })
                             .child(self.render_preview(
                                 root.clone(),
                                 snapshot,

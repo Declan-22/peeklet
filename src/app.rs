@@ -35,9 +35,8 @@ pub fn run() {
                 }),
                 ..Default::default()
             },
-            |window, cx| {
-                let store = Store::open_default();
-                let view = cx.new(|cx| RootView::new(cx, store));
+            move |window, cx| {
+                let view = cx.new(move |cx| RootView::new(cx, store));
                 // The preview takes keyboard focus immediately; clicking it
                 // re-focuses later.
                 let focus = view.read(cx).focus.clone();
@@ -71,9 +70,6 @@ fn register_action_handlers(cx: &mut App) {
     cx.on_action(|_: &Quit, cx| cx.quit());
     cx.on_action(|_: &ToggleTheme, cx| {
         with_root(cx, |root, cx| root.toggle_theme(cx));
-    });
-    cx.on_action(|_: &NewTab, cx| {
-        with_root(cx, |root, cx| root.new_tab(cx));
     });
     cx.on_action(|_: &CloseTab, cx| {
         with_root(cx, |root, cx| root.close_active_tab(cx));
@@ -115,14 +111,29 @@ fn register_action_handlers(cx: &mut App) {
         }
     });
     cx.on_action(|_: &OpenFile, cx| {
-        // Native dialogs are re-entrant on Windows. Defer them until the
-        // action's GPUI app borrow has been released.
-        cx.defer(|cx| {
-            if let Some(path) = rfd::FileDialog::new().pick_file() {
-                let path = path.to_string_lossy().into_owned();
-                with_root(cx, |root, cx| root.open_file_path(path, cx));
+        // Native dialogs pump the Windows message loop and must never run
+        // on the GPUI/UI thread. Pick the file in the background, then apply
+        // the result on GPUI's foreground executor.
+        let root = cx.global::<RootHandle>().0.clone();
+        cx.spawn(async move |cx| {
+            let path = cx
+                .background_executor()
+                .spawn(async {
+                    rfd::FileDialog::new()
+                        .add_filter(
+                            "Supported files",
+                            crate::shell::root::ACCEPTED_FILE_EXTENSIONS,
+                        )
+                        .pick_file()
+                })
+                .await;
+            if let Some(path) = path {
+                let _ = root.update(cx, |root, cx| {
+                    root.open_file_path(path.to_string_lossy().into_owned(), cx);
+                });
             }
-        });
+        })
+        .detach();
     });
     cx.on_action(|_: &OpenFolder, cx| {
         // rfd pumps the Windows message loop while the native dialog is
@@ -152,7 +163,6 @@ fn register_action_handlers(cx: &mut App) {
 
 fn bind_keys(cx: &mut App) {
     cx.bind_keys([
-        KeyBinding::new("ctrl-n", NewTab, None),
         KeyBinding::new("ctrl-o", OpenFile, None),
         KeyBinding::new("ctrl-w", CloseTab, None),
         KeyBinding::new("ctrl-z", Undo, None),

@@ -3,8 +3,8 @@
 use gpui::{Action, SharedString};
 
 use super::actions::{
-    CloseTab, NewTab, OpenFile, OpenFolder, Quit, Redo, Save, ShowWelcome, ToggleFilesPanel,
-    ToggleTheme, Undo,
+    CloseTab, OpenFile, OpenFolder, Quit, Redo, Save, ShowWelcome, ToggleFilesPanel, ToggleTheme,
+    Undo,
 };
 
 pub struct Menu {
@@ -56,7 +56,6 @@ pub fn default_menus() -> Vec<Menu> {
         Menu {
             label: "File".into(),
             items: vec![
-                MenuItem::entry("New Tab", NewTab).shortcut("Ctrl+N"),
                 MenuItem::entry("Open File…", OpenFile).shortcut("Ctrl+O"),
                 MenuItem::entry("Open Folder…", OpenFolder),
                 MenuItem::separator(),

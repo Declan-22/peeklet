@@ -3726,9 +3726,11 @@ dependencies = [
 name = "peeklet"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "dirs",
  "gpui",
  "gpui_platform",
+ "image",
  "rfd",
  "ropey",
  "rusqlite",

@@ -9,7 +9,6 @@ actions!(
     [
         Quit,
         ToggleTheme,
-        NewTab,
         OpenFile,
         OpenFolder,
         CloseTab,
