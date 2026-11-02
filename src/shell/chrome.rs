@@ -2,37 +2,56 @@
 //! (placeholder for per-file-type controls).
 
 use gpui::{
-    AnyElement, App, MouseButton, WeakEntity, Window, WindowControlArea, canvas, div, prelude::*, px,
-    rgba, svg,
+    AnyElement, App, MouseButton, WeakEntity, Window, WindowControlArea, canvas, deferred, div,
+    prelude::*, px, rgba, svg,
 };
 
-use super::panels::{ICON_INFO, PanelKind};
+use super::panels::{ICON_INFO, ICON_PDF, PanelKind};
 use super::root::{RootView, Tab};
 use crate::theme::WEIGHT_MEDIUM;
 
 pub const TOP_BAR_HEIGHT: f32 = 36.0;
 pub const BOTTOM_BAR_HEIGHT: f32 = 30.0;
+const TOP_BAR_BUTTON_SIZE: f32 = 24.0;
+const TOP_BAR_SMALL_BUTTON_SIZE: f32 = 22.0;
+const TOP_BAR_ICON_SIZE: f32 = 20.0;
+const TOP_BAR_CONTROL_CLUSTER_WIDTH: f32 = 116.0;
 
 const MENU_ICON: &[u8] =
     br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
 	<path d="M0 0h24v24H0z" fill="none" />
-	<g fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.5">
-		<path d="M20 7L4 7" />
-		<path d="M20 12L4 12" />
-		<path d="M20 17L4 17" />
-	</g>
+	<path fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="2.6" d="M9.41 7.3H9.4m5.2 0h-.01M9.31 12H9.3m5.3 0h-.01m-5.18 4.7H9.4m5.2 0h-.01" />
 </svg>
 "#;
+
+#[allow(dead_code)]
+const SIDEBAR_ICON: &[u8] = br#"<svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M6.83496 3.99992C6.38353 4.00411 6.01421 4.0122 5.69824 4.03801C5.31232 4.06954 5.03904 4.12266 4.82227 4.20012L4.62207 4.28606C4.18264 4.50996 3.81498 4.85035 3.55859 5.26848L3.45605 5.45207C3.33013 5.69922 3.25006 6.01354 3.20801 6.52824C3.16533 7.05065 3.16504 7.71885 3.16504 8.66301V11.3271C3.16504 12.2712 3.16533 12.9394 3.20801 13.4618C3.25006 13.9766 3.33013 14.2909 3.45605 14.538L3.55859 14.7216C3.81498 15.1397 4.18266 15.4801 4.62207 15.704L4.82227 15.79C5.03904 15.8674 5.31234 15.9205 5.69824 15.9521C6.01398 15.9779 6.383 15.986 6.83398 15.9902L6.83496 3.99992ZM18.165 11.3271C18.165 12.2493 18.1653 12.9811 18.1172 13.5702C18.0745 14.0924 17.9916 14.547 17.8125 14.9648L17.7295 15.1415C17.394 15.8 16.8834 16.3511 16.2568 16.7353L15.9814 16.8896C15.5157 17.1268 15.0069 17.2285 14.4102 17.2773C13.821 17.3251 13.0893 17.3251 12.167 17.3251H7.83301C6.91071 17.3251 6.17898 17.3251 5.58984 17.2773C5.06757 17.2346 4.61294 17.1505 4.19531 16.9716L4.01855 16.8896C3.36014 16.5541 2.80898 16.0434 2.4248 15.4169L2.27051 15.1415C2.03328 14.6758 1.93158 14.167 1.88281 13.5702C1.83468 12.9811 1.83496 12.2493 1.83496 11.3271V8.66301C1.83496 7.74072 1.83468 7.00898 1.88281 6.41985C1.93157 5.82309 2.03329 5.31432 2.27051 4.84856L2.4248 4.57317C2.80898 3.94666 3.36012 3.436 4.01855 3.10051L4.19531 3.0175C4.61285 2.83843 5.06771 2.75548 5.58984 2.71281C6.17898 2.66468 6.91071 2.66496 7.83301 2.66496H12.167C13.0893 2.66496 13.821 2.66468 14.4102 2.71281C15.0069 2.76157 15.5157 2.86329 15.9814 3.10051L16.2568 3.25481C16.8833 3.63898 17.394 4.19012 17.7295 4.84856L17.8125 5.02531C17.9916 5.44285 18.0745 5.89771 18.1172 6.41985C18.1653 7.00898 18.165 7.74072 18.165 8.66301V11.3271ZM8.16406 15.995H12.167C13.1112 15.995 13.7794 15.9947 14.3018 15.9521C14.8164 15.91 15.1308 15.8299 15.3779 15.704L15.5615 15.6015C15.9797 15.3451 16.32 14.9774 16.5439 14.538L16.6299 14.3378C16.7074 14.121 16.7605 13.8478 16.792 13.4618C16.8347 12.9394 16.835 12.2712 16.835 11.3271V8.66301C16.835 7.71885 16.8347 7.05065 16.792 6.52824C16.7605 6.14232 16.7073 5.86904 16.6299 5.65227L16.5439 5.45207C16.32 5.01264 15.9796 4.64498 15.5615 4.3886L15.3779 4.28606C15.1308 4.16013 14.8165 4.08006 14.3018 4.03801C13.7794 3.99533 13.111 3.99504 12.167 3.99504H8.16406C8.16407 3.99667 8.16504 3.99829 8.16504 3.99992L8.16406 15.995Z" fill="currentColor"/>
+</svg>"#;
+
+const SIDEBAR_ICON_COMPACT: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
+	<path d="M0 0h24v24H0z" fill="none" />
+	<g fill="none" stroke="currentColor" stroke-width="2">
+		<rect width="14" height="14" x="5" y="5" rx="4" />
+		<path stroke-linecap="round" d="M9 9v6" />
+	</g>
+</svg>"#;
+
+const UNDO_ICON: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+	<path d="M0 0h24v24H0z" fill="none" />
+	<path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 12H7m0 0l3.33-3.33M7 12l3.33 3.33" />
+</svg>"#;
+
+const REDO_ICON: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+	<path d="M0 0h24v24H0z" fill="none" />
+	<path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 12h10m0 0l-3.33-3.33M17 12l-3.33 3.33" />
+</svg>"#;
 
 const TAB_CLOSE_ICON: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
 	<path d="M0 0h24v24H0z" fill="none" />
 	<path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="m18 6l-6 6m0 0l-6 6m6-6l6 6m-6-6L6 6" />
 </svg>
 "#;
-
-const TAB_PLUS_ICON: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
-<path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.5"/>
-</svg>"#;
 
 const TAB_MAX_WIDTH: f32 = 220.0;
 
@@ -95,7 +114,7 @@ fn tab_icon(tab: &Tab) -> &'static [u8] {
 const FOLDER_TAB_GAP: f32 = 4.0;
 const FOLDER_RADIUS: f32 = 8.0;
 const FOLDER_TOP_PADDING: f32 = 4.0;
-const FOLDER_PADDING_X: f32 = 10.0;
+const FOLDER_PADDING_X: f32 = 20.0;
 const FOLDER_SEPARATOR_HEIGHT: f32 = 16.0;
 
 /// Adds a quarter circle from `from` to `to`, whose tangents meet at `corner`.
@@ -232,6 +251,11 @@ pub struct TopBar {
     pub hovered: Option<usize>,
     pub can_undo: bool,
     pub can_redo: bool,
+    /// Continuous sidebar animation value. Keeping the divider in the layout
+    /// during the animation prevents the tab strip from snapping when the
+    /// sidebar finishes closing.
+    pub sidebar_progress: f32,
+    pub sidebar_width: f32,
 }
 
 impl gpui::RenderOnce for TopBar {
@@ -247,6 +271,9 @@ impl gpui::RenderOnce for TopBar {
             .items_center()
             .relative()
             .bg(rgba(t.bg_secondary))
+            // Empty space in the title bar is draggable. Interactive children
+            // (tabs, menu, and window controls) retain their own hit areas.
+            .window_control_area(WindowControlArea::Drag)
             // Bottom border is painted as a child layer so tabs can cover it
             // under the active tab (see below).
             // Clicking anywhere else on the title bar dismisses the menu.
@@ -265,32 +292,89 @@ impl gpui::RenderOnce for TopBar {
                     .h(px(1.))
                     .bg(rgba(t.chrome_border_color)),
             )
+            .child(render_history_buttons(
+                t,
+                self.root.clone(),
+                self.can_undo,
+                self.can_redo,
+                shell_fade(&self.root, cx, "tab-undo"),
+                shell_fade(&self.root, cx, "tab-redo"),
+            ))
+            .child(render_sidebar_button(
+                t,
+                self.root.clone(),
+                shell_fade(&self.root, cx, "tb-sidebar"),
+            ))
             .child(render_menu_button(
                 self.menu_open,
                 self.icon_animation,
                 t,
                 self.root.clone(),
-                cx,
+                shell_fade(&self.root, cx, "tb-menu"),
             ))
-            .child(tab_divider(t.chrome_border_color))
+            .child(
+                div()
+                    .w(px((self.sidebar_width - TOP_BAR_CONTROL_CLUSTER_WIDTH).max(0.)))
+                    .h_full()
+                    .flex_shrink_0(),
+            )
+            // Keep the divider's layout slot alive throughout the close
+            // animation. It grows into place instead of being inserted after
+            // the tabs have already moved to the left.
+            .child(
+                div()
+                    .w(px(13.5 * (1.0 - self.sidebar_progress.clamp(0., 1.))))
+                    .h_full()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .w(px(1.5))
+                            .h(px(FOLDER_SEPARATOR_HEIGHT))
+                            .rounded(px(2.))
+                            .bg(rgba(t.chrome_border_color)),
+                    ),
+            )
             .child(TabBar {
                 root: self.root.clone(),
                 tabs: self.tabs,
                 active: self.active,
                 hovered: self.hovered,
-                can_undo: self.can_undo,
-                can_redo: self.can_redo,
             })
-            // Spacer — only this region is draggable so it doesn't
-            // swallow the menu or close / min / max hitboxes.
-            .child(
-                div()
-                    .w(px(40.))
-                    .h_full()
-                    .window_control_area(WindowControlArea::Drag),
-            )
             .child(render_window_controls(t, cx))
     }
+}
+
+pub fn render_sidebar_controls(
+    t: crate::theme::Theme,
+    root: WeakEntity<RootView>,
+    can_undo: bool,
+    can_redo: bool,
+    sidebar_fade: f32,
+    undo_fade: f32,
+    redo_fade: f32,
+    menu_fade: f32,
+) -> AnyElement {
+    div()
+        .id("sidebar-controls")
+        .h(px(TOP_BAR_HEIGHT))
+        .flex()
+        .flex_row()
+        .items_center()
+        .bg(rgba(t.bg_tertiary))
+        .child(render_history_buttons(
+            t,
+            root.clone(),
+            can_undo,
+            can_redo,
+            undo_fade,
+            redo_fade,
+        ))
+        .child(render_sidebar_button(t, root.clone(), sidebar_fade))
+        .child(render_menu_button(false, 0.0, t, root, menu_fade))
+        .into_any_element()
 }
 
 fn divider(color: u32) -> AnyElement {
@@ -319,33 +403,25 @@ fn render_menu_button(
     animation: f32,
     t: crate::theme::Theme,
     root: WeakEntity<RootView>,
-    cx: &App,
+    hover_fade: f32,
 ) -> AnyElement {
     // Active fade follows the open/close animation; hover fade is a tween.
     let act = animation.clamp(0., 1.);
-    let hov = shell_fade(&root, cx, "tb-menu");
-    let k = act.max(hov);
-    let bg = crate::theme::lerp_rgb(t.bg_secondary, t.bg_tertiary, k);
-    let icon_color = crate::theme::lerp_rgb(t.text_secondary, t.text_primary, act);
-    let border = crate::theme::fade_in(t.border_color, k);
-    let mut shadow = t.shadow_sm();
-    shadow.color = rgba(crate::theme::fade_in(t.item_shadow_color, k)).into();
+    let k = act.max(hover_fade);
+    let bg = crate::theme::lerp_rgb(t.bg_secondary, t.menu_hover_bg, k);
 
     div()
         .id("app-menu-button")
         .flex()
         .items_center()
         .justify_center()
-        .w(px(TOP_BAR_HEIGHT - 8.))
-        .h(px(TOP_BAR_HEIGHT - 8.))
-        .ml(px(3.))
+        .w(px(TOP_BAR_BUTTON_SIZE))
+        .h(px(TOP_BAR_BUTTON_SIZE))
+        .ml(px(2.))
+        .my(px((TOP_BAR_HEIGHT - TOP_BAR_BUTTON_SIZE) / 2.))
         .rounded(px(6.))
         .cursor_pointer()
-        // Constant geometry; only colors tween.
-        .border_1()
-        .border_color(rgba(border))
         .bg(rgba(bg))
-        .shadow(vec![shadow])
         .on_hover({
             let root = root.clone();
             move |hovered, _, cx| {
@@ -363,10 +439,140 @@ fn render_menu_button(
         .child(
             svg()
                 .data(MENU_ICON)
-                .w(px(20.))
-                .h(px(20.))
-                .text_color(rgba(icon_color)),
+                .w(px(TOP_BAR_ICON_SIZE))
+                .h(px(TOP_BAR_ICON_SIZE))
+                .text_color(rgba(crate::theme::lerp_rgb(
+                    t.empty_text_primary,
+                    t.text_primary,
+                    k,
+                ))),
         )
+        .into_any_element()
+}
+
+fn render_sidebar_button(
+    t: crate::theme::Theme,
+    root: WeakEntity<RootView>,
+    fade: f32,
+) -> AnyElement {
+    div()
+        .id("sidebar-toggle")
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(TOP_BAR_BUTTON_SIZE))
+        .h(px(TOP_BAR_BUTTON_SIZE))
+        .ml(px(2.))
+        .my(px((TOP_BAR_HEIGHT - TOP_BAR_BUTTON_SIZE) / 2.))
+        .rounded(px(6.))
+        .cursor_pointer()
+        .bg(rgba(crate::theme::lerp_rgb(
+            t.bg_secondary,
+            t.menu_hover_bg,
+            fade,
+        )))
+        .on_hover({
+            let root = root.clone();
+            move |hovered, _, cx| {
+                let _ = root.update(cx, |root, cx| {
+                    root.animate_fade("tb-sidebar", if *hovered { 1.0 } else { 0.0 }, cx);
+                });
+            }
+        })
+        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+            let _ = root.update(cx, |root, cx| {
+                root.toggle_panel(PanelKind::Files, cx);
+                cx.stop_propagation();
+            });
+        })
+        .child(
+            svg()
+                .data(SIDEBAR_ICON_COMPACT)
+                .w(px(TOP_BAR_ICON_SIZE))
+                .h(px(TOP_BAR_ICON_SIZE))
+                .text_color(rgba(crate::theme::lerp_rgb(
+                    t.empty_text_primary,
+                    t.text_primary,
+                    fade,
+                ))),
+        )
+        .into_any_element()
+}
+
+fn render_history_buttons(
+    t: crate::theme::Theme,
+    root: WeakEntity<RootView>,
+    can_undo: bool,
+    can_redo: bool,
+    undo_fade: f32,
+    redo_fade: f32,
+) -> AnyElement {
+    let button = |id: &'static str, enabled: bool| {
+        let root = root.clone();
+        let fade = if id == "tab-undo" { undo_fade } else { redo_fade };
+        div()
+            .id(id)
+            .w(px(TOP_BAR_SMALL_BUTTON_SIZE))
+            .h(px(TOP_BAR_SMALL_BUTTON_SIZE))
+            .my(px((TOP_BAR_HEIGHT - TOP_BAR_SMALL_BUTTON_SIZE) / 2.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(6.))
+            .cursor_pointer()
+            .text_sm()
+            .bg(rgba(crate::theme::lerp_rgb(
+                t.bg_secondary,
+                t.menu_hover_bg,
+                fade,
+            )))
+            .on_hover({
+                let root = root.clone();
+                move |hovered, _, cx| {
+                    let _ = root.update(cx, |root, cx| {
+                        root.animate_fade(id, if *hovered { 1.0 } else { 0.0 }, cx);
+                    });
+                }
+            })
+            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                let _ = root.update(cx, |root, cx| {
+                    if id == "tab-undo" {
+                        root.undo(cx);
+                    } else {
+                        root.redo(cx);
+                    }
+                });
+            })
+            .child(
+                svg()
+                    .data(if id == "tab-undo" {
+                        UNDO_ICON
+                    } else {
+                        REDO_ICON
+                    })
+                    .w(px(TOP_BAR_ICON_SIZE))
+                    .h(px(TOP_BAR_ICON_SIZE))
+                    .text_color(rgba(crate::theme::lerp_rgb(
+                        if enabled {
+                            t.empty_text_primary
+                        } else {
+                            t.empty_text_secondary
+                        },
+                        t.text_primary,
+                        fade,
+                    ))),
+            )
+    };
+
+    div()
+        .id("top-bar-history")
+        .flex()
+        .flex_row()
+        .items_center()
+        .ml(px(6.))
+        .child(button("tab-undo", can_undo))
+        .child(button("tab-redo", can_redo))
+        .child(tab_divider(t.chrome_border_color))
         .into_any_element()
 }
 
@@ -434,50 +640,11 @@ pub struct TabBar {
     pub tabs: Vec<Tab>,
     pub active: usize,
     pub hovered: Option<usize>,
-    pub can_undo: bool,
-    pub can_redo: bool,
 }
 
 impl gpui::RenderOnce for TabBar {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl gpui::IntoElement {
         let t = *crate::theme::active(cx);
-        let undo = |id: &'static str, label: &'static str, enabled: bool| {
-            let root = self.root.clone();
-            div()
-                .id(id)
-                .w(px(30.))
-                .h_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_sm()
-                .text_color(rgba(if enabled {
-                    t.text_secondary
-                } else {
-                    t.empty_text_secondary
-                }))
-                .hover(|s| {
-                    if enabled {
-                        s.bg(rgba(t.menu_hover_bg))
-                    } else {
-                        s
-                    }
-                })
-                .on_mouse_down(MouseButton::Left, {
-                    let root = root.clone();
-                    move |_, _, cx| {
-                        let _ = root.update(cx, |root, cx| {
-                            if id == "tab-undo" {
-                                root.undo(cx);
-                            } else {
-                                root.redo(cx);
-                            }
-                        });
-                    }
-                })
-                .child(label)
-        };
-
         let root_for_scroll = self.root.clone();
         let root_for_move = self.root.clone();
         let root_for_up = self.root.clone();
@@ -493,15 +660,6 @@ impl gpui::RenderOnce for TabBar {
             .flex_row()
             .items_stretch()
             .bg(rgba(0x00000000))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_stretch()
-                    .child(undo("tab-undo", "↩", self.can_undo))
-                    .child(undo("tab-redo", "↪", self.can_redo))
-                    .child(tab_divider(t.chrome_border_color)),
-            )
             .child(
                 div()
                     .id("tab-viewport")
@@ -541,7 +699,7 @@ impl gpui::RenderOnce for TabBar {
                             .flex()
                             .flex_row()
                             .items_end()
-                            .px(px(24.))
+                            .px(px(8.))
                             .children(self.tabs.iter().enumerate().map(|(i, tab)| {
                                 let root = self.root.clone();
                                 let tab_id = tab.id;
@@ -602,8 +760,16 @@ impl gpui::RenderOnce for TabBar {
                                         tab.child(folder_tab_shape(t.menu_hover_bg))
                                     })
                                     .when(is_active, |tab| {
-                                        tab.child(folder_tab_shape(t.bg_primary))
-                                            .child(folder_tab_outline(t.chrome_border_color))
+                                        // Deferred active-tab painting keeps its convex corners
+                                        // above hover shapes from tabs on either side.
+                                        tab.child(
+                                            deferred(folder_tab_shape(t.bg_primary))
+                                                .with_priority(1),
+                                        )
+                                        .child(
+                                            deferred(folder_tab_outline(t.chrome_border_color))
+                                                .with_priority(1),
+                                        )
                                     })
                                     .when(separator, |tab| {
                                         tab.child(
@@ -621,7 +787,8 @@ impl gpui::RenderOnce for TabBar {
                                         )
                                     })
                                     .child(
-                                        div()
+                                        deferred(
+                                            div()
                                             .relative()
                                             .id(format!("tab-surface-{tab_id}"))
                                             .min_w(px(0.))
@@ -632,8 +799,9 @@ impl gpui::RenderOnce for TabBar {
                                             .flex_row()
                                             .items_center()
                                             .pl(px(FOLDER_PADDING_X))
-                                            .pr(px(20.))
-                                            .pb(px(FOLDER_TOP_PADDING))
+                                            // Keep the title clear of the close control and
+                                            // give both sides enough breathing room.
+                                            .pr(px(28.))
                                             .on_hover({
                                                 let root = self.root.clone();
                                                 move |hovered, _, cx| {
@@ -661,7 +829,7 @@ impl gpui::RenderOnce for TabBar {
                                                         div()
                                                             .w_full()
                                                             .min_w(px(0.))
-                                                            .text_left()
+                                                            .text_center()
                                                             .text_sm()
                                                             .font_weight(WEIGHT_MEDIUM)
                                                             .text_color(rgba(if is_active {
@@ -688,8 +856,8 @@ impl gpui::RenderOnce for TabBar {
                                                 // is always mounted so hover timing cannot hide it.
                                                 div()
                                                     .absolute()
-                                                    .right(px(3.))
-                                                    .top(px(-2.))
+                                                    .right(px(4.))
+                                                    .top_0()
                                                     .bottom(px(0.))
                                                     .w(px(16.))
                                                     .opacity(if is_hovered { 1.0 } else { 0.0 })
@@ -760,28 +928,10 @@ impl gpui::RenderOnce for TabBar {
                                                             ),
                                                     )
                                             }),
+                                            )
+                                            .with_priority(2),
                                     )
                             }))
-                            .child(
-                                div()
-                                    .id("new-tab")
-                                    .w(px(32.))
-                                    .h_full()
-                                    .flex_shrink_0()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_color(rgba(t.text_secondary))
-                                    .hover(|s| s.bg(rgba(t.menu_hover_bg)))
-                                    .on_mouse_down(MouseButton::Left, {
-                                        let root = self.root.clone();
-                                        move |_, _, cx| {
-                                            let _ =
-                                                root.update(cx, |root, cx| root.open_welcome(cx));
-                                        }
-                                    })
-                                    .child(svg().data(TAB_PLUS_ICON).w(px(15.)).h(px(15.))),
-                            ),
                     ),
             )
     }
@@ -841,5 +991,51 @@ impl gpui::RenderOnce for BottomBar {
                             .text_color(rgba(t.text_secondary)),
                     ),
             )
+    }
+}
+
+/// The dock owns a second bottom bar so file-type tools do not compete with
+/// the application-wide status controls.
+#[derive(IntoElement)]
+pub struct SidebarBottomBar {
+    pub root: WeakEntity<RootView>,
+}
+
+impl gpui::RenderOnce for SidebarBottomBar {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl gpui::IntoElement {
+        let t = *crate::theme::active(cx);
+        let pdf_active = self.root.upgrade().is_some_and(|root| root.read(cx).panel_visible(PanelKind::PdfPages));
+        let is_pdf = self.root.upgrade().is_some_and(|root| root.read(cx).active_is_pdf());
+        let root = self.root.clone();
+
+        div()
+            .id("sidebar-bottom-bar")
+            .w_full()
+            .h(px(BOTTOM_BAR_HEIGHT))
+            .flex()
+            .flex_row()
+            .items_center()
+            .px(px(6.))
+            .bg(rgba(t.bg_secondary))
+            .border_t_1()
+            .border_color(rgba(t.chrome_border_color))
+            .when(is_pdf, |bar| bar.child(
+                div()
+                    .id("sidebar-pdf-toggle")
+                    .w(px(24.))
+                    .h(px(24.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(5.))
+                    .cursor_pointer()
+                    .when(pdf_active, |button| button.bg(rgba(t.bg_tertiary)))
+                    .hover(|button| button.bg(rgba(t.bg_tertiary)))
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        let _ = root.update(cx, |root, cx| root.toggle_panel(PanelKind::PdfPages, cx));
+                        cx.stop_propagation();
+                    })
+                    .child(svg().data(ICON_PDF).w(px(15.)).h(px(15.)).text_color(rgba(t.text_secondary))),
+            ))
     }
 }

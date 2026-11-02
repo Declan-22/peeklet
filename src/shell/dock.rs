@@ -3,10 +3,8 @@
 //! The resize handle is an invisible overlay straddling the dock's inner
 //! edge, so the tab bar meets the dock with no gap.
 
-use gpui::{
-    AnyElement, App, CursorStyle, MouseButton, MouseDownEvent, WeakEntity, div, prelude::*, px,
-    rgba,
-};
+use gpui::{AnyElement, App, CursorStyle, ImageSource, MouseButton, MouseDownEvent, ObjectFit,
+    WeakEntity, div, img, prelude::*, px, rgba};
 
 use super::panels::{DockSide, PanelKind};
 use super::actions::OpenFolder;
@@ -22,6 +20,8 @@ pub struct DockView {
     pub side: DockSide,
     pub visible: PanelKind,
     pub width: f32,
+    pub header: Option<AnyElement>,
+    pub footer: Option<AnyElement>,
 }
 
 impl DockView {
@@ -36,7 +36,46 @@ impl DockView {
         match self.visible {
             PanelKind::Files => self.render_project(cx),
             PanelKind::Info => self.render_info(cx),
+            PanelKind::PdfPages => self.render_pdf_pages(cx),
         }
+    }
+
+    fn render_pdf_pages(&self, cx: &mut App) -> AnyElement {
+        let Some(entity) = self.root.upgrade() else { return div().into_any_element(); };
+        let t = *crate::theme::active(cx);
+        let pages = entity.read(cx).pdf_page_assets();
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(8.))
+            .px(px(8.))
+            .pt(px(8.))
+            .overflow_hidden()
+            .children(pages.into_iter().enumerate().map(|(page, (image, width, height))| {
+                let thumb_width = 192.0;
+                let thumb_height = (thumb_width * height as f32 / width.max(1) as f32).min(108.0);
+                div()
+                    .id(format!("pdf-page-thumb-{page}"))
+                    .w_full()
+                    .h(px(108.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(5.))
+                    .border_1()
+                    .border_color(rgba(t.chrome_border_color))
+                    .bg(rgba(t.bg_secondary))
+                    .child(
+                        div()
+                            .w(px(thumb_width.min(208.)))
+                            .h(px(thumb_height))
+                            .bg(rgba(0xffffffff))
+                            .child(img(ImageSource::from(image)).size_full().object_fit(ObjectFit::Fill)),
+                    )
+                    .into_any_element()
+            }))
+            .into_any_element()
     }
 
     fn render_info(&self, cx: &mut App) -> AnyElement {
@@ -188,6 +227,7 @@ impl gpui::RenderOnce for DockView {
         let t = *crate::theme::active(cx);
         let root = self.root.clone();
         let side = self.side;
+        let body = self.render_body(cx);
 
         // Invisible overlay straddling the dock's inner edge: 2px over the
         // dock, 3px over the manuscript. No hover effect — the cursor
@@ -220,11 +260,16 @@ impl gpui::RenderOnce for DockView {
             .flex()
             .flex_col()
             .overflow_hidden()
-            .bg(rgba(t.bg_secondary))
+            .bg(rgba(if side == DockSide::Left {
+                t.bg_primary
+            } else {
+                t.bg_secondary
+            }))
             // 1px separator where the dock meets the tab bar / manuscript.
             .border_color(rgba(t.chrome_border_color))
             .when(side == DockSide::Left, |p| p.border_r_1())
             .when(side == DockSide::Right, |p| p.border_l_1())
+            .when_some(self.header, |panel, header| panel.child(header))
             .child(
                 div()
                     .flex_1()
@@ -232,8 +277,10 @@ impl gpui::RenderOnce for DockView {
                     .pt(px(8.))
                     .pb(px(8.))
                     .overflow_hidden()
-                    .child(self.render_body(cx)),
+                    .child(body),
             );
+
+        let panel = panel.when_some(self.footer, |panel, footer| panel.child(footer));
 
         // Fixed-width slot; the handle floats above the seam and adds no
         // layout width, so dock + tab bar always touch exactly.

@@ -18,7 +18,7 @@ use gpui::{
     px, rgba, svg,
 };
 
-use super::chrome::{BOTTOM_BAR_HEIGHT, BottomBar, TOP_BAR_HEIGHT, TopBar};
+use super::chrome::{BOTTOM_BAR_HEIGHT, BottomBar, SidebarBottomBar, TOP_BAR_HEIGHT, TopBar};
 use super::dock::{DOCK_DEFAULT_WIDTH, DockView};
 use super::dropdown::AppMenu;
 use super::panels::{DockSide, PanelKind};
@@ -111,6 +111,107 @@ fn viewer_kind(path: Option<&str>) -> ViewerKind {
         | "c" | "h" | "cpp" | "hpp" | "sql" | "ini" | "conf" => ViewerKind::Text,
         _ => ViewerKind::Unknown,
     }
+}
+
+struct LoadedImage {
+    image: Arc<gpui::Image>,
+    width: u32,
+    height: u32,
+}
+
+struct LoadedPdf {
+    pages: Vec<LoadedImage>,
+}
+
+fn load_pdf_assets(path: &str) -> Option<LoadedPdf> {
+    let root = std::env::temp_dir().join(format!("peeklet-pdf-{}-{}", std::process::id(),
+        path.bytes().fold(0u64, |hash, byte| hash.wrapping_mul(31).wrapping_add(byte as u64))));
+    let _ = std::fs::create_dir_all(&root);
+    let prefix = root.join("page");
+    let status = std::process::Command::new("pdftoppm")
+        .args(["-png", "-r", "120", "-f", "1", "-l", "64"])
+        .arg(path)
+        .arg(&prefix)
+        .status()
+        .ok()?;
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&root);
+        return None;
+    }
+    let mut pages = Vec::new();
+    for page_number in 1..=64 {
+        let page_path = root.join(format!("page-{page_number}.png"));
+        let Ok(bytes) = std::fs::read(&page_path) else { break };
+        let reader = image::ImageReader::new(Cursor::new(&bytes)).with_guessed_format().ok()?;
+        let (width, height) = reader.into_dimensions().ok()?;
+        pages.push(LoadedImage {
+            image: Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes)),
+            width,
+            height,
+        });
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    (!pages.is_empty()).then_some(LoadedPdf { pages })
+}
+
+/// Read image bytes and dimensions away from the UI thread. Keep normal-sized
+/// source bytes intact so JPEG/WebP/PNG files are not needlessly decoded and
+/// re-encoded before GPUI gets them. Very large images are reduced once, in
+/// the background, to keep the GPU/cache footprint bounded.
+fn load_image_asset(path: &str) -> Option<LoadedImage> {
+    const MAX_IMAGE_EDGE: u32 = 8192;
+
+    let bytes = std::fs::read(path).ok()?;
+    let reader = image::ImageReader::new(Cursor::new(&bytes))
+        .with_guessed_format()
+        .ok()?;
+    let source_format = reader.format()?;
+    let mut decoder = reader.into_decoder().ok()?;
+    let (width, height) = decoder.dimensions();
+    let gpui_format = match source_format {
+        image::ImageFormat::Png => gpui::ImageFormat::Png,
+        image::ImageFormat::Jpeg => gpui::ImageFormat::Jpeg,
+        image::ImageFormat::WebP => gpui::ImageFormat::Webp,
+        image::ImageFormat::Gif => gpui::ImageFormat::Gif,
+        image::ImageFormat::Bmp => gpui::ImageFormat::Bmp,
+        image::ImageFormat::Tiff => gpui::ImageFormat::Tiff,
+        image::ImageFormat::Ico => gpui::ImageFormat::Ico,
+        image::ImageFormat::Pnm => gpui::ImageFormat::Pnm,
+        _ => return None,
+    };
+
+    if width.max(height) <= MAX_IMAGE_EDGE {
+        drop(decoder);
+        return Some(LoadedImage {
+            image: Arc::new(gpui::Image::from_bytes(gpui_format, bytes)),
+            width,
+            height,
+        });
+    }
+
+    let orientation = decoder.orientation().ok()?;
+    let mut decoded = image::DynamicImage::from_decoder(decoder).ok()?;
+    decoded.apply_orientation(orientation);
+    let scale = MAX_IMAGE_EDGE as f32 / decoded.width().max(decoded.height()) as f32;
+    let resized = decoded.resize(
+        (decoded.width() as f32 * scale).round() as u32,
+        (decoded.height() as f32 * scale).round() as u32,
+        image::imageops::FilterType::Lanczos3,
+    );
+    let width = resized.width();
+    let height = resized.height();
+    let mut encoded = Cursor::new(Vec::new());
+    resized
+        .write_to(&mut encoded, image::ImageFormat::Png)
+        .ok()?;
+    Some(LoadedImage {
+        image: Arc::new(gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            encoded.into_inner(),
+        )),
+        width,
+        height,
+    })
 }
 
 fn format_file_size(bytes: u64) -> String {
@@ -298,6 +399,9 @@ pub struct RootView {
     visible_left: Option<PanelKind>,
     visible_right: Option<PanelKind>,
     left_width: f32,
+    left_sidebar_progress: f32,
+    left_sidebar_target: f32,
+    left_sidebar_animating: bool,
     right_width: f32,
     /// Active dock drag: (side being resized, last cursor x, window width).
     /// Widths are unclamped; the only rule is the docks never overlap.
@@ -311,6 +415,11 @@ pub struct RootView {
     pub(crate) hovered_close_tab: Option<usize>,
     store: Store,
     image_assets: HashMap<String, (Arc<gpui::Image>, u32, u32)>,
+    image_loading: HashSet<String>,
+    image_load_errors: HashSet<String>,
+    pdf_assets: HashMap<String, Vec<LoadedImage>>,
+    pdf_loading: HashSet<String>,
+    pdf_load_errors: HashSet<String>,
     image_zoom: f32,
     image_zoom_target: f32,
     image_pan: (f32, f32),
@@ -388,6 +497,8 @@ impl RootView {
             store.get(key).and_then(|v| v.parse::<f32>().ok()).unwrap_or(fallback)
         };
         let visible = |key: &str| store.get(key).and_then(|v| PanelKind::from_key(&v));
+        let visible_left = visible("panels.left.visible");
+        let visible_right = visible("panels.right.visible");
 
         let recent_files: Vec<String> = store
             .get("recents")
@@ -400,9 +511,12 @@ impl RootView {
             tabs,
             active_tab,
             next_tab_id,
-            visible_left: visible("panels.left.visible"),
-            visible_right: visible("panels.right.visible"),
+            visible_left,
+            visible_right,
             left_width: width("panels.left.width", DOCK_DEFAULT_WIDTH),
+            left_sidebar_progress: if visible_left.is_some() { 1.0 } else { 0.0 },
+            left_sidebar_target: if visible_left.is_some() { 1.0 } else { 0.0 },
+            left_sidebar_animating: false,
             right_width: width("panels.right.width", DOCK_DEFAULT_WIDTH),
             drag: None,
             recent_files,
@@ -414,6 +528,11 @@ impl RootView {
             hovered_close_tab: None,
             store,
             image_assets: HashMap::new(),
+            image_loading: HashSet::new(),
+            image_load_errors: HashSet::new(),
+            pdf_assets: HashMap::new(),
+            pdf_loading: HashSet::new(),
+            pdf_load_errors: HashSet::new(),
             image_zoom: 1.0,
             image_zoom_target: 1.0,
             image_pan: (0.0, 0.0),
@@ -452,8 +571,7 @@ impl RootView {
     /// Which dock a panel opens in.
     fn dock_of(kind: PanelKind) -> DockSide {
         match kind {
-            PanelKind::Files => DockSide::Left,
-            PanelKind::Info => DockSide::Right,
+            PanelKind::Files | PanelKind::Info | PanelKind::PdfPages => DockSide::Left,
         }
     }
 
@@ -576,10 +694,7 @@ impl RootView {
     // ----- preview geometry -----
 
     fn dock_occupancy(&self) -> (f32, f32) {
-        (
-            self.visible_left.map(|_| self.left_width).unwrap_or(0.0),
-            self.visible_right.map(|_| self.right_width).unwrap_or(0.0),
-        )
+        (0.0, 0.0)
     }
 
     fn geometry(&self, window: &mut Window) -> PreviewGeometry {
@@ -1093,10 +1208,50 @@ impl RootView {
 
     // ----- panels -----
 
+    fn animate_left_sidebar(&mut self, target: f32, cx: &mut Context<Self>) {
+        self.left_sidebar_target = target;
+        if self.left_sidebar_animating {
+            return;
+        }
+        self.left_sidebar_animating = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(12))
+                    .await;
+                let mut done = false;
+                let _ = this.update(cx, |root, cx| {
+                    let target = root.left_sidebar_target;
+                    let delta = target - root.left_sidebar_progress;
+                    if delta.abs() < 0.01 {
+                        root.left_sidebar_progress = target;
+                        root.left_sidebar_animating = false;
+                        if target == 0.0 {
+                            root.visible_left = None;
+                        }
+                        done = true;
+                    } else {
+                        root.left_sidebar_progress += delta * 0.28;
+                    }
+                    cx.notify();
+                });
+                if done {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
     pub fn toggle_panel(&mut self, kind: PanelKind, cx: &mut Context<Self>) {
         match Self::dock_of(kind) {
             DockSide::Left => {
-                self.visible_left = if self.visible_left == Some(kind) { None } else { Some(kind) };
+                if self.visible_left == Some(kind) {
+                    self.animate_left_sidebar(0.0, cx);
+                } else {
+                    self.visible_left = Some(kind);
+                    self.animate_left_sidebar(1.0, cx);
+                }
             }
             DockSide::Right => {
                 self.visible_right =
@@ -1112,6 +1267,22 @@ impl RootView {
             DockSide::Left => self.visible_left == Some(kind),
             DockSide::Right => self.visible_right == Some(kind),
         }
+    }
+
+    pub(crate) fn active_is_pdf(&self) -> bool {
+        self.tabs
+            .get(self.active_tab)
+            .and_then(|tab| tab.path.as_deref())
+            .is_some_and(|path| viewer_kind(Some(path)) == ViewerKind::Pdf)
+    }
+
+    pub(crate) fn pdf_page_assets(&self) -> Vec<(Arc<gpui::Image>, u32, u32)> {
+        self.tabs
+            .get(self.active_tab)
+            .and_then(|tab| tab.path.as_deref())
+            .and_then(|path| self.pdf_assets.get(path))
+            .map(|pages| pages.iter().map(|page| (page.image.clone(), page.width, page.height)).collect())
+            .unwrap_or_default()
     }
 
     pub fn project_entries(&self) -> Vec<ProjectEntry> {
@@ -1339,6 +1510,10 @@ impl RootView {
                 unreachable!("image viewer requires a file path");
             };
             return self.render_image_preview(path, root, window, cx);
+        }
+        if viewer_kind(image_path.as_deref()) == ViewerKind::Pdf {
+            let Some(path) = image_path.as_deref() else { unreachable!("pdf viewer requires a file path"); };
+            return self.render_pdf_preview(path, root, window, cx);
         }
         let t = *crate::theme::active(cx);
         let snap = snapshot.unwrap_or(EditorSnapshot {
@@ -1580,50 +1755,146 @@ impl RootView {
             .into_any_element()
     }
 
+    fn start_pdf_load(&mut self, path: &str, cx: &mut Context<Self>) {
+        if self.pdf_loading.contains(path) || self.pdf_assets.contains_key(path) { return; }
+        let key = path.to_string();
+        self.pdf_loading.insert(key.clone());
+        cx.spawn(async move |this, cx| {
+            let load_key = key.clone();
+            let loaded = cx.background_executor().spawn(async move { load_pdf_assets(&load_key) }).await;
+            let _ = this.update(cx, |root, cx| {
+                root.pdf_loading.remove(&key);
+                if let Some(loaded) = loaded {
+                    root.pdf_assets.insert(key.clone(), loaded.pages);
+                } else {
+                    root.pdf_load_errors.insert(key.clone());
+                }
+                cx.notify();
+            });
+        }).detach();
+    }
+
+    fn render_pdf_preview(
+        &mut self,
+        path: &str,
+        _root: WeakEntity<RootView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let t = *crate::theme::active(cx);
+        if !self.pdf_loading.contains(path)
+            && !self.pdf_assets.contains_key(path)
+            && !self.pdf_load_errors.contains(path)
+        {
+            self.start_pdf_load(path, cx);
+        }
+        let Some(pages) = self.pdf_assets.get(path) else {
+            return div()
+                .id("pdf-preview")
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgba(t.bg_primary))
+                .child(div().text_sm().text_color(rgba(t.text_secondary)).child(
+                    if self.pdf_load_errors.contains(path) { "Unable to preview this PDF" } else { "Loading PDF…" },
+                ))
+                .into_any_element();
+        };
+        let view_w = window.viewport_size().width.as_f32().max(1.0);
+        let max_w = (view_w - self.dock_occupancy().0 - 48.0).max(120.0);
+        let children = pages.iter().enumerate().map(|(index, page)| {
+            let scale = (max_w / page.width as f32).min(1.0);
+            div()
+                .id(format!("pdf-page-{index}"))
+                .w(px(page.width as f32 * scale))
+                .h(px(page.height as f32 * scale))
+                .bg(rgba(0xffffffff))
+                .child(img(ImageSource::from(page.image.clone())).size_full().object_fit(ObjectFit::Fill))
+        });
+        div()
+            .id("pdf-preview")
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(16.))
+            .py(px(16.))
+            .overflow_y_scroll()
+            .bg(rgba(t.bg_primary))
+            .children(children)
+            .into_any_element()
+    }
+
+    fn start_image_load(&mut self, path: &str, cx: &mut Context<Self>) {
+        if self.image_loading.contains(path) || self.image_assets.contains_key(path) {
+            return;
+        }
+
+        let key = path.to_string();
+        self.image_loading.insert(key.clone());
+        cx.spawn(async move |this, cx| {
+            let load_key = key.clone();
+            let loaded = cx
+                .background_executor()
+                .spawn(async move { load_image_asset(&load_key) })
+                .await;
+            let _ = this.update(cx, |root, cx| {
+                root.image_loading.remove(&key);
+                if let Some(loaded) = loaded {
+                    root.image_assets.insert(
+                        key.clone(),
+                        (
+                            loaded.image,
+                            loaded.width,
+                            loaded.height,
+                        ),
+                    );
+                    root.prune_image_cache(&key);
+                } else {
+                    root.image_load_errors.insert(key.clone());
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn prune_image_cache(&mut self, keep: &str) {
+        const IMAGE_CACHE_BUDGET: usize = 256 * 1024 * 1024;
+        let total_bytes: usize = self
+            .image_assets
+            .values()
+            .map(|(image, _, _)| image.bytes.len())
+            .sum();
+        if total_bytes <= IMAGE_CACHE_BUDGET {
+            return;
+        }
+
+        // Keep the image currently being displayed and release retained source
+        // buffers for older tabs. GPUI may still hold its own render asset, but
+        // this prevents the application cache from growing without bound.
+        let current = self.image_assets.remove(keep);
+        self.image_assets.clear();
+        if let Some(current) = current {
+            self.image_assets.insert(keep.to_string(), current);
+        }
+    }
+
     fn render_image_preview(
         &mut self,
         path: &str,
         root: WeakEntity<RootView>,
         window: &mut Window,
-        cx: &mut App,
+        cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let t = *crate::theme::active(cx);
-        let image = if let Some(image) = self.image_assets.get(path) {
-            Some(image.clone())
-        } else {
-            let image = std::fs::read(path).ok().and_then(|bytes| {
-                let reader = image::ImageReader::new(Cursor::new(bytes))
-                    .with_guessed_format()
-                    .ok()?;
-                let mut decoder = reader.into_decoder().ok()?;
-                let orientation = decoder.orientation().ok()?;
-                let mut decoded = image::DynamicImage::from_decoder(decoder).ok()?;
-                decoded.apply_orientation(orientation);
-                const MAX_IMAGE_EDGE: u32 = 4096;
-                if decoded.width().max(decoded.height()) > MAX_IMAGE_EDGE {
-                    decoded = decoded.thumbnail(MAX_IMAGE_EDGE, MAX_IMAGE_EDGE);
-                }
-                let mut encoded = Cursor::new(Vec::new());
-                decoded
-                    .write_to(&mut encoded, image::ImageFormat::Png)
-                    .ok()?;
-                Some((
-                    Arc::new(gpui::Image::from_bytes(
-                        gpui::ImageFormat::Png,
-                        encoded.into_inner(),
-                    )),
-                    decoded.width(),
-                    decoded.height(),
-                ))
-            });
-            if let Some(image) = &image {
-                self.image_assets
-                    .insert(path.to_string(), image.clone());
-            }
-            image
-        };
+        let image = self.image_assets.get(path).cloned();
 
         let Some((image, image_w, image_h)) = image else {
+            if !self.image_loading.contains(path) && !self.image_load_errors.contains(path) {
+                self.start_image_load(path, cx);
+            }
             return div()
                 .id("image-preview")
                 .size_full()
@@ -1635,7 +1906,11 @@ impl RootView {
                     div()
                         .text_sm()
                         .text_color(rgba(t.text_secondary))
-                        .child("Unable to preview this image"),
+                        .child(if self.image_load_errors.contains(path) {
+                            "Unable to preview this image"
+                        } else {
+                            "Loading image…"
+                        }),
                 )
                 .into_any_element();
         };
@@ -1960,19 +2235,6 @@ impl Render for RootView {
             .detach();
         }
 
-        let left_dock = self.visible_left.map(|kind| DockView {
-            root: root.clone(),
-            side: DockSide::Left,
-            visible: kind,
-            width: self.left_width,
-        });
-        let right_dock = self.visible_right.map(|kind| DockView {
-            root: root.clone(),
-            side: DockSide::Right,
-            visible: kind,
-            width: self.right_width,
-        });
-
         // Geometry first: everything preview-related derives from it.
         let geo = self.geometry(window);
 
@@ -2059,6 +2321,22 @@ impl Render for RootView {
         let can_undo = snapshot.as_ref().is_some_and(|s| s.can_undo);
         let can_redo = snapshot.as_ref().is_some_and(|s| s.can_redo);
         self.scroll_content_rows = snapshot.as_ref().map(|s| s.rows.len()).unwrap_or(0);
+        let sidebar_width = self.left_width * self.left_sidebar_progress;
+        let sidebar_dock = self.visible_left.map(|kind| DockView {
+            root: root.clone(),
+            side: DockSide::Left,
+            visible: kind,
+            width: sidebar_width,
+            header: Some(
+                div()
+                    .h(px(TOP_BAR_HEIGHT))
+                    .bg(rgba(t.bg_primary))
+                    .border_b_1()
+                    .border_color(rgba(t.chrome_border_color))
+                    .into_any_element(),
+            ),
+            footer: Some(SidebarBottomBar { root: root.clone() }.into_any_element()),
+        });
 
         div()
             .id("root")
@@ -2078,16 +2356,7 @@ impl Render for RootView {
                 this.image_drag = None;
                 cx.notify();
             }))
-            .child(TopBar {
-                root: root.clone(),
-                menu_open: self.menu_open,
-                icon_animation: self.icon_animation,
-                tabs: self.tabs.clone(),
-                active: self.active_tab,
-                hovered: self.hovered_tab,
-                can_undo,
-                can_redo,
-            })
+            .child(div().h(px(TOP_BAR_HEIGHT)).flex_shrink_0())
             // Middle row: docks flank the tab bar + preview column, and
             // span exactly that height (below top bar, above bottom bar).
             .child(
@@ -2109,7 +2378,6 @@ impl Render for RootView {
                     .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| {
                         this.end_drag(cx);
                     }))
-                    .when_some(left_dock, |row, dock| row.child(dock))
                     .child(
                         div()
                             .flex_1()
@@ -2125,10 +2393,41 @@ impl Render for RootView {
                                 window,
                                 cx,
                             )),
-                    )
-                    .when_some(right_dock, |row, dock| row.child(dock)),
+                    ),
             )
             .child(BottomBar { root: root.clone() })
+            .when_some(sidebar_dock, |root, dock| {
+                root.child(
+                    div()
+                        .absolute()
+                        .top(px(0.))
+                        .bottom(px(0.))
+                        .left(px(0.))
+                        .w(px(sidebar_width))
+                        .bg(rgba(t.bg_primary))
+                        .child(dock),
+                )
+            })
+            .child(
+                div()
+                    .absolute()
+                    .top(px(0.))
+                    .left(px(0.))
+                    .right(px(0.))
+                    .h(px(TOP_BAR_HEIGHT))
+                    .child(TopBar {
+                        root: root.clone(),
+                        menu_open: self.menu_open,
+                        icon_animation: self.icon_animation,
+                        tabs: self.tabs.clone(),
+                        active: self.active_tab,
+                        hovered: self.hovered_tab,
+                        can_undo,
+                        can_redo,
+                        sidebar_progress: self.left_sidebar_progress,
+                        sidebar_width,
+                    }),
+            )
             // Menu overlay, painted last so it sits above the middle row:
             // click-away catcher first, dropdown panel after.
             .when(self.menu_open, |d| {
