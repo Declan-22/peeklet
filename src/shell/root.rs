@@ -1190,6 +1190,13 @@ impl RootView {
         }
     }
 
+    pub fn clear_hovered_tab(&mut self, id: usize, cx: &mut Context<Self>) {
+        if self.hovered_tab == Some(id) {
+            self.hovered_tab = None;
+            cx.notify();
+        }
+    }
+
     pub fn begin_tab_scroll(&mut self, x: f32) {
         self.tab_scroll_drag = Some((x, self.tab_scroll_offset));
     }

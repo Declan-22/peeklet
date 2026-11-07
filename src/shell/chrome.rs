@@ -31,7 +31,7 @@ const SIDEBAR_ICON: &[u8] = br#"<svg viewBox="0 0 20 20" fill="none" xmlns="http
 
 const SIDEBAR_ICON_COMPACT: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
 	<path d="M0 0h24v24H0z" fill="none" />
-	<g fill="none" stroke="currentColor" stroke-width="2">
+	<g fill="none" stroke="currentColor" stroke-width="1.5">
 		<rect width="14" height="14" x="5" y="5" rx="4" />
 		<path stroke-linecap="round" d="M9 9v6" />
 	</g>
@@ -187,7 +187,7 @@ fn folder_tab_shape(bg: u32) -> impl gpui::IntoElement {
 
 /// Outline for the active folder tab: rides up the convex corners and over the
 /// tab, leaving the bottom edge open so it connects to the content below.
-fn folder_tab_outline(color: u32) -> impl gpui::IntoElement {
+fn folder_tab_outline(color: u32, draw_left: bool, open_bottom: bool) -> impl gpui::IntoElement {
     let curve = gpui::px(FOLDER_RADIUS);
     canvas(
         |_, _, _| {},
@@ -199,13 +199,17 @@ fn folder_tab_outline(color: u32) -> impl gpui::IntoElement {
                 .clamp(gpui::px(0.), curve);
 
             let mut path = gpui::PathBuilder::stroke(gpui::px(1.0));
-            path.move_to(gpui::point(left, bottom));
-            quarter_circle_to(
-                &mut path,
-                gpui::point(left, bottom),
-                gpui::point(tab_left, bottom),
-                gpui::point(tab_left, bottom - curve),
-            );
+            if draw_left {
+                path.move_to(gpui::point(left, bottom));
+                quarter_circle_to(
+                    &mut path,
+                    gpui::point(left, bottom),
+                    gpui::point(tab_left, bottom),
+                    gpui::point(tab_left, bottom - curve),
+                );
+            } else {
+                path.move_to(gpui::point(tab_left, bottom));
+            }
             path.line_to(gpui::point(tab_left, top + radius));
             quarter_circle_to(
                 &mut path,
@@ -227,6 +231,13 @@ fn folder_tab_outline(color: u32) -> impl gpui::IntoElement {
                 gpui::point(tab_right, bottom),
                 gpui::point(right, bottom),
             );
+            if !open_bottom {
+                if draw_left {
+                    path.line_to(gpui::point(left, bottom));
+                } else {
+                    path.line_to(gpui::point(tab_left, bottom));
+                }
+            }
             if let Ok(path) = path.build() {
                 window.paint_path(path, gpui::rgba(color));
             }
@@ -390,7 +401,7 @@ fn divider(color: u32) -> AnyElement {
 
 fn tab_divider(color: u32) -> AnyElement {
     div()
-        .w(px(1.5))
+        .w(px(2.))
         .h(px(FOLDER_SEPARATOR_HEIGHT))
         .my(px((TOP_BAR_HEIGHT - FOLDER_SEPARATOR_HEIGHT) / 2.))
         .mx(px(6.))
@@ -705,14 +716,7 @@ impl gpui::RenderOnce for TabBar {
                                 let tab_id = tab.id;
                                 let is_active = i == self.active;
                                 let is_hovered = self.hovered == Some(tab_id);
-                                let hovered_ix = self
-                                    .hovered
-                                    .and_then(|hid| self.tabs.iter().position(|t| t.id == hid));
-                                let has_shape = |ix: usize| {
-                                    ix == self.active || hovered_ix == Some(ix)
-                                };
-                                let separator =
-                                    i + 1 < self.tabs.len() && !has_shape(i) && !has_shape(i + 1);
+                                // (dividers between tabs removed; all tabs now carry their own border)
                                 // Constant geometry in both states: the outer shell always
                                 // carries side borders, the inner row always carries the
                                 // bottom border — only colors change. Inactive sides are
@@ -720,6 +724,7 @@ impl gpui::RenderOnce for TabBar {
                                 // so switching tabs never moves anything by a pixel.
                                 div()
                                     .id(format!("tab-{tab_id}"))
+                                    .group(format!("tab-{}", tab_id))
                                     .h(px(TOP_BAR_HEIGHT - 6.))
                                     .mt(px(6.))
                                     .mb(px(0.))
@@ -745,10 +750,11 @@ impl gpui::RenderOnce for TabBar {
                                         let root = root.clone();
                                         move |hovered, _, cx| {
                                             let _ = root.update(cx, |root, cx| {
-                                                root.set_hovered_tab(
-                                                    if *hovered { Some(tab_id) } else { None },
-                                                    cx,
-                                                );
+                                                if *hovered {
+                                                    root.set_hovered_tab(Some(tab_id), cx);
+                                                } else {
+                                                    root.clear_hovered_tab(tab_id, cx);
+                                                }
                                             });
                                         }
                                     })
@@ -756,34 +762,31 @@ impl gpui::RenderOnce for TabBar {
                                         let _ = root
                                             .update(cx, |root, cx| root.activate_tab(tab_id, cx));
                                     })
+                                    .when(!is_active, |tab| {
+                                        // Inactive tabs get a solid bg-tertiary folder shape so
+                                        // they are not transparent.
+                                        let p = self.tabs.len() - i;
+                                        tab.child(deferred(folder_tab_shape(t.bg_secondary)).with_priority(p))
+                                    })
                                     .when(is_hovered && !is_active, |tab| {
-                                        tab.child(folder_tab_shape(t.menu_hover_bg))
+                                        let p = self.tabs.len() - i;
+                                        tab.child(deferred(folder_tab_shape(t.menu_hover_bg)).with_priority(p))
+                                    })
+                                    .when(!is_active, |tab| {
+                                        // Outline painted last so it stays visible on hover.
+                                        let p = self.tabs.len() - i;
+                                        tab.child(deferred(folder_tab_outline(t.chrome_border_color, i == 0, false)).with_priority(p))
                                     })
                                     .when(is_active, |tab| {
                                         // Deferred active-tab painting keeps its convex corners
-                                        // above hover shapes from tabs on either side.
+                                        // above every other tab regardless of position.
                                         tab.child(
                                             deferred(folder_tab_shape(t.bg_primary))
-                                                .with_priority(1),
+                                                .with_priority(1000),
                                         )
                                         .child(
-                                            deferred(folder_tab_outline(t.chrome_border_color))
-                                                .with_priority(1),
-                                        )
-                                    })
-                                    .when(separator, |tab| {
-                                        tab.child(
-                                            div()
-                                                .absolute()
-                                                .right(px(-FOLDER_TAB_GAP / 2.0))
-                                                .top(px(
-                                                    (TOP_BAR_HEIGHT - 6. - FOLDER_TOP_PADDING
-                                                        - FOLDER_SEPARATOR_HEIGHT)
-                                                        / 2.0,
-                                                ))
-                                                .w(px(1.5))
-                                                .h(px(FOLDER_SEPARATOR_HEIGHT))
-                                                .bg(rgba(t.chrome_border_color)),
+                                            deferred(folder_tab_outline(t.chrome_border_color, true, true))
+                                                .with_priority(1000),
                                         )
                                     })
                                     .child(
@@ -806,14 +809,11 @@ impl gpui::RenderOnce for TabBar {
                                                 let root = self.root.clone();
                                                 move |hovered, _, cx| {
                                                     let _ = root.update(cx, |root, cx| {
-                                                        root.set_hovered_tab(
-                                                            if *hovered {
-                                                                Some(tab_id)
-                                                            } else {
-                                                                None
-                                                            },
-                                                            cx,
-                                                        );
+                                                        if *hovered {
+                                                            root.set_hovered_tab(Some(tab_id), cx);
+                                                        } else {
+                                                            root.clear_hovered_tab(tab_id, cx);
+                                                        }
                                                     });
                                                 }
                                             })
@@ -929,7 +929,7 @@ impl gpui::RenderOnce for TabBar {
                                                     )
                                             }),
                                             )
-                                            .with_priority(2),
+                                            .with_priority(2000),
                                     )
                             }))
                     ),
