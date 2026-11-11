@@ -12,7 +12,7 @@ use super::menu::{Menu, MenuItem, default_menus};
 use super::root::RootView;
 use crate::theme::{Theme, WEIGHT_MEDIUM, lerp_rgb};
 
-pub const MENU_LEFT: f32 = 6.0;
+pub const MENU_LEFT: f32 = 92.0;
 pub const PANEL_WIDTH: f32 = 200.0;
 pub const SUBMENU_WIDTH: f32 = 232.0;
 pub const ENTRY_HEIGHT: f32 = 24.0;

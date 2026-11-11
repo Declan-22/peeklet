@@ -14,7 +14,7 @@ use gpui::{
     App, ClipboardItem, Context, FocusHandle, Font, FontFeatures, FontStyle, FontWeight, Hsla,
     ImageSource, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseExitEvent, ObjectFit,
     Point, Render,
-    ScrollDelta, ScrollWheelEvent, ShapedLine, TextRun, WeakEntity, Window, div, img, prelude::*,
+    ScrollDelta, ScrollWheelEvent, ShapedLine, TextRun, WeakEntity, Window, deferred, div, img, prelude::*,
     px, rgba, svg,
 };
 
@@ -24,7 +24,7 @@ use super::dropdown::AppMenu;
 use super::panels::{DockSide, PanelKind};
 use crate::editor::EditorState;
 use crate::persist::{Store, TabRecord};
-use crate::theme::WEIGHT_MEDIUM;
+use crate::theme::{Theme, WEIGHT_MEDIUM};
 
 /// Folder icon for Open File.
 const ICON_OPEN_FILE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
@@ -252,21 +252,32 @@ const MIN_COLUMN_MARGIN: f32 = 24.0;
 struct PreviewGeometry {
     /// Center-column width (window minus open docks).
     col_w: f32,
-    /// Margin on both sides of the text column.
+    /// Left occupancy: sidebar width (so text column starts after it).
+    left_occ: f32,
+    /// Left margin (static).
     margin: f32,
-    /// Text width; lines wrap to this.
+    /// Wrap width (f32::MAX disables wrapping).
     measure: f32,
+    /// Rendered text block width.
+    text_width: f32,
+    /// Whether text wraps.
+    wrap: bool,
 }
 
-fn preview_geometry(view_w: f32, left_occ: f32, right_occ: f32) -> PreviewGeometry {
+fn preview_geometry(view_w: f32, left_occ: f32, right_occ: f32, wrap: bool) -> PreviewGeometry {
     let col = (view_w - left_occ - right_occ).max(0.0);
-    let measure = (col - 2.0 * MIN_COLUMN_MARGIN).clamp(0.0, MAX_TEXT_WIDTH);
-    let margin = ((col - measure) / 2.0).max(0.0);
-    PreviewGeometry { col_w: col, margin, measure }
+    let min = MIN_COLUMN_MARGIN;
+    let (measure, text_width, margin) = if wrap {
+        let m = (col - 2.0 * min).max(0.0);
+        (m, m, min)
+    } else {
+        (f32::MAX, (col - min).max(0.0), min)
+    };
+    PreviewGeometry { col_w: col, left_occ, margin, measure, text_width, wrap }
 }
 
 fn preview_text_left(geo: &PreviewGeometry) -> f32 {
-    geo.margin
+    geo.left_occ + geo.margin
 }
 
 /// Render-ready snapshot of the active buffer. Keeps borrows short: the
@@ -286,14 +297,17 @@ struct BuiltRow {
     segs: Vec<SnapshotSeg>,
 }
 
+#[derive(Clone)]
 struct SnapshotRow {
     segs: Vec<SnapshotSeg>,
+    buffer_line: usize,
     /// Caret (x, height) within the row, if the cursor is here.
     caret: Option<(f32, f32)>,
     /// Selection x-range (px) within the row, if any overlaps it.
     sel_px: Option<(f32, f32)>,
 }
 
+#[derive(Clone)]
 struct EditorSnapshot {
     rows: Vec<SnapshotRow>,
     can_undo: bool,
@@ -368,26 +382,76 @@ fn layout_line(
     measure: f32,
     window: &mut Window,
     t: crate::theme::Theme,
+    spans: &[(u32, usize, usize)],
 ) -> Vec<BuiltRow> {
     let color = Hsla::from(rgba(t.text_primary));
+    if measure == f32::MAX {
+        // Non-wrapped: one visual row per buffer line, no measurement.
+        let mut segs = Vec::new();
+        for (c, s, e) in spans {
+            let s = (*s).min(line_text.len());
+            let e = (*e).min(line_text.len());
+            if s < e {
+                segs.push(SnapshotSeg {
+                    text: line_text[s..e].to_string(),
+                    size: PREVIEW_FONT_SIZE,
+                    weight: FontWeight::NORMAL,
+                    mono: false,
+                    color: *c,
+                    src_start: s,
+                    src_end: e,
+                });
+            }
+        }
+        if segs.is_empty() {
+            segs.push(SnapshotSeg {
+                text: line_text.to_string(),
+                size: PREVIEW_FONT_SIZE,
+                weight: FontWeight::NORMAL,
+                mono: false,
+                color: t.text_primary,
+                src_start: 0,
+                src_end: line_text.len(),
+            });
+        }
+        return vec![BuiltRow { segs }];
+    }
     let mut width_of = |s: &str| {
         measure_text(window, s, color, PREVIEW_FONT_SIZE, FontWeight::NORMAL, false)
     };
     crate::editor::wrap_line(0, line_text, measure, &mut width_of)
         .into_iter()
         .map(|row| {
-            let text = &line_text[row.start_byte..row.end_byte];
-            BuiltRow {
-                segs: vec![SnapshotSeg {
-                    text: text.to_string(),
+            let rs = row.start_byte;
+            let re = row.end_byte;
+            let mut segs = Vec::new();
+            for (c, s, e) in spans {
+                let a = (*s).max(rs);
+                let b = (*e).min(re);
+                if a < b {
+                    segs.push(SnapshotSeg {
+                        text: line_text[a..b].to_string(),
+                        size: PREVIEW_FONT_SIZE,
+                        weight: FontWeight::NORMAL,
+                        mono: false,
+                        color: *c,
+                        src_start: a,
+                        src_end: b,
+                    });
+                }
+            }
+            if segs.is_empty() {
+                segs.push(SnapshotSeg {
+                    text: line_text[rs..re].to_string(),
                     size: PREVIEW_FONT_SIZE,
                     weight: FontWeight::NORMAL,
                     mono: false,
                     color: t.text_primary,
-                    src_start: row.start_byte,
-                    src_end: row.end_byte,
-                }],
+                    src_start: rs,
+                    src_end: re,
+                });
             }
+            BuiltRow { segs }
         })
         .collect()
 }
@@ -428,6 +492,11 @@ pub struct RootView {
     image_drag: Option<(MouseButton, f32, f32, f32, f32)>,
     /// Buffers keyed by tab id, created lazily.
     editors: HashMap<usize, EditorState>,
+    /// Tab ids with unsaved edits (dirty).
+    dirty_tabs: HashSet<usize>,
+    editor_version: u64,
+    cached_snapshot: Option<EditorSnapshot>,
+    cached_snapshot_key: (usize, u64, u32),
     /// Preview focus follows the active tab.
     pub focus: FocusHandle,
     /// Caret blink state, toggled on a timer.
@@ -444,6 +513,13 @@ pub struct RootView {
     mouse_select: bool,
     // -- hamburger menu state (Parametric behavior) --
     pub menu_open: bool,
+    pub settings_open: bool,
+    pub close_confirm: Option<usize>,
+    pub settings_tab: usize,
+    pub wrap_text_files: bool,
+    pub wrap_code_files: bool,
+    pub line_numbers: bool,
+    pub syntax_highlighting: bool,
     pub active_menu: Option<usize>,
     pub menu_animation: f32,
     pub icon_animation: f32,
@@ -469,13 +545,21 @@ impl RootView {
         let mut tabs: Vec<Tab> = Vec::new();
         let mut next_tab_id = 0;
         let mut preloaded: HashMap<usize, String> = HashMap::new();
+        let mut dirty_restored: HashSet<usize> = HashSet::new();
         for record in store.tabs() {
             if let Some(path) = record.path.as_ref() {
                 let title = std::path::Path::new(path)
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path.to_string());
-                let content = std::fs::read_to_string(path).unwrap_or_default();
+                let dirty_key = format!("dirty:{}", path);
+                let buffer_key = format!("buffer:{}", path);
+                let content = if store.get(&dirty_key).as_deref() == Some("1") {
+                    dirty_restored.insert(next_tab_id);
+                    store.get(&buffer_key).unwrap_or_default()
+                } else {
+                    std::fs::read_to_string(path).unwrap_or_default()
+                };
                 preloaded.insert(next_tab_id, content);
                 tabs.push(Tab { id: next_tab_id, title, path: Some(path.clone()) });
             } else {
@@ -504,6 +588,10 @@ impl RootView {
             .get("recents")
             .map(|v| v.split('\n').filter(|s| !s.is_empty()).map(str::to_string).collect())
             .unwrap_or_default();
+        let wrap_text_files = store.get("editor.wrap_text_files").map(|v| v == "true").unwrap_or(true);
+        let wrap_code_files = store.get("editor.wrap_code_files").map(|v| v == "true").unwrap_or(false);
+        let line_numbers = store.get("editor.line_numbers").map(|v| v == "true").unwrap_or(true);
+        let syntax_highlighting = store.get("editor.syntax_highlighting").map(|v| v == "true").unwrap_or(true);
         let project_root = None;
         let project_expanded = HashSet::new();
 
@@ -540,6 +628,10 @@ impl RootView {
             image_zoom_tween_active: false,
             image_drag: None,
             editors: HashMap::new(),
+            dirty_tabs: HashSet::new(),
+            editor_version: 0,
+            cached_snapshot: None,
+            cached_snapshot_key: (usize::MAX, 0, 0),
             focus: cx.focus_handle(),
             caret_visible: true,
             blink_started: false,
@@ -549,6 +641,13 @@ impl RootView {
             scrollbar_hovered: false,
             mouse_select: false,
             menu_open: false,
+            settings_open: false,
+            close_confirm: None,
+            settings_tab: 0,
+            wrap_text_files,
+            wrap_code_files,
+            line_numbers,
+            syntax_highlighting,
             active_menu: None,
             menu_animation: 0.0,
             icon_animation: 0.0,
@@ -558,6 +657,7 @@ impl RootView {
             fade_tween_active: HashSet::new(),
             cursor_trail: Vec::new(),
         };
+        view.dirty_tabs = dirty_restored;
         // Preload reopened files into their buffers.
         for (id, content) in preloaded {
             view.editors
@@ -656,6 +756,30 @@ impl RootView {
     }
 
     pub fn close_tab(&mut self, id: usize, cx: &mut Context<Self>) {
+        if self.dirty_tabs.contains(&id) {
+            self.close_confirm = Some(id);
+            cx.notify();
+            return;
+        }
+        self.close_tab_force(id, cx);
+    }
+
+    fn close_tab_force(&mut self, id: usize, cx: &mut Context<Self>) {
+        // Persist unsaved buffer before discarding, so reopen can restore.
+        if let Some(tab) = self.tabs.iter().find(|t| t.id == id) {
+            if let Some(path) = &tab.path {
+                if self.dirty_tabs.contains(&id) {
+                    if let Some(ed) = self.editors.get(&id) {
+                        self.store.set(&format!("buffer:{}", path), &ed.text_string());
+                        self.store.set(&format!("dirty:{}", path), "1");
+                    }
+                } else {
+                    self.store.set(&format!("dirty:{}", path), "0");
+                }
+            }
+        }
+        self.dirty_tabs.remove(&id);
+        self.editors.remove(&id);
         if let Some(i) = self.tabs.iter().position(|t| t.id == id) {
             self.tabs.remove(i);
             if self.tabs.is_empty() {
@@ -693,14 +817,35 @@ impl RootView {
 
     // ----- preview geometry -----
 
+    pub fn left_occupancy(&self) -> f32 {
+        if self.visible_left.is_some() {
+            self.left_width * self.left_sidebar_progress
+        } else {
+            0.0
+        }
+    }
+
     fn dock_occupancy(&self) -> (f32, f32) {
-        (0.0, 0.0)
+        let left = if self.visible_left.is_some() {
+            self.left_width * self.left_sidebar_progress
+        } else {
+            0.0
+        };
+        let right = if self.visible_right.is_some() {
+            self.right_width
+        } else {
+            0.0
+        };
+        (left, right)
     }
 
     fn geometry(&self, window: &mut Window) -> PreviewGeometry {
         let view_w = window.viewport_size().width.as_f32();
         let (left_occ, right_occ) = self.dock_occupancy();
-        preview_geometry(view_w, left_occ, right_occ)
+        let active_path = self.tabs.get(self.active_tab).and_then(|t| t.path.clone());
+        let is_code = active_path.as_deref().map(is_code_path).unwrap_or(false);
+        let wrap = if is_code { self.wrap_code_files } else { self.wrap_text_files };
+        preview_geometry(view_w, left_occ, right_occ, wrap)
     }
 
     // ----- undo / redo (active tab's buffer) -----
@@ -732,6 +877,9 @@ impl RootView {
                             cx.write_to_clipboard(ClipboardItem::new_string(text));
                             ed.delete_selection();
                             self.caret_visible = true;
+                            if let Some(tab) = self.tabs.get(self.active_tab) {
+                                self.mark_tab_dirty(tab.id);
+                            }
                             cx.notify();
                         }
                     }
@@ -744,6 +892,9 @@ impl RootView {
                                 ed.delete_selection();
                                 ed.insert_str(&text);
                                 self.caret_visible = true;
+                                if let Some(tab) = self.tabs.get(self.active_tab) {
+                                    self.mark_tab_dirty(tab.id);
+                                }
                                 cx.notify();
                             }
                         }
@@ -753,6 +904,7 @@ impl RootView {
                 "a" => {
                     if let Some(ed) = self.active_editor_mut() {
                         ed.select_all();
+                        self.editor_version = self.editor_version.wrapping_add(1);
                         cx.notify();
                     }
                     return;
@@ -794,8 +946,10 @@ impl RootView {
             }
         }
         self.caret_visible = true;
-        // Write-through: every keystroke lands on disk immediately.
-        self.save_active();
+        self.editor_version = self.editor_version.wrapping_add(1);
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            self.mark_tab_dirty(tab.id);
+        }
         cx.notify();
     }
 
@@ -931,42 +1085,62 @@ impl RootView {
         let y_view = y_win - TOP_BAR_HEIGHT;
         let view_h = Self::viewport_h(window);
         let ed = self.editors.entry(tab_id).or_insert_with(EditorState::new);
-        // Rows carry their line's type for measurement.
-        let mut rows: Vec<(crate::editor::VisualRow, f32, FontWeight)> = Vec::new();
-        for line_no in 0..ed.len_lines() {
-            let text = ed.line_text(line_no);
-            let size = PREVIEW_FONT_SIZE;
-            let weight = FontWeight::NORMAL;
-            let mut width_of = |s: &str| measure_text(window, s, color, size, weight, false);
-            rows.extend(
-                crate::editor::wrap_line(line_no, &text, geo.measure, &mut width_of)
-                    .into_iter()
-                    .map(|r| (r, size, weight)),
-            );
-        }
-        if rows.is_empty() {
-            return;
-        }
-        let total_h = rows.len() as f32 * PREVIEW_LINE_HEIGHT;
-        let max = (total_h - view_h).max(0.0);
-        let offset = self.scroll_offset.min(max);
-        let content_y = y_view + offset;
-        let idx = ((content_y - PREVIEW_TOP_PAD) / PREVIEW_LINE_HEIGHT)
-            .floor()
-            .max(0.0) as usize;
-        let idx = idx.min(rows.len() - 1);
-        let (row, size, weight) = rows[idx].clone();
-        // Keep the left edge visible when the column is wider than the
-        // viewport: margins are consumed before the text itself is clipped.
+        // Use cached snapshot rows for O(1) lookup instead of rebuilding all rows.
+        let snap_opt = self.cached_snapshot.clone();
+        let (buffer_line, row_start, row_end, size, weight) = if let Some(snap) = snap_opt {
+            if snap.rows.is_empty() {
+                return;
+            }
+            let total_h = snap.rows.len() as f32 * PREVIEW_LINE_HEIGHT;
+            let max = (total_h - view_h).max(0.0);
+            let offset = self.scroll_offset.min(max);
+            let content_y = y_view + offset;
+            let idx = ((content_y - PREVIEW_TOP_PAD) / PREVIEW_LINE_HEIGHT)
+                .floor()
+                .max(0.0) as usize;
+            let idx = idx.min(snap.rows.len() - 1);
+            let row = &snap.rows[idx];
+            let bs = row.segs.first().map(|s| s.src_start).unwrap_or(0);
+            let be = row.segs.last().map(|s| s.src_end).unwrap_or(0);
+            let be = if be == 0 { ed.line_char_len(row.buffer_line) } else { be };
+            (row.buffer_line, bs, be, PREVIEW_FONT_SIZE, FontWeight::NORMAL)
+        } else {
+            // Fallback: build rows (slow for huge files).
+            let mut rows: Vec<(crate::editor::VisualRow, f32, FontWeight)> = Vec::new();
+            for line_no in 0..ed.len_lines() {
+                let text = ed.line_text(line_no);
+                let size = PREVIEW_FONT_SIZE;
+                let weight = FontWeight::NORMAL;
+                let mut width_of = |s: &str| measure_text(window, s, color, size, weight, false);
+                rows.extend(
+                    crate::editor::wrap_line(line_no, &text, geo.measure, &mut width_of)
+                        .into_iter()
+                        .map(|r| (r, size, weight)),
+                );
+            }
+            if rows.is_empty() { return; }
+            let total_h = rows.len() as f32 * PREVIEW_LINE_HEIGHT;
+            let max = (total_h - view_h).max(0.0);
+            let offset = self.scroll_offset.min(max);
+            let content_y = y_view + offset;
+            let idx = ((content_y - PREVIEW_TOP_PAD) / PREVIEW_LINE_HEIGHT)
+                .floor()
+                .max(0.0) as usize;
+            let idx = idx.min(rows.len() - 1);
+            let (row, size, weight) = rows[idx].clone();
+            (row.buffer_line, row.start_byte, row.end_byte, size, weight)
+        };
         let text_left = preview_text_left(&geo);
-        let x_text = x_col - text_left;
-        let row_text = ed.line_text(row.buffer_line);
-        let row_slice = &row_text[row.start_byte..row.end_byte.min(row_text.len())];
+        let x_text = x_win - text_left;
+        let row_text = ed.line_text(buffer_line);
+        let end = row_end.min(row_text.len());
+        let row_slice = &row_text[row_start..end];
         let byte = crate::editor::byte_for_x(row_slice, x_text, &mut |s: &str| {
             measure_text(window, s, color, size, weight, false)
         });
-        ed.set_cursor_line_byte(row.buffer_line, row.start_byte + byte, extend);
+        ed.set_cursor_line_byte(buffer_line, row_start + byte, extend);
         self.caret_visible = true;
+        self.editor_version = self.editor_version.wrapping_add(1);
         cx.notify();
     }
 
@@ -974,7 +1148,7 @@ impl RootView {
         if let Some(ed) = self.active_editor_mut() {
             ed.undo();
         }
-        self.save_active();
+        self.editor_version = self.editor_version.wrapping_add(1);
         cx.notify();
     }
 
@@ -982,7 +1156,7 @@ impl RootView {
         if let Some(ed) = self.active_editor_mut() {
             ed.redo();
         }
-        self.save_active();
+        self.editor_version = self.editor_version.wrapping_add(1);
         cx.notify();
     }
 
@@ -1023,6 +1197,35 @@ impl RootView {
         if self.menu_open {
             self.start_menu_animation(cx);
         }
+        cx.notify();
+    }
+
+    pub fn toggle_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings_open = !self.settings_open;
+        cx.notify();
+    }
+
+    pub fn set_wrap_text_files(&mut self, value: bool, cx: &mut Context<Self>) {
+        self.wrap_text_files = value;
+        self.store.set("editor.wrap_text_files", if value { "true" } else { "false" });
+        cx.notify();
+    }
+
+    pub fn set_wrap_code_files(&mut self, value: bool, cx: &mut Context<Self>) {
+        self.wrap_code_files = value;
+        self.store.set("editor.wrap_code_files", if value { "true" } else { "false" });
+        cx.notify();
+    }
+
+    pub fn set_line_numbers(&mut self, value: bool, cx: &mut Context<Self>) {
+        self.line_numbers = value;
+        self.store.set("editor.line_numbers", if value { "true" } else { "false" });
+        cx.notify();
+    }
+
+    pub fn set_syntax_highlighting(&mut self, value: bool, cx: &mut Context<Self>) {
+        self.syntax_highlighting = value;
+        self.store.set("editor.syntax_highlighting", if value { "true" } else { "false" });
         cx.notify();
     }
 
@@ -1395,6 +1598,46 @@ impl RootView {
         cx.notify();
     }
 
+    fn mark_tab_dirty(&mut self, tab_id: usize) {
+        self.editor_version = self.editor_version.wrapping_add(1);
+        let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else { return; };
+        let Some(path) = tab.path.clone() else { return; };
+        self.dirty_tabs.insert(tab_id);
+        // Persist lazily (on close/exit) to avoid per-keystroke SQLite writes.
+        let _ = (path, tab_id);
+    }
+
+    pub fn bottom_status(&self) -> Option<(String, String, String, String)> {
+        let tab = self.tabs.get(self.active_tab)?;
+        if tab.title == "Welcome" {
+            return None;
+        }
+        let id = tab.id;
+        let ed = self.editors.get(&id)?;
+        let (line, byte) = ed.cursor_line_byte();
+        let line_text = ed.line_text(line);
+        let col = line_text[..byte.min(line_text.len())].chars().count() + 1;
+        let chars = ed.text_string().chars().count();
+        let file_type = tab
+            .path
+            .as_ref()
+            .and_then(|p| std::path::Path::new(p).extension().and_then(|e| e.to_str()).map(|s| s.to_string()))
+            .unwrap_or_else(|| "Text".to_string());
+        let size_bytes = tab
+            .path
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).ok().map(|m| m.len()))
+            .unwrap_or(chars as u64);
+        let size_str = if size_bytes < 1024 {
+            format!("{} B", size_bytes)
+        } else if size_bytes < 1024 * 1024 {
+            format!("{:.1} KB", size_bytes as f64 / 1024.0)
+        } else {
+            format!("{:.1} MB", size_bytes as f64 / (1024.0 * 1024.0))
+        };
+        Some((format!("Ln {}, Col {}", line + 1, col), format!("{}", chars), file_type, size_str))
+    }
+
     /// Write the active tab's buffer to its file. No-op without a path.
     fn save_active(&self) {
         let Some(tab) = self.tabs.get(self.active_tab) else {
@@ -1439,6 +1682,14 @@ impl RootView {
             }
         }
         self.save_active();
+        // Mark clean: remove dirty state and persisted buffer.
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            let id = tab.id;
+            self.dirty_tabs.remove(&id);
+            if let Some(path) = tab.path.clone() {
+                self.store.set(&format!("dirty:{}", path), "0");
+            }
+        }
         self.save_layout();
         cx.notify();
     }
@@ -1531,6 +1782,7 @@ impl RootView {
                     color: t.text_primary,
                     src_start: 0, src_end: 0,
                 }],
+                buffer_line: 0,
                 caret: Some((0.0, CARET_HEIGHT)),
                 sel_px: None,
             }],
@@ -1540,12 +1792,20 @@ impl RootView {
         });
         // No caret while any selection is visible.
         let show_caret = self.caret_visible && !snap.has_selection;
+        let active_path = self.tabs.get(self.active_tab).and_then(|t| t.path.clone()).unwrap_or_default();
+        let is_code = is_code_path(&active_path);
+        let show_line_numbers = self.line_numbers && is_code;
+        let gutter_width = if show_line_numbers { 64.0 } else { 0.0 };
 
         // Scrollbar geometry (Zed-style: thick low-opacity thumb + a 2px
         // accent line at the cursor row).
         let view_h = Self::viewport_h(window);
         let total_h = snap.rows.len() as f32 * PREVIEW_LINE_HEIGHT;
         let offset = self.scroll_offset.min((total_h - view_h).max(0.0));
+        let start_row = (offset / PREVIEW_LINE_HEIGHT).floor() as usize;
+        let visible_count = (view_h / PREVIEW_LINE_HEIGHT).ceil() as usize + 2;
+        let end_row = (start_row + visible_count).min(snap.rows.len());
+        let top_offset = offset - start_row as f32 * PREVIEW_LINE_HEIGHT;
         let show_scroll = total_h > view_h;
         let track_h = view_h.max(0.0);
         let thumb_h = if show_scroll {
@@ -1631,18 +1891,49 @@ impl RootView {
                             .absolute()
                             .left(px(0.))
                             .right(px(0.))
-                            .top(px(-offset))
+                            .top(px(-top_offset))
                             .flex()
                             .flex_col()
                             .items_start()
+                            .when(show_line_numbers, |d| {
+                                d.child(
+                                    div()
+                                        .absolute()
+                                        .left(px(preview_text_left(geo) - gutter_width))
+                                        .top_0()
+                                        .w(px(gutter_width))
+                                        .flex()
+                                        .flex_col()
+                                        .items_end()
+                                        .pr(px(12.))
+                                        .pl(px(8.))
+                                        .children(snap.rows[start_row..end_row].iter().map(|row| {
+                                            let is_first = row.segs.first().map(|s| s.src_start).unwrap_or(0) == 0;
+                                            let label = if is_first {
+                                                (row.buffer_line + 1).to_string()
+                                            } else {
+                                                String::new()
+                                            };
+                                            div()
+                                                .h(px(PREVIEW_LINE_HEIGHT))
+                                                .flex()
+                                                .items_center()
+                                                .justify_end()
+                                                .text_sm()
+                                                .font_family(crate::theme::FONT_MONO)
+                                                .text_color(rgba(t.text_secondary))
+                                                .child(label)
+                                        })),
+                                )
+                            })
                             .child(
                                 div()
-                                    .w(px(geo.measure))
+                                    .w(px(geo.text_width))
                                     .ml(px(preview_text_left(geo)))
                                     .flex()
                                     .flex_col()
                                     .pt(px(PREVIEW_TOP_PAD))
-                                    .children(snap.rows.iter().map(|row| {
+                                    .children(snap.rows[start_row..end_row].iter().map(|row| {
                                         // The text always renders as one
                                         // unsplit run, so shaping (kerning,
                                         // ligatures) never shifts when the
@@ -1688,9 +1979,9 @@ impl RootView {
                                                                 (PREVIEW_LINE_HEIGHT - h)
                                                                     / 2.0,
                                                             ))
-                                                            .w(px(2.))
+                                                            .w(px(1.5))
                                                             .h(px(h))
-                                                            .bg(rgba(t.cursor)),
+                                                            .bg(rgba(t.text_primary)),
                                                     )
                                                 },
                                             )
@@ -1947,7 +2238,7 @@ impl RootView {
         } else {
             (draw_h - view_h).abs() / 2.0
         };
-        let left = (view_w - draw_w) / 2.0 + self.image_pan.0;
+        let left = left_occ + (view_w - draw_w) / 2.0 + self.image_pan.0;
         let top = (view_h - draw_h) / 2.0 + self.image_pan.1;
         div()
             .id("image-preview")
@@ -2248,19 +2539,34 @@ impl Render for RootView {
         // Snapshot the active buffer once per frame: wrapped visual rows
         // with caret/selection x-edges and history flags. Welcome tabs have
         // no buffer.
-        let snapshot: Option<EditorSnapshot> = self
-            .tabs
-            .get(self.active_tab)
-            .filter(|tab| tab.title != "Welcome")
-            .map(|tab| tab.id)
-            .map(|id| {
+        let measure_bits = geo.measure.to_bits();
+        let cache_key = (self.active_tab, self.editor_version, measure_bits);
+        let snapshot: Option<EditorSnapshot> = if self.cached_snapshot_key == cache_key {
+            self.cached_snapshot.clone()
+        } else {
+            let built = self
+                .tabs
+                .get(self.active_tab)
+                .filter(|tab| tab.title != "Welcome")
+                .map(|tab| tab.id)
+                .map(|id| {
                 let ed = self.editors.entry(id).or_insert_with(EditorState::new);
                 let (cur_line, cur_byte) = ed.cursor_line_byte();
                 let sel_chars = ed.selection_range();
                 let mut rows = Vec::new();
                 let mut caret_placed = false;
+                let active_path = self.tabs.get(self.active_tab).and_then(|t| t.path.clone()).unwrap_or_default();
+                let is_code = is_code_path(&active_path);
+                let highlight = is_code && self.syntax_highlighting;
+                let ext = std::path::Path::new(&active_path)
+                    .extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
                 for line_no in 0..ed.len_lines() {
                     let text = ed.line_text(line_no);
+                    let spans = if highlight {
+                        highlight_line_spans(&text, &ext)
+                    } else {
+                        vec![(t.text_primary, 0, text.len())]
+                    };
                     let ls = ed.line_start_char(line_no);
                     let llen = ed.line_char_len(line_no);
                     let sel_bytes = sel_chars.and_then(|(a, b)| {
@@ -2275,7 +2581,7 @@ impl Render for RootView {
                             ))
                         }
                     });
-                    for built in layout_line(&text, geo.measure, window, t) {
+                    for built in layout_line(&text, geo.measure, window, t, &spans) {
                         let mut shaped = Vec::new();
                         for seg in &built.segs {
                             let color = Hsla::from(rgba(seg.color));
@@ -2315,7 +2621,7 @@ impl Render for RootView {
                             }
                             x0.zip(x1)
                         });
-                        rows.push(SnapshotRow { segs: built.segs, caret, sel_px });
+                        rows.push(SnapshotRow { segs: built.segs, buffer_line: line_no, caret, sel_px });
                     }
                 }
                 EditorSnapshot {
@@ -2325,6 +2631,10 @@ impl Render for RootView {
                     has_selection: ed.selection_range().is_some(),
                 }
             });
+            self.cached_snapshot = built.clone();
+            self.cached_snapshot_key = cache_key;
+            built
+        };
         let can_undo = snapshot.as_ref().is_some_and(|s| s.can_undo);
         let can_redo = snapshot.as_ref().is_some_and(|s| s.can_redo);
         self.scroll_content_rows = snapshot.as_ref().map(|s| s.rows.len()).unwrap_or(0);
@@ -2429,6 +2739,7 @@ impl Render for RootView {
                         tabs: self.tabs.clone(),
                         active: self.active_tab,
                         hovered: self.hovered_tab,
+                        dirty: self.dirty_tabs.clone(),
                         can_undo,
                         can_redo,
                         sidebar_progress: self.left_sidebar_progress,
@@ -2456,5 +2767,287 @@ impl Render for RootView {
                     animation: self.menu_animation,
                 })
             })
+            .when(self.close_confirm.is_some(), |d| {
+                let shell = root.clone();
+                let shell_save = shell.clone();
+                let shell_discard = shell.clone();
+                let shell_cancel = shell.clone();
+                let path = self.close_confirm.and_then(|id| self.tabs.iter().find(|t| t.id == id).and_then(|t| t.path.clone())).unwrap_or_default();
+                let file_name = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or(path.clone());
+                let id = self.close_confirm.unwrap();
+                d.child(deferred(
+                    div()
+                        .absolute()
+                        .top(px(0.)).bottom(px(0.)).left(px(0.)).right(px(0.))
+                        .bg(rgba(0x00000066))
+                        .flex().items_center().justify_center()
+                        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                            let _ = shell.update(cx, |root, cx| {
+                                root.close_confirm = None;
+                                cx.notify();
+                            });
+                        })
+                        .child(
+                            div()
+                                .w(px(420.)).rounded(px(20.))
+                                .bg(rgba(t.bg_primary)).border_1().border_color(rgba(t.chrome_border_color))
+                                .p(px(10.)).flex().flex_col().gap(px(8.))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(div().child(format!("Do you want to save changes to \"{}\"?", file_name)))
+                                .child(
+                                    div().flex().flex_row().gap(px(8.))
+                                        .child(modal_button(t, "Save", true, move |cx| {
+                                            let _ = shell_save.update(cx, |root, cx| {
+                                                if let Some(i) = root.tabs.iter().position(|t| t.id == id) { root.active_tab = i; }
+                                                root.save_to(None, cx);
+                                                root.close_confirm = None;
+                                                root.close_tab_force(id, cx);
+                                            });
+                                        }))
+                                        .child(modal_button(t, "Don't Save", false, move |cx| {
+                                            let _ = shell_discard.update(cx, |root, cx| {
+                                                root.close_confirm = None;
+                                                root.close_tab_force(id, cx);
+                                            });
+                                        }))
+                                        .child(modal_button(t, "Cancel", false, move |cx| {
+                                            let _ = shell_cancel.update(cx, |root, cx| {
+                                                root.close_confirm = None;
+                                                cx.notify();
+                                            });
+                                        })),
+                                ),
+                        ),
+                ).with_priority(10000))
+            })
+            .when(self.settings_open, |d| {
+                let shell = root.clone();
+                let shell_click = shell.clone();
+                let wrap_text = self.wrap_text_files;
+                let wrap_code = self.wrap_code_files;
+                let line_numbers = self.line_numbers;
+                let syntax_highlighting = self.syntax_highlighting;
+                let tab = self.settings_tab;
+                d.child(
+                    div()
+                        .absolute()
+                        .top(px(0.))
+                        .bottom(px(0.))
+                        .left(px(0.))
+                        .right(px(0.))
+                        .bg(rgba(0x00000066))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                            let _ = shell_click.update(cx, |root, cx| {
+                                root.settings_open = false;
+                                cx.notify();
+                            });
+                        })
+                        .child(
+                            div()
+                                .w(px(640.))
+                                .h(px(420.))
+                                .rounded(px(12.))
+                                .bg(rgba(t.bg_primary))
+                                .border_1()
+                                .border_color(rgba(t.chrome_border_color))
+                                .flex()
+                                .flex_row()
+                                .overflow_hidden()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(
+                                    div()
+                                        .w(px(160.))
+                                        .h_full()
+                                        .bg(rgba(t.bg_secondary))
+                                        .border_r_1()
+                                        .border_color(rgba(t.chrome_border_color))
+                                        .flex()
+                                        .flex_col()
+                                        .p(px(8.))
+                                        .gap(px(4.))
+                                        .child(settings_tab_button(t, shell.clone(), 0, "General", tab == 0))
+                                        .child(settings_tab_button(t, shell.clone(), 1, "Formatting", tab == 1)),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .h_full()
+                                        .p(px(16.))
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(12.))
+                                        .when(tab == 0, |c| {
+                                            c.child(div().text_lg().child("General"))
+                                                .child(div().child("Theme and general options."))
+                                        })
+                                        .when(tab == 1, |c| {
+                                            c.child(div().text_lg().child("Formatting"))
+                                                .child(settings_toggle(t, shell.clone(), "Wrap text files", wrap_text, "wrap_text"))
+                                                .child(settings_toggle(t, shell.clone(), "Wrap code files", wrap_code, "wrap_code"))
+                                                .child(settings_toggle(t, shell.clone(), "Line numbers", line_numbers, "line_numbers"))
+                                                .child(settings_toggle(t, shell.clone(), "Syntax highlighting", syntax_highlighting, "syntax_highlighting"))
+                                        }),
+                                ),
+                        ),
+                )
+            })
     }
+}
+
+fn settings_tab_button(t: crate::theme::Theme, shell: gpui::WeakEntity<crate::shell::root::RootView>, index: usize, label: &'static str, active: bool) -> gpui::AnyElement {
+    use gpui::prelude::*;
+    div()
+        .id(format!("settings-tab-{}", index))
+        .w_full()
+        .px(gpui::px(8.))
+        .py(gpui::px(6.))
+        .rounded(gpui::px(6.))
+        .cursor_pointer()
+        .bg(gpui::rgba(if active { t.bg_tertiary } else { t.bg_secondary }))
+        .hover(|s| s.bg(gpui::rgba(t.menu_hover_bg)))
+        .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
+            let _ = shell.update(cx, |root, cx| {
+                root.settings_tab = index;
+                cx.notify();
+            });
+        })
+        .child(label)
+        .into_any_element()
+}
+
+fn settings_toggle(t: crate::theme::Theme, shell: gpui::WeakEntity<crate::shell::root::RootView>, label: &'static str, value: bool, kind: &'static str) -> gpui::AnyElement {
+    use gpui::prelude::*;
+    let shell2 = shell.clone();
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .w_full()
+        .child(div().child(label))
+        .child(
+            div()
+                .id(format!("settings-toggle-{}", label))
+                .px(gpui::px(10.))
+                .py(gpui::px(4.))
+                .rounded(gpui::px(6.))
+                .cursor_pointer()
+                .bg(gpui::rgba(if value { t.menu_hover_bg } else { t.bg_tertiary }))
+                .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
+                    let _ = shell2.update(cx, |root, cx| {
+                        match kind {
+                            "wrap_text" => root.set_wrap_text_files(!value, cx),
+                            "wrap_code" => root.set_wrap_code_files(!value, cx),
+                            "line_numbers" => root.set_line_numbers(!value, cx),
+                            "syntax_highlighting" => root.set_syntax_highlighting(!value, cx),
+                            _ => {}
+                        }
+                    });
+                })
+                .child(if value { "On" } else { "Off" }),
+        )
+        .into_any_element()
+}
+
+fn is_code_path(path: &str) -> bool {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(ext.as_str(),
+        "rs" | "js" | "ts" | "jsx" | "tsx" | "py" | "c" | "cpp" | "cc" | "h" | "hpp" |
+        "java" | "go" | "toml" | "json" | "yaml" | "yml" | "css" | "scss" | "html" |
+        "sh" | "bash" | "sql" | "kt" | "swift" | "rb" | "php" | "cs" | "xml" | "ini"
+    )
+}
+
+fn modal_button(t: crate::theme::Theme, label: &'static str, _primary: bool, on_click: impl Fn(&mut gpui::App) + 'static + Clone) -> gpui::AnyElement {
+    use gpui::prelude::*;
+    let cb = on_click.clone();
+    div()
+        .id(format!("modal-{}", label))
+        .flex_1()
+        .flex()
+        .items_center()
+        .justify_center()
+        .px(gpui::px(12.))
+        .py(gpui::px(4.))
+        .rounded(gpui::px(10.))
+        .cursor_pointer()
+        .border_1()
+        .border_color(gpui::rgba(t.chrome_border_color))
+        .bg(gpui::rgba(t.menu_hover_bg))
+        .hover(|s| s.bg(gpui::rgba(t.bg_secondary)))
+        .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
+            cb(cx);
+        })
+        .child(label)
+        .into_any_element()
+}
+
+impl Drop for RootView {
+    fn drop(&mut self) {
+        for id in self.dirty_tabs.clone() {
+            if let Some(tab) = self.tabs.iter().find(|t| t.id == id) {
+                if let Some(path) = &tab.path {
+                    if let Some(ed) = self.editors.get(&id) {
+                        self.store.set(&format!("buffer:{}", path), &ed.text_string());
+                        self.store.set(&format!("dirty:{}", path), "1");
+                    }
+                }
+            }
+        }
+    }
+}
+
+use std::sync::OnceLock;
+
+static SYNTAX_SET: OnceLock<syntect::parsing::SyntaxSet> = OnceLock::new();
+static THEME_SET: OnceLock<syntect::highlighting::ThemeSet> = OnceLock::new();
+
+fn highlight_line_spans(text: &str, ext: &str) -> Vec<(u32, usize, usize)> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use std::sync::Mutex;
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<u64, Vec<(u32, usize, usize)>>>> = OnceLock::new();
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    ext.hash(&mut hasher);
+    let key = hasher.finish();
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(cached) = guard.get(&key) {
+            return cached.clone();
+        }
+    }
+    let ss = SYNTAX_SET.get_or_init(syntect::parsing::SyntaxSet::load_defaults_newlines);
+    let ts = THEME_SET.get_or_init(syntect::highlighting::ThemeSet::load_defaults);
+    let syntax = ss
+        .find_syntax_by_extension(ext)
+        .unwrap_or_else(|| ss.find_syntax_plain_text());
+    let theme = ts.themes.get("base16-ocean-dark").or_else(|| ts.themes.values().next()).unwrap();
+    let mut h = syntect::easy::HighlightLines::new(syntax, theme);
+    let Ok(ranges) = h.highlight_line(text, ss) else {
+        return vec![(0xffffff, 0, text.len())];
+    };
+    let mut out = Vec::new();
+    let mut pos = 0;
+    for (style, s) in ranges {
+        let len = s.len();
+        let c = style.foreground;
+        let color = ((c.r as u32) << 24) | ((c.g as u32) << 16) | ((c.b as u32) << 8) | if c.a == 0 { 0xff } else { c.a as u32 };
+        out.push((color, pos, pos + len));
+        pos += len;
+    }
+    if out.is_empty() {
+        out.push((0xffffff, 0, text.len()));
+    }
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(key, out.clone());
+    }
+    out
 }

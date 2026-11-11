@@ -17,6 +17,7 @@ actions!(
         Save,
         ShowWelcome,
         ToggleFilesPanel,
+        ToggleSettings,
     ]
 );
 

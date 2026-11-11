@@ -159,6 +159,9 @@ fn register_action_handlers(cx: &mut App) {
     cx.on_action(|_: &ToggleFilesPanel, cx| {
         with_root(cx, |root, cx| root.toggle_panel(PanelKind::Files, cx));
     });
+    cx.on_action(|_: &ToggleSettings, cx| {
+        with_root(cx, |root, cx| root.toggle_settings(cx));
+    });
 }
 
 fn bind_keys(cx: &mut App) {

@@ -47,6 +47,14 @@ const REDO_ICON: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 
 	<path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 12h10m0 0l-3.33-3.33M17 12l-3.33 3.33" />
 </svg>"#;
 
+const SETTINGS_ICON: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
+	<path d="M0 0h24v24H0z" fill="none" />
+	<g fill="none" stroke="currentColor" stroke-width="2">
+		<path stroke-linecap="round" stroke-linejoin="round" d="M10.3 5.98q1.7-.98 3.4 0l2.66 1.54q1.7.98 1.7 2.94v3.08q0 1.96-1.7 2.94l-2.66 1.54q-1.7.98-3.4 0l-2.66-1.54q-1.7-.98-1.7-2.94v-3.08q0-1.96 1.7-2.94Z" />
+		<circle cx="12" cy="12" r="2.5" />
+	</g>
+</svg>"#;
+
 const TAB_CLOSE_ICON: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
 	<path d="M0 0h24v24H0z" fill="none" />
 	<path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="m18 6l-6 6m0 0l-6 6m6-6l6 6m-6-6L6 6" />
@@ -260,6 +268,7 @@ pub struct TopBar {
     pub tabs: Vec<Tab>,
     pub active: usize,
     pub hovered: Option<usize>,
+    pub dirty: std::collections::HashSet<usize>,
     pub can_undo: bool,
     pub can_redo: bool,
     /// Continuous sidebar animation value. Keeping the divider in the layout
@@ -323,6 +332,11 @@ impl gpui::RenderOnce for TopBar {
                 self.root.clone(),
                 shell_fade(&self.root, cx, "tb-menu"),
             ))
+            .child(render_settings_button(
+                t,
+                self.root.clone(),
+                shell_fade(&self.root, cx, "tb-settings"),
+            ))
             .child(
                 div()
                     .w(px((self.sidebar_width - TOP_BAR_CONTROL_CLUSTER_WIDTH).max(0.)))
@@ -342,7 +356,7 @@ impl gpui::RenderOnce for TopBar {
                     .justify_center()
                     .child(
                         div()
-                            .w(px(1.5))
+                            .w(px(2.))
                             .h(px(FOLDER_SEPARATOR_HEIGHT))
                             .rounded(px(2.))
                             .bg(rgba(t.chrome_border_color)),
@@ -353,6 +367,7 @@ impl gpui::RenderOnce for TopBar {
                 tabs: self.tabs,
                 active: self.active,
                 hovered: self.hovered,
+                dirty: self.dirty.clone(),
             })
             .child(render_window_controls(t, cx))
     }
@@ -510,6 +525,55 @@ fn render_sidebar_button(
         .into_any_element()
 }
 
+fn render_settings_button(
+    t: crate::theme::Theme,
+    root: WeakEntity<RootView>,
+    fade: f32,
+) -> AnyElement {
+    div()
+        .id("app-settings-button")
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(TOP_BAR_BUTTON_SIZE))
+        .h(px(TOP_BAR_BUTTON_SIZE))
+        .ml(px(2.))
+        .my(px((TOP_BAR_HEIGHT - TOP_BAR_BUTTON_SIZE) / 2.))
+        .rounded(px(6.))
+        .cursor_pointer()
+        .bg(rgba(crate::theme::lerp_rgb(
+            t.bg_secondary,
+            t.menu_hover_bg,
+            fade,
+        )))
+        .on_hover({
+            let root = root.clone();
+            move |hovered, _, cx| {
+                let _ = root.update(cx, |root, cx| {
+                    root.animate_fade("tb-settings", if *hovered { 1.0 } else { 0.0 }, cx);
+                });
+            }
+        })
+        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+            let _ = root.update(cx, |root, cx| {
+                root.toggle_settings(cx);
+                cx.stop_propagation();
+            });
+        })
+        .child(
+            svg()
+                .data(SETTINGS_ICON)
+                .w(px(TOP_BAR_ICON_SIZE))
+                .h(px(TOP_BAR_ICON_SIZE))
+                .text_color(rgba(crate::theme::lerp_rgb(
+                    t.empty_text_primary,
+                    t.text_primary,
+                    fade,
+                ))),
+        )
+        .into_any_element()
+}
+
 fn render_history_buttons(
     t: crate::theme::Theme,
     root: WeakEntity<RootView>,
@@ -651,6 +715,7 @@ pub struct TabBar {
     pub tabs: Vec<Tab>,
     pub active: usize,
     pub hovered: Option<usize>,
+    pub dirty: std::collections::HashSet<usize>,
 }
 
 impl gpui::RenderOnce for TabBar {
@@ -716,6 +781,7 @@ impl gpui::RenderOnce for TabBar {
                                 let tab_id = tab.id;
                                 let is_active = i == self.active;
                                 let is_hovered = self.hovered == Some(tab_id);
+                                let is_dirty = self.dirty.contains(&tab_id);
                                 // (dividers between tabs removed; all tabs now carry their own border)
                                 // Constant geometry in both states: the outer shell always
                                 // carries side borders, the inner row always carries the
@@ -789,6 +855,25 @@ impl gpui::RenderOnce for TabBar {
                                                 .with_priority(1000),
                                         )
                                     })
+                                    .child(deferred(
+                                        div()
+                                            .absolute()
+                                            .right(px(4.))
+                                            .top_0()
+                                            .bottom(px(0.))
+                                            .w(px(16.))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(
+                                                div()
+                                                    .w(px(6.))
+                                                    .h(px(6.))
+                                                    .rounded(px(3.))
+                                                    .bg(rgba(t.text_secondary))
+                                                    .opacity(if is_dirty && !is_hovered { 1.0 } else { 0.0 }),
+                                            ),
+                                    ).with_priority(10000))
                                     .child(
                                         deferred(
                                             div()
@@ -964,6 +1049,25 @@ impl gpui::RenderOnce for BottomBar {
             .bg(rgba(t.bg_secondary))
             .border_t_1()
             .border_color(rgba(t.chrome_border_color))
+            .children(self.root.upgrade().and_then(|root| {
+                let left_occ = root.read(cx).left_occupancy();
+                let status = root.read(cx).bottom_status();
+                status.map(|(cursor, chars, file_type, size)| {
+                    div()
+                        .ml(px(left_occ))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(4.))
+                        .child(div().text_xs().font_weight(WEIGHT_MEDIUM).text_color(rgba(t.empty_text_primary)).child(cursor))
+                        .child(tab_divider(t.chrome_border_color))
+                        .child(div().text_xs().font_weight(WEIGHT_MEDIUM).text_color(rgba(t.empty_text_primary)).child(format!("{} chars", chars)))
+                        .child(tab_divider(t.chrome_border_color))
+                        .child(div().text_xs().font_weight(WEIGHT_MEDIUM).text_color(rgba(t.empty_text_primary)).child(file_type))
+                        .child(tab_divider(t.chrome_border_color))
+                        .child(div().text_xs().font_weight(WEIGHT_MEDIUM).text_color(rgba(t.empty_text_primary)).child(size))
+                })
+            }).into_iter())
             .child(div().flex_1())
             .child(
                 div()

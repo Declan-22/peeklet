@@ -12,3 +12,4 @@ gpui_platform = { git = "https://github.com/zed-industries/zed.git" }
 rfd = "0.15"
 ropey = "1.6"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+syntect = "5.2"
