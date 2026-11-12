@@ -2,8 +2,10 @@
 //! right dock), bottom bar, menu overlay. Owns tabs, dock layout, menus,
 //! hover tweens, and drag-resize state.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use image::ImageDecoder;
@@ -18,9 +20,10 @@ use gpui::{
     px, rgba, svg,
 };
 
-use super::chrome::{BOTTOM_BAR_HEIGHT, BottomBar, SidebarBottomBar, TOP_BAR_HEIGHT, TopBar};
+use super::chrome::{BOTTOM_BAR_HEIGHT, BottomBar, SidebarBottomBar, TOOLBAR_HEIGHT, Toolbar, TOP_BAR_HEIGHT, TopBar};
 use super::dock::{DOCK_DEFAULT_WIDTH, DockView};
 use super::dropdown::AppMenu;
+use super::ink::{self, InkStroke};
 use super::panels::{DockSide, PanelKind};
 use crate::editor::EditorState;
 use crate::persist::{Store, TabRecord};
@@ -490,6 +493,23 @@ pub struct RootView {
     image_pan_target: (f32, f32),
     image_zoom_tween_active: bool,
     image_drag: Option<(MouseButton, f32, f32, f32, f32)>,
+    /// Annotation strokes per image path, in source-image pixel space.
+    image_strokes: HashMap<String, Vec<InkStroke>>,
+    /// The stroke currently being drawn, if any.
+    image_current_stroke: Option<InkStroke>,
+    /// True while the mouse button is held down on the canvas.
+    image_drawing: bool,
+    /// Scale of the image at the fit-to-window zoom level, used to keep the
+    /// sampling density of new strokes constant.
+    image_fit: f32,
+    /// Path of the image that is currently being annotated.
+    image_ink_path: String,
+    /// Currently selected image-toolbar tool (0 = cursor, ...).
+    pub image_toolbar_tool: usize,
+    /// Whether the shapes dropdown is open.
+    pub image_shapes_dropdown_open: bool,
+    /// Currently selected shape in the shapes dropdown (0 = rectangle).
+    pub image_shapes_selected: usize,
     /// Buffers keyed by tab id, created lazily.
     editors: HashMap<usize, EditorState>,
     /// Tab ids with unsaved edits (dirty).
@@ -627,6 +647,14 @@ impl RootView {
             image_pan_target: (0.0, 0.0),
             image_zoom_tween_active: false,
             image_drag: None,
+            image_strokes: HashMap::new(),
+            image_current_stroke: None,
+            image_drawing: false,
+            image_fit: 1.0,
+            image_ink_path: String::new(),
+            image_toolbar_tool: 0,
+            image_shapes_dropdown_open: false,
+            image_shapes_selected: 0,
             editors: HashMap::new(),
             dirty_tabs: HashSet::new(),
             editor_version: 0,
@@ -715,7 +743,7 @@ impl RootView {
                 .and_then(|reader| reader.into_decoder().ok())
                 .map(|decoder| {
                     let (width, height) = decoder.dimensions();
-                    (Some(format!("{width} × {height}")), Some("—".into()))
+                    (Some(format!("{width} × {height} px")), Some("—".into()))
                 })
                 .unwrap_or((None, None))
         } else {
@@ -820,6 +848,14 @@ impl RootView {
     pub fn left_occupancy(&self) -> f32 {
         if self.visible_left.is_some() {
             self.left_width * self.left_sidebar_progress
+        } else {
+            0.0
+        }
+    }
+
+    pub fn right_occupancy(&self) -> f32 {
+        if self.visible_right.is_some() {
+            self.right_width
         } else {
             0.0
         }
@@ -1486,6 +1522,93 @@ impl RootView {
             .is_some_and(|path| viewer_kind(Some(path)) == ViewerKind::Pdf)
     }
 
+    pub(crate) fn active_is_image(&self) -> bool {
+        self.tabs
+            .get(self.active_tab)
+            .and_then(|tab| tab.path.as_deref())
+            .is_some_and(|path| viewer_kind(Some(path)) == ViewerKind::Image)
+    }
+
+    /// Remove strokes (or parts of them) near the given image-space point.
+    pub fn erase_image_strokes(&mut self, path: &str, point: (f32, f32), radius: f32) {
+        if let Some(strokes) = self.image_strokes.get_mut(path) {
+            ink::erase(strokes, point.0, point.1, radius);
+        }
+    }
+
+    /// Start an annotation stroke (or an eraser pass) at an image-space point.
+    pub fn begin_ink_stroke(
+        &mut self,
+        path: &str,
+        x: f32,
+        y: f32,
+        pen_width: f32,
+        hl_width: f32,
+        eraser_radius: f32,
+    ) {
+        let tool = self.image_toolbar_tool as u8;
+        match tool {
+            ink::TOOL_PEN | ink::TOOL_HIGHLIGHTER => {
+                let width = if tool == ink::TOOL_PEN {
+                    pen_width
+                } else {
+                    hl_width
+                };
+                self.image_drawing = true;
+                self.image_ink_path = path.to_string();
+                self.image_current_stroke = Some(InkStroke::new(tool, width, vec![(x, y)]));
+            }
+            ink::TOOL_ERASER => {
+                self.image_drawing = true;
+                self.image_ink_path = path.to_string();
+                self.image_current_stroke = None;
+                self.erase_image_strokes(path, (x, y), eraser_radius);
+            }
+            _ => {}
+        }
+    }
+
+    /// Extend the stroke in progress to an image-space point.
+    pub fn extend_ink_stroke(&mut self, x: f32, y: f32, eraser_radius: f32) {
+        if !self.image_drawing {
+            return;
+        }
+        if self.image_toolbar_tool as u8 == ink::TOOL_ERASER {
+            let path = self.image_ink_path.clone();
+            self.erase_image_strokes(&path, (x, y), eraser_radius);
+            return;
+        }
+        if let Some(stroke) = &mut self.image_current_stroke {
+            // Ignore samples that are too close together; they add nothing but
+            // path vertices. The spacing is fixed in screen terms so the
+            // smoothing is the same at every zoom level.
+            let min_dist = (1.5 / self.image_fit).max(0.05);
+            let too_close = match stroke.points.last() {
+                Some((lx, ly)) => {
+                    let dx = x - lx;
+                    let dy = y - ly;
+                    (dx * dx + dy * dy).sqrt() < min_dist
+                }
+                None => false,
+            };
+            if !too_close {
+                stroke.points.push((x, y));
+            }
+        }
+    }
+
+    /// Finish the stroke in progress and store it.
+    pub fn end_ink_stroke(&mut self) {
+        self.image_drawing = false;
+        if let Some(stroke) = self.image_current_stroke.take() {
+            if stroke.points.len() >= 2 {
+                let path = std::mem::take(&mut self.image_ink_path);
+                self.image_strokes.entry(path).or_default().push(stroke);
+            }
+        }
+        self.image_ink_path.clear();
+    }
+
     pub(crate) fn pdf_page_assets(&self) -> Vec<(Arc<gpui::Image>, u32, u32)> {
         self.tabs
             .get(self.active_tab)
@@ -1607,11 +1730,36 @@ impl RootView {
         let _ = (path, tab_id);
     }
 
-    pub fn bottom_status(&self) -> Option<(String, String, String, String)> {
+    pub fn bottom_status(&self) -> Option<Vec<String>> {
         let tab = self.tabs.get(self.active_tab)?;
         if tab.title == "Welcome" {
             return None;
         }
+        let path = tab.path.as_deref();
+        let size_bytes = tab
+            .path
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).ok().map(|m| m.len()))
+            .unwrap_or(0);
+        let size_str = if size_bytes < 1024 {
+            format!("{} B", size_bytes)
+        } else if size_bytes < 1024 * 1024 {
+            format!("{:.1} KB", size_bytes as f64 / 1024.0)
+        } else {
+            format!("{:.1} MB", size_bytes as f64 / (1024.0 * 1024.0))
+        };
+
+        if viewer_kind(path) == ViewerKind::Image {
+            let info = self.active_file_info();
+            let dims = info.dimensions.unwrap_or_else(|| "—".into());
+            let kind = tab
+                .path
+                .as_ref()
+                .and_then(|p| std::path::Path::new(p).extension().and_then(|e| e.to_str()).map(|s| s.to_uppercase()))
+                .unwrap_or_else(|| "IMAGE".to_string());
+            return Some(vec![dims, kind, size_str]);
+        }
+
         let id = tab.id;
         let ed = self.editors.get(&id)?;
         let (line, byte) = ed.cursor_line_byte();
@@ -1623,32 +1771,157 @@ impl RootView {
             .as_ref()
             .and_then(|p| std::path::Path::new(p).extension().and_then(|e| e.to_str()).map(|s| s.to_string()))
             .unwrap_or_else(|| "Text".to_string());
-        let size_bytes = tab
-            .path
-            .as_ref()
-            .and_then(|p| std::fs::metadata(p).ok().map(|m| m.len()))
-            .unwrap_or(chars as u64);
-        let size_str = if size_bytes < 1024 {
-            format!("{} B", size_bytes)
-        } else if size_bytes < 1024 * 1024 {
-            format!("{:.1} KB", size_bytes as f64 / 1024.0)
-        } else {
-            format!("{:.1} MB", size_bytes as f64 / (1024.0 * 1024.0))
-        };
-        Some((format!("Ln {}, Col {}", line + 1, col), format!("{}", chars), file_type, size_str))
+        Some(vec![
+            format!("Ln {}, Col {}", line + 1, col),
+            format!("{}", chars),
+            file_type,
+            size_str,
+        ])
     }
 
     /// Write the active tab's buffer to its file. No-op without a path.
-    fn save_active(&self) {
+    fn save_active(&mut self, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get(self.active_tab) else {
             return;
         };
-        let Some(path) = tab.path.as_ref() else {
+        let Some(path) = tab.path.clone() else {
             return;
         };
-        if let Some(ed) = self.editors.get(&tab.id) {
-            let _ = std::fs::write(path, ed.text_string());
+        if viewer_kind(Some(&path)) == ViewerKind::Image {
+            self.save_annotated_image(&path, cx);
+            return;
         }
+        if let Some(ed) = self.editors.get(&tab.id) {
+            let _ = std::fs::write(&path, ed.text_string());
+        }
+    }
+
+    /// Write the image back with the annotation strokes baked in.
+    ///
+    /// Strokes are stored in the source image's pixel space, so they are
+    /// rasterized at the image's own resolution. A stroke that reaches
+    /// outside the image grows the canvas instead of being clipped.
+    fn save_annotated_image(&mut self, path: &str, cx: &mut Context<Self>) {
+        let Some(strokes) = self.image_strokes.get(path) else {
+            return;
+        };
+        if strokes.is_empty() {
+            return;
+        }
+        let Ok(source) = image::open(path) else {
+            return;
+        };
+        let (img_w, img_h) = (source.width() as f32, source.height() as f32);
+
+        // How far the strokes reach outside the image.
+        let mut min_x = 0.0f32;
+        let mut min_y = 0.0f32;
+        let mut max_x = img_w;
+        let mut max_y = img_h;
+        for stroke in strokes {
+            let pad = stroke.width;
+            for p in &stroke.points {
+                min_x = min_x.min(p.0 - pad);
+                min_y = min_y.min(p.1 - pad);
+                max_x = max_x.max(p.0 + pad);
+                max_y = max_y.max(p.1 + pad);
+            }
+        }
+        let off_x = (-min_x).max(0.0).ceil() as i64;
+        let off_y = (-min_y).max(0.0).ceil() as i64;
+        let canvas_w = (max_x.ceil() as i64 + off_x).max(1) as u32;
+        let canvas_h = (max_y.ceil() as i64 + off_y).max(1) as u32;
+
+        let Some(mut canvas) = tiny_skia::Pixmap::new(canvas_w, canvas_h) else {
+            return;
+        };
+
+        // Draw the source image into the canvas.
+        let rgba = source.to_rgba8();
+        {
+            let pixels = canvas.pixels_mut();
+            for y in 0..rgba.height() {
+                for x in 0..rgba.width() {
+                    let px = rgba.get_pixel(x, y).0;
+                    let idx = ((y as i64 + off_y) * canvas_w as i64 + x as i64 + off_x) as usize;
+                    if idx < pixels.len() {
+                        if let Some(c) = tiny_skia::PremultipliedColorU8::from_rgba(
+                            px[0], px[1], px[2], px[3],
+                        ) {
+                            pixels[idx] = c;
+                        }
+                    }
+                }
+            }
+        }
+
+        // The pen is opaque, so it can be drawn straight onto the canvas.
+        for stroke in strokes.iter().filter(|s| s.tool == ink::TOOL_PEN) {
+            let Some(path) = stroke_path(stroke, off_x as f32, off_y as f32) else {
+                continue;
+            };
+            let mut paint = tiny_skia::Paint::default();
+            paint.anti_alias = true;
+            paint.set_color(tiny_skia::Color::from_rgba(0.0, 0.0, 0.0, 1.0).unwrap_or(tiny_skia::Color::BLACK));
+            let mut style = tiny_skia::Stroke::default();
+            style.width = stroke.width;
+            style.line_cap = tiny_skia::LineCap::Round;
+            style.line_join = tiny_skia::LineJoin::Round;
+            canvas.stroke_path(
+                &path,
+                &paint,
+                &style,
+                tiny_skia::Transform::identity(),
+                None,
+            );
+        }
+
+        // The highlighter is translucent, so the strokes are first merged into
+        // a coverage mask. Overlapping strokes then keep a single layer of
+        // colour instead of stacking their opacity.
+        let highlights: Vec<&InkStroke> = strokes
+            .iter()
+            .filter(|s| s.tool == ink::TOOL_HIGHLIGHTER)
+            .collect();
+        if !highlights.is_empty() {
+            if let Some(mask) = build_highlight_mask(&highlights, off_x as f32, off_y as f32, canvas_w, canvas_h)
+            {
+                let pixels = canvas.pixels_mut();
+                for (i, p) in pixels.iter_mut().enumerate() {
+                    let a = mask[i];
+                    if a == 0 {
+                        continue;
+                    }
+                    let alpha = a as f32 / 255.0 * 0.47;
+                    let r = p.red() as f32;
+                    let g = p.green() as f32;
+                    let b = p.blue() as f32;
+                    let nr = 255.0f32 * alpha + r * (1.0 - alpha);
+                    let ng = 235.0f32 * alpha + g * (1.0 - alpha);
+                    let nb = 40.0f32 * alpha + b * (1.0 - alpha);
+                    *p = tiny_skia::PremultipliedColorU8::from_rgba(
+                        nr.round() as u8,
+                        ng.round() as u8,
+                        nb.round() as u8,
+                        255,
+                    )
+                    .unwrap_or(*p);
+                }
+            }
+        }
+
+        let data = canvas.encode_png().unwrap_or_default();
+        if std::fs::write(path, data).is_err() {
+            return;
+        }
+
+        // The strokes are now part of the file, so drop them and reload the
+        // image. Saving again would otherwise bake them a second time.
+        self.image_strokes.remove(path);
+        self.image_assets.remove(path);
+        self.image_loading.remove(path);
+        self.image_load_errors.remove(path);
+        self.start_image_load(path, cx);
     }
 
     /// Save the active tab, asking for a path when it has none.
@@ -1681,7 +1954,7 @@ impl RootView {
                 tab.title = title;
             }
         }
-        self.save_active();
+        self.save_active(cx);
         // Mark clean: remove dirty state and persisted buffer.
         if let Some(tab) = self.tabs.get(self.active_tab) {
             let id = tab.id;
@@ -1728,11 +2001,12 @@ impl RootView {
         }
     }
 
-    /// Viewport height: window minus top and bottom bars.
+    /// Viewport height: window minus top and bottom bars and the toolbar.
     fn viewport_h(window: &mut Window) -> f32 {
         (window.viewport_size().height.as_f32()
             - TOP_BAR_HEIGHT
-            - BOTTOM_BAR_HEIGHT)
+            - BOTTOM_BAR_HEIGHT
+            - TOOLBAR_HEIGHT)
             .max(0.0)
     }
 
@@ -2089,7 +2363,9 @@ impl RootView {
         let Some(pages) = self.pdf_assets.get(path) else {
             return div()
                 .id("pdf-preview")
-                .size_full()
+                .w_full()
+                .flex_1()
+                .min_h(px(0.))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -2112,7 +2388,9 @@ impl RootView {
         });
         div()
             .id("pdf-preview")
-            .size_full()
+            .w_full()
+            .flex_1()
+            .min_h(px(0.))
             .flex()
             .flex_col()
             .items_center()
@@ -2195,7 +2473,9 @@ impl RootView {
             }
             return div()
                 .id("image-preview")
-                .size_full()
+                .w_full()
+                .flex_1()
+                .min_h(px(0.))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -2240,9 +2520,28 @@ impl RootView {
         };
         let left = left_occ + (view_w - draw_w) / 2.0 + self.image_pan.0;
         let top = (view_h - draw_h) / 2.0 + self.image_pan.1;
-        div()
+
+        // Scale from source-image pixels to preview pixels.
+        let scale_x = if image_w > 0.0 { draw_w / image_w } else { 1.0 };
+        let scale_y = if image_h > 0.0 { draw_h / image_h } else { 1.0 };
+
+        // Tool widths are given on screen at the fit-to-window zoom level and
+        // stored in image pixels, so they grow as you zoom in.
+        self.image_fit = fit;
+        let pen_width = (ink::PEN_SCREEN_WIDTH / fit).max(0.5);
+        let hl_width = (ink::HIGHLIGHTER_SCREEN_WIDTH / fit).max(1.0);
+        let eraser_radius = ink::ERASER_SCREEN_RADIUS / scale_x;
+
+        // The image rect's origin in window coordinates. Only the ink layer's
+        // prepaint knows where the preview column actually sits, so it
+        // publishes the measured origin here for the mouse handlers.
+        let ink_origin: Rc<Cell<(f32, f32)>> = Rc::new(Cell::new((left, top)));
+
+        let mut preview = div()
             .id("image-preview")
-            .size_full()
+            .w_full()
+            .flex_1()
+            .min_h(px(0.))
             .relative()
             .overflow_hidden()
             .bg(rgba(t.bg_primary))
@@ -2330,6 +2629,7 @@ impl RootView {
                         let cursor_x = event.position.x.as_f32() - left_occ - view_w / 2.0;
                         let cursor_y = event.position.y.as_f32()
                             - TOP_BAR_HEIGHT
+                            - TOOLBAR_HEIGHT
                             - view_h / 2.0;
                         root.image_zoom_target = new_zoom;
                         if new_zoom <= 1.0 {
@@ -2359,8 +2659,185 @@ impl RootView {
                             .size_full()
                             .object_fit(ObjectFit::Fill),
                     ),
-            )
+            );
+
+        // The drawing tools claim the left mouse button.
+        let tool = self.image_toolbar_tool as u8;
+        if matches!(
+            tool,
+            ink::TOOL_PEN | ink::TOOL_HIGHLIGHTER | ink::TOOL_ERASER
+        ) {
+            let root_down = root.clone();
+            let path_down = path.to_string();
+            let origin_down = ink_origin.clone();
+            preview = preview.on_mouse_down(
+                MouseButton::Left,
+                move |ev: &MouseDownEvent, _w, cx| {
+                    let (ox, oy) = origin_down.get();
+                    let ix = (ev.position.x.as_f32() - ox) / scale_x;
+                    let iy = (ev.position.y.as_f32() - oy) / scale_y;
+                    let _ = root_down.update(cx, |root, cx| {
+                        root.begin_ink_stroke(
+                            &path_down,
+                            ix,
+                            iy,
+                            pen_width,
+                            hl_width,
+                            eraser_radius,
+                        );
+                        cx.notify();
+                    });
+                    cx.stop_propagation();
+                },
+            );
+
+            let root_move = root.clone();
+            let origin_move = ink_origin.clone();
+            preview = preview.on_mouse_move(
+                move |ev: &gpui::MouseMoveEvent, _w, cx| {
+                    let (ox, oy) = origin_move.get();
+                    let ix = (ev.position.x.as_f32() - ox) / scale_x;
+                    let iy = (ev.position.y.as_f32() - oy) / scale_y;
+                    let _ = root_move.update(cx, |root, cx| {
+                        root.extend_ink_stroke(ix, iy, eraser_radius);
+                        cx.notify();
+                    });
+                },
+            );
+
+            let root_up = root.clone();
+            preview = preview.on_mouse_up(MouseButton::Left, move |_ev, _w, cx| {
+                let _ = root_up.update(cx, |root, cx| {
+                    root.end_ink_stroke();
+                    cx.notify();
+                });
+            });
+        }
+
+        preview
+            .child(self.render_image_ink_layer(
+                path,
+                left,
+                top,
+                window.viewport_size().width.as_f32(),
+                view_h,
+                scale_x,
+                scale_y,
+                ink_origin.clone(),
+                cx,
+            ))
             .into_any_element()
+    }
+
+    /// Draw the annotation strokes over the image.
+    ///
+    /// Strokes live in the source image's pixel space, so they stay anchored to
+    /// the image and scale with zoom. Rendering goes through GPUI's path
+    /// pipeline (CPU tessellation, GPU rasterization), which keeps the edges
+    /// smooth at any zoom and costs no per-frame image encoding.
+    #[allow(clippy::too_many_arguments)]
+    fn render_image_ink_layer(
+        &self,
+        path: &str,
+        left: f32,
+        top: f32,
+        view_w: f32,
+        view_h: f32,
+        scale_x: f32,
+        scale_y: f32,
+        origin: Rc<Cell<(f32, f32)>>,
+        _cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let mut strokes: Vec<InkStroke> = self.image_strokes.get(path).cloned().unwrap_or_default();
+        // The stroke currently being drawn is rendered live.
+        if let Some(current) = &self.image_current_stroke {
+            strokes.push(current.clone());
+        }
+
+        let pen_color = rgba(0x000000ff);
+        let hl_color = rgba(0xffff0078);
+
+        let origin_prepaint = origin.clone();
+        let canvas = gpui::canvas(
+            move |bounds: gpui::Bounds<gpui::Pixels>, _window, _app| {
+                // The canvas covers the whole preview area, so its origin is
+                // the preview area's origin in window coordinates. The image
+                // sits at left/	op inside it.
+                origin_prepaint.set((
+                    bounds.origin.x.as_f32() + left,
+                    bounds.origin.y.as_f32() + top,
+                ));
+            },
+            move |bounds: gpui::Bounds<gpui::Pixels>, _unit, window, _app| {
+                let ox = bounds.origin.x.as_f32();
+                let oy = bounds.origin.y.as_f32();
+                let vw = bounds.size.width.as_f32();
+                let vh = bounds.size.height.as_f32();
+                // The image's origin in window coordinates.
+                let ix0 = ox + left;
+                let iy0 = oy + top;
+
+                let mut pen_polys: Vec<Vec<(f32, f32)>> = Vec::new();
+                let mut hl_polys: Vec<Vec<(f32, f32)>> = Vec::new();
+
+                for stroke in &strokes {
+                    if stroke.points.len() < 2 {
+                        continue;
+                    }
+                    // Smooth in image space, so the shape of a stroke does not
+                    // change as the image is zoomed.
+                    let pts = ink::smooth(&stroke.points);
+                    let win: Vec<(f32, f32)> = pts
+                        .iter()
+                        .map(|p| (ix0 + p.0 * scale_x, iy0 + p.1 * scale_y))
+                        .collect();
+                    // Skip strokes that are entirely off screen.
+                    if !visible(&win, ox, oy, vw, vh) {
+                        continue;
+                    }
+                    match stroke.tool {
+                        ink::TOOL_PEN => {
+                            // The width is stored in image pixels, so the
+                            // stroke gets thicker as the image is zoomed in.
+                            let w = stroke.width * scale_x;
+                            let curve = ink::spline(&win, 0.4, 220);
+                            let poly = ink::ribbon(&curve, w * 0.5, false);
+                            if poly.len() >= 3 {
+                                pen_polys.push(poly);
+                            }
+                        }
+                        ink::TOOL_HIGHLIGHTER => {
+                            // The highlighter is one filled shape for every
+                            // stroke, so overlapping strokes merge instead of
+                            // stacking their opacity.
+                            let w = stroke.width * scale_x;
+                            let curve = ink::spline(&win, 1.0, 220);
+                            let poly = ink::ribbon(&curve, w * 0.5, true);
+                            if poly.len() >= 3 {
+                                hl_polys.push(poly);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Every stroke of a tool goes into a single filled path, so
+                // overlapping strokes merge instead of stacking their opacity.
+                if let Some(p) = ink::fill(&pen_polys) {
+                    window.paint_path(p, pen_color);
+                }
+                if let Some(p) = ink::fill(&hl_polys) {
+                    window.paint_path(p, hl_color);
+                }
+            },
+        )
+        .absolute()
+        .left(px(0.))
+        .top(px(0.))
+        .w(px(view_w))
+        .h(px(view_h));
+
+        canvas.into_any_element()
     }
 
     /// Zed-style welcome tab: big centered greeting, then a narrow
@@ -2702,6 +3179,7 @@ impl Render for RootView {
                             .flex()
                             .flex_col()
                             .min_h(px(0.))
+                            .child(Toolbar { root: root.clone() })
                             .child(self.render_preview(
                                 root.clone(),
                                 snapshot,
@@ -3051,3 +3529,70 @@ fn highlight_line_spans(text: &str, ext: &str) -> Vec<(u32, usize, usize)> {
     }
     out
 }
+
+/// Build a raster path for a stroke, offset into the output canvas.
+fn stroke_path(stroke: &InkStroke, off_x: f32, off_y: f32) -> Option<tiny_skia::Path> {
+    if stroke.points.len() < 2 {
+        return None;
+    }
+    let mut pb = tiny_skia::PathBuilder::new();
+    let first = stroke.points[0];
+    pb.move_to(first.0 + off_x, first.1 + off_y);
+    for p in &stroke.points[1..] {
+        pb.line_to(p.0 + off_x, p.1 + off_y);
+    }
+    pb.finish()
+}
+
+/// Rasterize the highlighter strokes into a coverage mask.
+///
+/// Each stroke is drawn with the lighten blend so that where strokes
+/// overlap the coverage is the strongest one rather than the sum, which is
+/// what keeps the highlighter from doubling up its opacity.
+fn build_highlight_mask(
+    strokes: &[&InkStroke],
+    off_x: f32,
+    off_y: f32,
+    width: u32,
+    height: u32,
+) -> Option<Vec<u8>> {
+    let mut mask = tiny_skia::Pixmap::new(width, height)?;
+    let mut paint = tiny_skia::Paint::default();
+    paint.anti_alias = true;
+    paint.set_color(tiny_skia::Color::from_rgba(1.0, 1.0, 1.0, 1.0).unwrap_or(tiny_skia::Color::WHITE));
+    paint.blend_mode = tiny_skia::BlendMode::Lighten;
+    for stroke in strokes {
+        let Some(path) = stroke_path(stroke, off_x, off_y) else {
+            continue;
+        };
+        let mut style = tiny_skia::Stroke::default();
+        style.width = stroke.width;
+        style.line_cap = tiny_skia::LineCap::Butt;
+        style.line_join = tiny_skia::LineJoin::Round;
+        mask.stroke_path(
+            &path,
+            &paint,
+            &style,
+            tiny_skia::Transform::identity(),
+            None,
+        );
+    }
+    Some(mask.pixels().iter().map(|p| p.alpha()).collect())
+}
+
+/// Whether a polyline (in window coordinates) overlaps the given rectangle.
+/// Used to skip strokes that are entirely off screen.
+fn visible(points: &[(f32, f32)], x: f32, y: f32, w: f32, h: f32) -> bool {
+    let mut min_x = f32::MAX;
+    let mut min_y = f32::MAX;
+    let mut max_x = f32::MIN;
+    let mut max_y = f32::MIN;
+    for p in points {
+        min_x = min_x.min(p.0);
+        min_y = min_y.min(p.1);
+        max_x = max_x.max(p.0);
+        max_y = max_y.max(p.1);
+    }
+    min_x <= x + w && max_x >= x && min_y <= y + h && max_y >= y
+}
+

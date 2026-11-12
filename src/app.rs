@@ -11,6 +11,9 @@ use crate::shell::panels::PanelKind;
 use crate::theme::{self, ThemeMode};
 
 pub fn run() {
+    // `peeklet <path>` opens a file straight away, which is handy for
+    // scripting and for opening images from the shell.
+    let initial_file = std::env::args_os().nth(1).map(std::path::PathBuf::from);
     application().run(|cx: &mut App| {
         load_fonts(cx);
         let store = Store::open_default();
@@ -42,6 +45,10 @@ pub fn run() {
                 let focus = view.read(cx).focus.clone();
                 window.focus(&focus, cx);
                 cx.set_global(RootHandle(view.downgrade()));
+                if let Some(path) = initial_file {
+                    let path = path.to_string_lossy().into_owned();
+                    view.update(cx, |view, cx| view.open_file_path(path, cx));
+                }
                 view
             },
         )

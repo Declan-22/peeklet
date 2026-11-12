@@ -2,6 +2,7 @@ pub mod actions;
 pub mod chrome;
 pub mod dock;
 pub mod dropdown;
+pub mod ink;
 pub mod menu;
 pub mod panels;
 pub mod root;

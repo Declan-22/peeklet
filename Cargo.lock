@@ -3780,10 +3780,12 @@ dependencies = [
  "gpui",
  "gpui_platform",
  "image",
+ "lyon",
  "rfd",
  "ropey",
  "rusqlite",
  "syntect",
+ "tiny-skia",
 ]
 
 [[package]]

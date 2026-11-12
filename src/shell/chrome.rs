@@ -6,12 +6,14 @@ use gpui::{
     prelude::*, px, rgba, svg,
 };
 
-use super::panels::{ICON_INFO, ICON_PDF, PanelKind};
+use super::dropdown::{ENTRY_HEIGHT, PANEL_PADDING_X, PANEL_PADDING_Y};
+use super::panels::{ICON_PDF, PanelKind};
 use super::root::{RootView, Tab};
 use crate::theme::WEIGHT_MEDIUM;
 
 pub const TOP_BAR_HEIGHT: f32 = 36.0;
 pub const BOTTOM_BAR_HEIGHT: f32 = 30.0;
+pub const TOOLBAR_HEIGHT: f32 = 34.0;
 const TOP_BAR_BUTTON_SIZE: f32 = 24.0;
 const TOP_BAR_SMALL_BUTTON_SIZE: f32 = 22.0;
 const TOP_BAR_ICON_SIZE: f32 = 20.0;
@@ -1022,6 +1024,260 @@ impl gpui::RenderOnce for TabBar {
     }
 }
 
+// ---------- Toolbar (per-file-kind tools) ----------
+
+const TOOLBAR_ICON_CURSOR: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
+	<path d="M0 0h24v24H0z" fill="none" />
+	<path fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.5" d="m9.803 4.63l6.033 2.36c3.48 1.362 5.22 2.043 5.163 3.123c-.058 1.08-1.874 1.576-5.506 2.566c-1.081.295-1.622.442-1.997.817s-.522.916-.817 1.997c-.99 3.632-1.486 5.448-2.566 5.506s-1.76-1.683-3.122-5.163L4.63 9.803C3.204 6.159 2.49 4.338 3.414 3.414c.924-.923 2.745-.21 6.389 1.216Z" />
+</svg>"#;
+
+const TOOLBAR_ICON_PEN: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
+	<path d="M0 0h24v24H0z" fill="none" />
+	<g fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.5">
+		<path stroke-linejoin="round" d="M16.422 7c.26-1.182 1.09-3.196.118-4.268C15.877 2 14.629 2 12.134 2h-.268c-2.495 0-3.742 0-4.406.732c-.972 1.072-.143 3.086.12 4.268m10.427 7.653l-4.22 5.705C12.977 21.453 12.573 22 12 22s-.977-.547-1.787-1.642l-4.22-5.705c-.676-.915-1.015-1.373-.992-1.86s.475-.998 1.379-2.02C7.25 9.79 7.579 8.77 7.579 7h8.843c0 1.769.327 2.789 1.198 3.773c.904 1.022 1.356 1.532 1.379 2.02c.023.487-.316.945-.992 1.86" />
+		<path d="M13.5 14c-.441.318-.954.5-1.5.5m0 0a2.55 2.55 0 0 1-1.5-.5m1.5.5V22" />
+	</g>
+</svg>"#;
+
+const TOOLBAR_ICON_HIGHLIGHTER: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
+	<path d="M0 0h24v24H0z" fill="none" />
+	<path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="m6.678 16.207l2.115 2.115m-2.115-2.115L2.5 20.5h4l2.293-2.178m-2.115-2.115c-.39-.39-.383-1.02-.043-1.455c.792-1.014 1.08-1.93 1.164-2.614c.093-.752.275-1.565.81-2.1l.892-.89m-.708 9.174c.39.39 1.02.383 1.455.043c1.014-.792 1.93-1.08 2.614-1.164c.752-.093 1.565-.275 2.1-.81l.89-.892m0 0l-6.35-6.35m6.35 6.35a1 1 0 0 0 1.414 0l4.234-4.234M9.501 9.148a1 1 0 0 1 0-1.414L13.735 3.5" />
+</svg>"#;
+
+const TOOLBAR_ICON_ERASER: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
+	<path d="M0 0h24v24H0z" fill="none" />
+	<path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="m8.738 7.78l-3.891 3.977c-1.17 1.196-1.755 1.794-1.834 2.523q-.025.232 0 .464c.08.73.664 1.327 1.834 2.523l.149.152c.624.639.937.958 1.31 1.172q.328.188.689.291c.413.118.856.118 1.743.118c.886 0 1.33 0 1.743-.118q.361-.104.688-.29c.374-.215.686-.534 1.31-1.173l2.845-2.907M8.738 7.78l3.582-3.657C13.706 2.708 14.4 2 15.263 2s1.556.708 2.941 2.125l.743.76C20.316 6.283 21 6.983 21 7.85s-.685 1.566-2.054 2.964l-3.622 3.698M8.738 7.78l6.586 6.732M10 22h11" />
+</svg>"#;
+
+const TOOLBAR_ICON_SHAPES: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 16 16">
+	<path d="M0 0h16v16H0z" fill="none" />
+	<path fill="currentColor" d="M5.5 2A3.5 3.5 0 0 0 5 8.965v1.008A4.5 4.5 0 1 1 9.973 5H8.965A3.5 3.5 0 0 0 5.5 2m3 4A2.5 2.5 0 0 0 6 8.5v4A2.5 2.5 0 0 0 8.5 15h4a2.5 2.5 0 0 0 2.5-2.5v-4A2.5 2.5 0 0 0 12.5 6zM7 8.5A1.5 1.5 0 0 1 8.5 7h4A1.5 1.5 0 0 1 14 8.5v4a1.5 1.5 0 0 1-1.5 1.5h-4A1.5 1.5 0 0 1 7 12.5z" />
+</svg>"#;
+
+const TOOLBAR_ICON_CROP: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
+	<path d="M0 0h24v24H0z" fill="none" />
+	<g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2">
+		<path d="M6 2v14a2 2 0 0 0 2 2h14" />
+		<path d="M18 22V8a2 2 0 0 0-2-2H2" />
+	</g>
+</svg>"#;
+
+const TOOLBAR_ICON_RECT: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
+	<path d="M0 0h24v24H0z" fill="none" />
+	<path fill="none" stroke="currentColor" stroke-width="1.5" d="M2.5 12c0-4.478 0-6.718 1.391-8.109S7.521 2.5 12 2.5c4.478 0 6.718 0 8.109 1.391S21.5 7.521 21.5 12c0 4.478 0 6.718-1.391 8.109S16.479 21.5 12 21.5c-4.478 0-6.718 0-8.109-1.391S2.5 16.479 2.5 12Z" />
+</svg>"#;
+
+const TOOLBAR_ICON_CIRCLE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
+	<path d="M0 0h24v24H0z" fill="none" />
+	<circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.5" />
+</svg>"#;
+
+const TOOLBAR_ICON_LINE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
+	<path d="M0 0h24v24H0z" fill="none" />
+	<path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M3 20L21 4" />
+</svg>"#;
+
+const TOOLBAR_ICON_ARROW: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
+	<path d="M0 0h24v24H0z" fill="none" />
+	<g fill="none">
+		<path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M18.578 12c.019-1.313.922-5.664 0-6.586s-5.272-.019-6.586 0" />
+		<path fill="currentColor" d="M4.462 18.47a.75.75 0 1 0 1.06 1.06l-.53-.53zm14.06-11.94a.75.75 0 0 0-1.06-1.06l.53.53zM4.993 19l.53.53l13-13l-.53-.53l-.53-.53l-13 13z" />
+	</g>
+</svg>"#;
+
+#[derive(IntoElement)]
+pub struct Toolbar {
+    pub root: WeakEntity<RootView>,
+}
+
+impl gpui::RenderOnce for Toolbar {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl gpui::IntoElement {
+        let t = *crate::theme::active(cx);
+        let root_upgrade = self.root.upgrade();
+        let is_image = root_upgrade.as_ref().map(|r| r.read(cx).active_is_image()).unwrap_or(false);
+        let active_tool = root_upgrade.as_ref().map(|r| r.read(cx).image_toolbar_tool).unwrap_or(0);
+        let shapes_open = root_upgrade.as_ref().map(|r| r.read(cx).image_shapes_dropdown_open).unwrap_or(false);
+        let left_occ = root_upgrade.as_ref().map(|r| r.read(cx).left_occupancy()).unwrap_or(0.0);
+        let right_occ = root_upgrade.as_ref().map(|r| r.read(cx).right_occupancy()).unwrap_or(0.0);
+        let content_w = (window.viewport_size().width.as_f32() - left_occ - right_occ).max(0.0);
+
+        let root = self.root.clone();
+        let tool_button = |root: WeakEntity<RootView>, index: usize, icon: &'static [u8], tooltip: &'static str, active: bool| {
+            let is_active = active_tool == index;
+            div()
+                .id(format!("toolbar-tool-{}", index))
+                .w(px(28.))
+                .h(px(28.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(8.))
+                .cursor_pointer()
+                .border_1()
+                .border_color(rgba(if is_active { t.border_color } else { 0x00000000 }))
+                .bg(rgba(if is_active { t.bg_darker } else { t.bg_primary }))
+                .hover(|s| s.bg(rgba(t.bg_darker)))
+                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                    let _ = root.update(cx, |root, cx| {
+                        root.image_toolbar_tool = index;
+                        root.image_shapes_dropdown_open = false;
+                        cx.notify();
+                    });
+                    cx.stop_propagation();
+                })
+                .child(
+                    svg()
+                        .data(icon)
+                        .w(px(19.))
+                        .h(px(19.))
+                        .text_color(rgba(if is_active { t.text_primary } else { t.text_secondary })),
+                )
+        };
+
+        let mut bar = div()
+            .id("toolbar")
+            .ml(px(left_occ))
+            .w(px(content_w))
+            .h(px(TOOLBAR_HEIGHT))
+            .flex_shrink_0()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_center()
+            .gap(px(4.))
+            .px(px(8.))
+            .bg(rgba(t.bg_primary))
+            .border_b_1()
+            .border_color(rgba(t.chrome_border_color));
+
+        if is_image {
+            // Cursor (0)
+            bar = bar.child(tool_button(root.clone(), 0, TOOLBAR_ICON_CURSOR, "Cursor", active_tool == 0));
+            // Pen (1)
+            bar = bar.child(tool_button(root.clone(), 1, TOOLBAR_ICON_PEN, "Pen", active_tool == 1));
+            // Highlighter (2)
+            bar = bar.child(tool_button(root.clone(), 2, TOOLBAR_ICON_HIGHLIGHTER, "Highlighter", active_tool == 2));
+            // Eraser (3)
+            bar = bar.child(tool_button(root.clone(), 3, TOOLBAR_ICON_ERASER, "Eraser", active_tool == 3));
+            // Shapes (4) with dropdown
+            {
+                let root_for_shape = root.clone();
+                let shapes_active = active_tool == 4;
+                let shape_btn = div()
+                    .id("toolbar-tool-shapes")
+                    .w(px(28.))
+                    .h(px(28.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(8.))
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(rgba(if shapes_active { t.border_color } else { 0x00000000 }))
+                    .bg(rgba(if shapes_active { t.bg_darker } else { t.bg_primary }))
+                    .hover(|s| s.bg(rgba(t.bg_darker)))
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        let _ = root_for_shape.update(cx, |root, cx| {
+                            root.image_toolbar_tool = 4;
+                            root.image_shapes_dropdown_open = !root.image_shapes_dropdown_open;
+                            cx.notify();
+                        });
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        svg()
+                            .data(TOOLBAR_ICON_SHAPES)
+                            .w(px(19.))
+                            .h(px(19.))
+                            .text_color(rgba(if shapes_active { t.text_primary } else { t.text_secondary })),
+                    );
+                let mut shapes_wrap = div().relative().child(shape_btn);
+                if shapes_open {
+                    let root_for_opt = root.clone();
+                    let selected_shape = root_upgrade.as_ref().map(|r| r.read(cx).image_shapes_selected).unwrap_or(0);
+                    let opt_button = |root: WeakEntity<RootView>, index: usize, icon: &'static [u8], label: &'static str, selected: usize| {
+                        let is_active = selected == index;
+                        div()
+                            .id(format!("shape-opt-{}", label))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .h(px(ENTRY_HEIGHT))
+                            .pl(px(6.))
+                            .pr(px(4.))
+                            .rounded(px(8.))
+                            .text_sm()
+                            .font_weight(WEIGHT_MEDIUM)
+                            .text_color(rgba(t.text_primary))
+                            .cursor_pointer()
+                            .bg(rgba(if is_active { t.bg_tertiary } else { t.bg_primary }))
+                            .hover(|s| s.bg(rgba(t.menu_hover_bg)))
+                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                let _ = root.update(cx, |root, cx| {
+                                    root.image_shapes_selected = index;
+                                    root.image_shapes_dropdown_open = false;
+                                    cx.notify();
+                                });
+                                cx.stop_propagation();
+                            })
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .child(svg().data(icon).w(px(14.)).h(px(14.)).text_color(rgba(t.text_primary)))
+                                    .child(label),
+                            )
+                    };
+                    shapes_wrap = shapes_wrap.child(
+                        deferred(
+                            div()
+                                .absolute()
+                                .top(px(32.))
+                                .left(px(0.))
+                                .w(px(160.))
+                                .occlude()
+                                .flex()
+                                .flex_col()
+                                .px(px(PANEL_PADDING_X))
+                                .py(px(PANEL_PADDING_Y))
+                                .gap(px(2.0))
+                                .bg(rgba(t.bg_primary))
+                                .border_1()
+                                .border_color(rgba(t.menu_border_color))
+                                .rounded(px(10.))
+                                .shadow(vec![t.shadow_lg()])
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(opt_button(root_for_opt.clone(), 0, TOOLBAR_ICON_RECT, "Rectangle", selected_shape))
+                                .child(opt_button(root_for_opt.clone(), 1, TOOLBAR_ICON_CIRCLE, "Circle", selected_shape))
+                                .child(opt_button(root_for_opt.clone(), 2, TOOLBAR_ICON_LINE, "Line", selected_shape))
+                                .child(opt_button(root_for_opt.clone(), 3, TOOLBAR_ICON_ARROW, "Arrow", selected_shape)),
+                        )
+                        .with_priority(1000),
+                    );
+                }
+                bar = bar.child(shapes_wrap);
+            }
+            // divider (matches bottom bar dividers)
+            bar = bar.child(
+                div()
+                    .w(px(2.))
+                    .h(px(16.))
+                    .mx(px(6.))
+                    .bg(rgba(t.chrome_border_color)),
+            );
+            // Crop (5)
+            bar = bar.child(tool_button(root.clone(), 5, TOOLBAR_ICON_CROP, "Crop", active_tool == 5));
+        }
+
+        // (shapes dropdown is now anchored to the shapes button above)
+
+        bar.into_any_element()
+    }
+}
+
 // ---------- Bottom bar ----------
 
 #[derive(IntoElement)]
@@ -1032,10 +1288,6 @@ pub struct BottomBar {
 impl gpui::RenderOnce for BottomBar {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl gpui::IntoElement {
         let t = *crate::theme::active(cx);
-        let info_active = self
-            .root
-            .upgrade()
-            .is_some_and(|root| root.read(cx).panel_visible(PanelKind::Info));
         let root = self.root.clone();
 
         div()
@@ -1052,49 +1304,29 @@ impl gpui::RenderOnce for BottomBar {
             .children(self.root.upgrade().and_then(|root| {
                 let left_occ = root.read(cx).left_occupancy();
                 let status = root.read(cx).bottom_status();
-                status.map(|(cursor, chars, file_type, size)| {
-                    div()
+                status.map(|items| {
+                    let mut row = div()
                         .ml(px(left_occ))
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap(px(4.))
-                        .child(div().text_xs().font_weight(WEIGHT_MEDIUM).text_color(rgba(t.empty_text_primary)).child(cursor))
-                        .child(tab_divider(t.chrome_border_color))
-                        .child(div().text_xs().font_weight(WEIGHT_MEDIUM).text_color(rgba(t.empty_text_primary)).child(format!("{} chars", chars)))
-                        .child(tab_divider(t.chrome_border_color))
-                        .child(div().text_xs().font_weight(WEIGHT_MEDIUM).text_color(rgba(t.empty_text_primary)).child(file_type))
-                        .child(tab_divider(t.chrome_border_color))
-                        .child(div().text_xs().font_weight(WEIGHT_MEDIUM).text_color(rgba(t.empty_text_primary)).child(size))
+                        .gap(px(4.));
+                    for (i, item) in items.iter().enumerate() {
+                        if i > 0 {
+                            row = row.child(tab_divider(t.chrome_border_color));
+                        }
+                        row = row.child(
+                            div()
+                                .text_xs()
+                                .font_weight(WEIGHT_MEDIUM)
+                                .text_color(rgba(t.empty_text_primary))
+                                .child(item.clone()),
+                        );
+                    }
+                    row
                 })
             }).into_iter())
             .child(div().flex_1())
-            .child(
-                div()
-                    .id("bottom-info-toggle")
-                    .w(px(24.))
-                    .h(px(24.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(5.))
-                    .cursor_pointer()
-                    .when(info_active, |button| button.bg(rgba(t.bg_tertiary)))
-                    .hover(|button| button.bg(rgba(t.bg_tertiary)))
-                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                        let _ = root.update(cx, |root, cx| {
-                            root.toggle_panel(PanelKind::Info, cx);
-                        });
-                        cx.stop_propagation();
-                    })
-                    .child(
-                        svg()
-                            .data(ICON_INFO)
-                            .w(px(15.))
-                            .h(px(15.))
-                            .text_color(rgba(t.text_secondary)),
-                    ),
-            )
     }
 }
 
