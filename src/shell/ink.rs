@@ -12,6 +12,7 @@
 
 use gpui::{Path, PathBuilder, PathStyle, Pixels, point, px};
 use lyon::tessellation::{FillOptions, FillRule};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const TOOL_PEN: u8 = 1;
 pub const TOOL_HIGHLIGHTER: u8 = 2;
@@ -24,9 +25,14 @@ pub const HIGHLIGHTER_SCREEN_WIDTH: f32 = 14.0;
 /// Eraser radius on screen, in pixels, at the fit-to-window zoom level.
 pub const ERASER_SCREEN_RADIUS: f32 = 14.0;
 
+/// Gives every stroke a unique id, so history entries can find their stroke
+/// again even after the list has been reordered.
+static NEXT_STROKE_ID: AtomicU64 = AtomicU64::new(1);
+
 /// A single annotation stroke, in the source image's pixel space.
 #[derive(Clone, Debug)]
 pub struct InkStroke {
+    pub id: u64,
     pub tool: u8,
     /// Stroke width in source image pixels.
     pub width: f32,
@@ -36,7 +42,107 @@ pub struct InkStroke {
 
 impl InkStroke {
     pub fn new(tool: u8, width: f32, points: Vec<(f32, f32)>) -> Self {
-        Self { tool, width, points }
+        Self {
+            id: NEXT_STROKE_ID.fetch_add(1, Ordering::Relaxed),
+            tool,
+            width,
+            points,
+        }
+    }
+}
+
+/// One change to an image's annotations.
+#[derive(Clone, Debug)]
+enum InkEdit {
+    /// A stroke was drawn at `index` in the stroke list.
+    Added { index: usize, stroke: InkStroke },
+    /// The eraser took these strokes away.
+    Removed(Vec<InkStroke>),
+}
+
+/// Undo/redo history for one image's annotations.
+#[derive(Clone, Debug)]
+pub struct InkHistory {
+    edits: Vec<InkEdit>,
+    /// How many edits are currently applied.
+    cursor: usize,
+    /// The cursor position that matches the file on disk.
+    saved_cursor: Option<usize>,
+}
+
+impl Default for InkHistory {
+    fn default() -> Self {
+        Self {
+            edits: Vec::new(),
+            cursor: 0,
+            saved_cursor: Some(0),
+        }
+    }
+}
+
+impl InkHistory {
+    /// Record a stroke that was drawn.
+    pub fn push_added(&mut self, index: usize, stroke: InkStroke) {
+        self.edits.truncate(self.cursor);
+        self.edits.push(InkEdit::Added { index, stroke });
+        self.cursor = self.edits.len();
+    }
+
+    /// Record strokes that the eraser removed.
+    pub fn push_removed(&mut self, strokes: Vec<InkStroke>) {
+        if strokes.is_empty() {
+            return;
+        }
+        self.edits.truncate(self.cursor);
+        self.edits.push(InkEdit::Removed(strokes));
+        self.cursor = self.edits.len();
+    }
+
+    /// Step back one edit, applying it to `strokes`.
+    pub fn undo(&mut self, strokes: &mut Vec<InkStroke>) -> bool {
+        if self.cursor == 0 {
+            return false;
+        }
+        self.cursor -= 1;
+        match &self.edits[self.cursor] {
+            InkEdit::Added { index, stroke } => {
+                if let Some(pos) = strokes.iter().position(|s| s.id == stroke.id) {
+                    strokes.remove(pos);
+                } else if *index < strokes.len() {
+                    strokes.remove(*index);
+                }
+            }
+            InkEdit::Removed(removed) => {
+                for stroke in removed {
+                    strokes.push(stroke.clone());
+                }
+            }
+        }
+        true
+    }
+
+    /// Step forward one edit, applying it to `strokes`.
+    pub fn redo(&mut self, strokes: &mut Vec<InkStroke>) -> bool {
+        if self.cursor >= self.edits.len() {
+            return false;
+        }
+        match &self.edits[self.cursor] {
+            InkEdit::Added { index, stroke } => {
+                let at = (*index).min(strokes.len());
+                strokes.insert(at, stroke.clone());
+            }
+            InkEdit::Removed(removed) => {
+                let ids: Vec<u64> = removed.iter().map(|s| s.id).collect();
+                strokes.retain(|s| !ids.contains(&s.id));
+            }
+        }
+        self.cursor += 1;
+        true
+    }
+
+    /// Whether the annotations differ from what is on disk.
+    pub fn is_dirty(&self) -> bool {
+        self.saved_cursor != Some(self.cursor)
     }
 }
 
@@ -404,8 +510,20 @@ fn signed_area(points: &[(f32, f32)]) -> f32 {
 ///
 /// The eraser takes whole strokes away rather than nibbling at them: a
 /// stroke is removed as soon as the eraser reaches any part of it.
-pub fn erase(strokes: &mut Vec<InkStroke>, x: f32, y: f32, radius: f32) {
-    strokes.retain(|stroke| !stroke_touches(stroke, x, y, radius + stroke.width * 0.5));
+///
+/// Returns the strokes that were removed.
+pub fn erase(strokes: &mut Vec<InkStroke>, x: f32, y: f32, radius: f32) -> Vec<InkStroke> {
+    let mut removed = Vec::new();
+    let mut kept = Vec::with_capacity(strokes.len());
+    for stroke in strokes.drain(..) {
+        if stroke_touches(&stroke, x, y, radius + stroke.width * 0.5) {
+            removed.push(stroke);
+        } else {
+            kept.push(stroke);
+        }
+    }
+    *strokes = kept;
+    removed
 }
 
 /// Whether the eraser at `(x, y)` reaches any part of the stroke.

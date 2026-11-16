@@ -8,7 +8,7 @@ use std::io::Cursor;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use image::ImageDecoder;
+use image::{ImageDecoder, ImageEncoder};
 use chrono::Datelike;
 use std::time::{Duration, Instant};
 
@@ -23,7 +23,7 @@ use gpui::{
 use super::chrome::{BOTTOM_BAR_HEIGHT, BottomBar, SidebarBottomBar, TOOLBAR_HEIGHT, Toolbar, TOP_BAR_HEIGHT, TopBar};
 use super::dock::{DOCK_DEFAULT_WIDTH, DockView};
 use super::dropdown::AppMenu;
-use super::ink::{self, InkStroke};
+use super::ink::{self, InkHistory, InkStroke};
 use super::panels::{DockSide, PanelKind};
 use crate::editor::EditorState;
 use crate::persist::{Store, TabRecord};
@@ -171,6 +171,13 @@ fn load_image_asset(path: &str) -> Option<LoadedImage> {
     let source_format = reader.format()?;
     let mut decoder = reader.into_decoder().ok()?;
     let (width, height) = decoder.dimensions();
+    // The preview shows the picture upright, so the layout has to use the
+    // dimensions the viewer will actually have.
+    let orientation = decoder.orientation().ok();
+    let (width, height) = match orientation {
+        Some(o) if orientation_swaps_axes(o) => (height, width),
+        _ => (width, height),
+    };
     let gpui_format = match source_format {
         image::ImageFormat::Png => gpui::ImageFormat::Png,
         image::ImageFormat::Jpeg => gpui::ImageFormat::Jpeg,
@@ -495,6 +502,11 @@ pub struct RootView {
     image_drag: Option<(MouseButton, f32, f32, f32, f32)>,
     /// Annotation strokes per image path, in source-image pixel space.
     image_strokes: HashMap<String, Vec<InkStroke>>,
+    /// Undo/redo history for the annotations of each image.
+    image_history: HashMap<String, InkHistory>,
+    /// Strokes removed by the eraser during the current drag, so the whole
+    /// drag counts as one undo step.
+    image_erased: Vec<InkStroke>,
     /// The stroke currently being drawn, if any.
     image_current_stroke: Option<InkStroke>,
     /// True while the mouse button is held down on the canvas.
@@ -504,6 +516,8 @@ pub struct RootView {
     image_fit: f32,
     /// Path of the image that is currently being annotated.
     image_ink_path: String,
+    /// A transient message shown in the status bar.
+    status_message: Option<(String, Instant)>,
     /// Currently selected image-toolbar tool (0 = cursor, ...).
     pub image_toolbar_tool: usize,
     /// Whether the shapes dropdown is open.
@@ -648,10 +662,13 @@ impl RootView {
             image_zoom_tween_active: false,
             image_drag: None,
             image_strokes: HashMap::new(),
+            image_history: HashMap::new(),
+            image_erased: Vec::new(),
             image_current_stroke: None,
             image_drawing: false,
             image_fit: 1.0,
             image_ink_path: String::new(),
+            status_message: None,
             image_toolbar_tool: 0,
             image_shapes_dropdown_open: false,
             image_shapes_selected: 0,
@@ -794,16 +811,25 @@ impl RootView {
 
     fn close_tab_force(&mut self, id: usize, cx: &mut Context<Self>) {
         // Persist unsaved buffer before discarding, so reopen can restore.
-        if let Some(tab) = self.tabs.iter().find(|t| t.id == id) {
-            if let Some(path) = &tab.path {
-                if self.dirty_tabs.contains(&id) {
-                    if let Some(ed) = self.editors.get(&id) {
-                        self.store.set(&format!("buffer:{}", path), &ed.text_string());
-                        self.store.set(&format!("dirty:{}", path), "1");
-                    }
-                } else {
-                    self.store.set(&format!("dirty:{}", path), "0");
+        let closed_path = self
+            .tabs
+            .iter()
+            .find(|t| t.id == id)
+            .and_then(|t| t.path.clone());
+        if let Some(path) = closed_path.as_deref() {
+            if viewer_kind(Some(path)) == ViewerKind::Image {
+                // Image annotations cannot be restored later, so closing the
+                // tab throws them away instead of persisting a stale buffer.
+                self.image_strokes.remove(path);
+                self.image_history.remove(path);
+                self.store.set(&format!("dirty:{}", path), "0");
+            } else if self.dirty_tabs.contains(&id) {
+                if let Some(ed) = self.editors.get(&id) {
+                    self.store.set(&format!("buffer:{}", path), &ed.text_string());
+                    self.store.set(&format!("dirty:{}", path), "1");
                 }
+            } else {
+                self.store.set(&format!("dirty:{}", path), "0");
             }
         }
         self.dirty_tabs.remove(&id);
@@ -1181,6 +1207,10 @@ impl RootView {
     }
 
     pub fn undo(&mut self, cx: &mut Context<Self>) {
+        if self.undo_annotations() {
+            cx.notify();
+            return;
+        }
         if let Some(ed) = self.active_editor_mut() {
             ed.undo();
         }
@@ -1189,11 +1219,74 @@ impl RootView {
     }
 
     pub fn redo(&mut self, cx: &mut Context<Self>) {
+        if self.redo_annotations() {
+            cx.notify();
+            return;
+        }
         if let Some(ed) = self.active_editor_mut() {
             ed.redo();
         }
         self.editor_version = self.editor_version.wrapping_add(1);
         cx.notify();
+    }
+
+    /// Step back through the active image's annotation history.
+    fn undo_annotations(&mut self) -> bool {
+        let Some(path) = self.active_image_path() else {
+            return false;
+        };
+        let mut strokes = self.image_strokes.get(&path).cloned().unwrap_or_default();
+        let Some(history) = self.image_history.get_mut(&path) else {
+            return false;
+        };
+        if !history.undo(&mut strokes) {
+            return false;
+        }
+        self.image_strokes.insert(path.clone(), strokes);
+        self.sync_image_dirty(&path);
+        true
+    }
+
+    /// Step forward through the active image's annotation history.
+    fn redo_annotations(&mut self) -> bool {
+        let Some(path) = self.active_image_path() else {
+            return false;
+        };
+        let mut strokes = self.image_strokes.get(&path).cloned().unwrap_or_default();
+        let Some(history) = self.image_history.get_mut(&path) else {
+            return false;
+        };
+        if !history.redo(&mut strokes) {
+            return false;
+        }
+        self.image_strokes.insert(path.clone(), strokes);
+        self.sync_image_dirty(&path);
+        true
+    }
+
+    /// The path of the image in the active tab, if there is one.
+    fn active_image_path(&self) -> Option<String> {
+        let tab = self.tabs.get(self.active_tab)?;
+        let path = tab.path.clone()?;
+        (viewer_kind(Some(&path)) == ViewerKind::Image).then_some(path)
+    }
+
+    /// Update the dirty mark of an image's tab from its history.
+    fn sync_image_dirty(&mut self, path: &str) {
+        let dirty = self
+            .image_history
+            .get(path)
+            .map(|h| h.is_dirty())
+            .unwrap_or(false);
+        let Some(tab) = self.tabs.iter().find(|t| t.path.as_deref() == Some(path)) else {
+            return;
+        };
+        let id = tab.id;
+        if dirty {
+            self.dirty_tabs.insert(id);
+        } else {
+            self.dirty_tabs.remove(&id);
+        }
     }
 
     // ----- hamburger menu state -----
@@ -1531,9 +1624,16 @@ impl RootView {
 
     /// Remove strokes (or parts of them) near the given image-space point.
     pub fn erase_image_strokes(&mut self, path: &str, point: (f32, f32), radius: f32) {
-        if let Some(strokes) = self.image_strokes.get_mut(path) {
-            ink::erase(strokes, point.0, point.1, radius);
+        let removed = match self.image_strokes.get_mut(path) {
+            Some(strokes) => ink::erase(strokes, point.0, point.1, radius),
+            None => Vec::new(),
+        };
+        if removed.is_empty() {
+            return;
         }
+        // The whole drag is one undo step, so hold on to what it removed.
+        self.image_erased.extend(removed);
+        self.mark_path_dirty(path);
     }
 
     /// Start an annotation stroke (or an eraser pass) at an image-space point.
@@ -1546,6 +1646,9 @@ impl RootView {
         hl_width: f32,
         eraser_radius: f32,
     ) {
+        // A previous drag that never got its mouse-up still has to be
+        // recorded, otherwise its change would be lost from the history.
+        self.flush_erased(path);
         let tool = self.image_toolbar_tool as u8;
         match tool {
             ink::TOOL_PEN | ink::TOOL_HIGHLIGHTER => {
@@ -1600,13 +1703,43 @@ impl RootView {
     /// Finish the stroke in progress and store it.
     pub fn end_ink_stroke(&mut self) {
         self.image_drawing = false;
+        let path = std::mem::take(&mut self.image_ink_path);
         if let Some(stroke) = self.image_current_stroke.take() {
             if stroke.points.len() >= 2 {
-                let path = std::mem::take(&mut self.image_ink_path);
-                self.image_strokes.entry(path).or_default().push(stroke);
+                let strokes = self.image_strokes.entry(path.clone()).or_default();
+                let index = strokes.len();
+                strokes.push(stroke.clone());
+                self.image_history
+                    .entry(path.clone())
+                    .or_default()
+                    .push_added(index, stroke);
+                // Annotations are unsaved work, so the tab gets a dirty mark.
+                self.mark_path_dirty(&path);
             }
         }
-        self.image_ink_path.clear();
+        // The eraser collects what it removed over the whole drag; that is
+        // one undo step.
+        self.flush_erased(&path);
+    }
+
+    /// Record the strokes the eraser removed during the current drag.
+    fn flush_erased(&mut self, path: &str) {
+        if self.image_erased.is_empty() {
+            return;
+        }
+        let removed = std::mem::take(&mut self.image_erased);
+        self.image_history
+            .entry(path.to_string())
+            .or_default()
+            .push_removed(removed);
+    }
+
+    /// Mark the tab that shows the file at `path` as having unsaved changes.
+    fn mark_path_dirty(&mut self, path: &str) {
+        if let Some(tab) = self.tabs.iter().find(|t| t.path.as_deref() == Some(path)) {
+            let id = tab.id;
+            self.dirty_tabs.insert(id);
+        }
     }
 
     pub(crate) fn pdf_page_assets(&self) -> Vec<(Arc<gpui::Image>, u32, u32)> {
@@ -1730,7 +1863,17 @@ impl RootView {
         let _ = (path, tab_id);
     }
 
+    /// Show a transient message in the status bar.
+    pub fn set_status_message(&mut self, message: impl Into<String>) {
+        self.status_message = Some((message.into(), Instant::now()));
+    }
+
     pub fn bottom_status(&self) -> Option<Vec<String>> {
+        if let Some((message, at)) = &self.status_message {
+            if at.elapsed() < Duration::from_secs(8) {
+                return Some(vec![message.clone()]);
+            }
+        }
         let tab = self.tabs.get(self.active_tab)?;
         if tab.title == "Welcome" {
             return None;
@@ -1801,6 +1944,9 @@ impl RootView {
     /// Strokes are stored in the source image's pixel space, so they are
     /// rasterized at the image's own resolution. A stroke that reaches
     /// outside the image grows the canvas instead of being clipped.
+    ///
+    /// The work runs on a background thread: decoding and re-encoding a large
+    /// photo takes a while and the window has to stay usable meanwhile.
     fn save_annotated_image(&mut self, path: &str, cx: &mut Context<Self>) {
         let Some(strokes) = self.image_strokes.get(path) else {
             return;
@@ -1808,122 +1954,42 @@ impl RootView {
         if strokes.is_empty() {
             return;
         }
-        let Ok(source) = image::open(path) else {
-            return;
-        };
-        let (img_w, img_h) = (source.width() as f32, source.height() as f32);
-
-        // How far the strokes reach outside the image.
-        let mut min_x = 0.0f32;
-        let mut min_y = 0.0f32;
-        let mut max_x = img_w;
-        let mut max_y = img_h;
-        for stroke in strokes {
-            let pad = stroke.width;
-            for p in &stroke.points {
-                min_x = min_x.min(p.0 - pad);
-                min_y = min_y.min(p.1 - pad);
-                max_x = max_x.max(p.0 + pad);
-                max_y = max_y.max(p.1 + pad);
-            }
-        }
-        let off_x = (-min_x).max(0.0).ceil() as i64;
-        let off_y = (-min_y).max(0.0).ceil() as i64;
-        let canvas_w = (max_x.ceil() as i64 + off_x).max(1) as u32;
-        let canvas_h = (max_y.ceil() as i64 + off_y).max(1) as u32;
-
-        let Some(mut canvas) = tiny_skia::Pixmap::new(canvas_w, canvas_h) else {
-            return;
-        };
-
-        // Draw the source image into the canvas.
-        let rgba = source.to_rgba8();
-        {
-            let pixels = canvas.pixels_mut();
-            for y in 0..rgba.height() {
-                for x in 0..rgba.width() {
-                    let px = rgba.get_pixel(x, y).0;
-                    let idx = ((y as i64 + off_y) * canvas_w as i64 + x as i64 + off_x) as usize;
-                    if idx < pixels.len() {
-                        if let Some(c) = tiny_skia::PremultipliedColorU8::from_rgba(
-                            px[0], px[1], px[2], px[3],
-                        ) {
-                            pixels[idx] = c;
-                        }
+        let strokes = strokes.clone();
+        let path = path.to_string();
+        let name = file_name_of(&path);
+        self.set_status_message(format!("Saving {name}..."));
+        cx.spawn(async move |this, cx| {
+            let job_path = path.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { bake_annotated_image(&job_path, &strokes) })
+                .await;
+            this.update(cx, |root, cx| {
+                match result {
+                    Ok(()) => {
+                        // The strokes are now part of the file, so drop them
+                        // and reload the image. Saving again would otherwise
+                        // bake them a second time.
+                        root.image_strokes.remove(&path);
+                        root.image_history.remove(&path);
+                        root.image_erased.clear();
+                        root.image_assets.remove(&path);
+                        root.image_loading.remove(&path);
+                        root.image_load_errors.remove(&path);
+                        root.start_image_load(&path, cx);
+                        root.set_status_message(format!("Saved {name}"));
                     }
+                    Err(message) => root.set_status_message(message),
                 }
-            }
-        }
-
-        // The pen is opaque, so it can be drawn straight onto the canvas.
-        for stroke in strokes.iter().filter(|s| s.tool == ink::TOOL_PEN) {
-            let Some(path) = stroke_path(stroke, off_x as f32, off_y as f32) else {
-                continue;
-            };
-            let mut paint = tiny_skia::Paint::default();
-            paint.anti_alias = true;
-            paint.set_color(tiny_skia::Color::from_rgba(0.0, 0.0, 0.0, 1.0).unwrap_or(tiny_skia::Color::BLACK));
-            let mut style = tiny_skia::Stroke::default();
-            style.width = stroke.width;
-            style.line_cap = tiny_skia::LineCap::Round;
-            style.line_join = tiny_skia::LineJoin::Round;
-            canvas.stroke_path(
-                &path,
-                &paint,
-                &style,
-                tiny_skia::Transform::identity(),
-                None,
-            );
-        }
-
-        // The highlighter is translucent, so the strokes are first merged into
-        // a coverage mask. Overlapping strokes then keep a single layer of
-        // colour instead of stacking their opacity.
-        let highlights: Vec<&InkStroke> = strokes
-            .iter()
-            .filter(|s| s.tool == ink::TOOL_HIGHLIGHTER)
-            .collect();
-        if !highlights.is_empty() {
-            if let Some(mask) = build_highlight_mask(&highlights, off_x as f32, off_y as f32, canvas_w, canvas_h)
-            {
-                let pixels = canvas.pixels_mut();
-                for (i, p) in pixels.iter_mut().enumerate() {
-                    let a = mask[i];
-                    if a == 0 {
-                        continue;
-                    }
-                    let alpha = a as f32 / 255.0 * 0.47;
-                    let r = p.red() as f32;
-                    let g = p.green() as f32;
-                    let b = p.blue() as f32;
-                    let nr = 255.0f32 * alpha + r * (1.0 - alpha);
-                    let ng = 235.0f32 * alpha + g * (1.0 - alpha);
-                    let nb = 40.0f32 * alpha + b * (1.0 - alpha);
-                    *p = tiny_skia::PremultipliedColorU8::from_rgba(
-                        nr.round() as u8,
-                        ng.round() as u8,
-                        nb.round() as u8,
-                        255,
-                    )
-                    .unwrap_or(*p);
-                }
-            }
-        }
-
-        let data = canvas.encode_png().unwrap_or_default();
-        if std::fs::write(path, data).is_err() {
-            return;
-        }
-
-        // The strokes are now part of the file, so drop them and reload the
-        // image. Saving again would otherwise bake them a second time.
-        self.image_strokes.remove(path);
-        self.image_assets.remove(path);
-        self.image_loading.remove(path);
-        self.image_load_errors.remove(path);
-        self.start_image_load(path, cx);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
+    /// Strokes are stored in the source image's pixel space, so they are
+    /// rasterized at the image's own resolution. A stroke that reaches
+    /// outside the image grows the canvas instead of being clipped.
     /// Save the active tab, asking for a path when it has none.
     /// Never shows a dialog itself: callers run the dialog with no entity
     /// borrow held (a pumping native modal re-enters the app and panics
@@ -3472,6 +3538,12 @@ impl Drop for RootView {
         for id in self.dirty_tabs.clone() {
             if let Some(tab) = self.tabs.iter().find(|t| t.id == id) {
                 if let Some(path) = &tab.path {
+                    // Only text buffers can be restored later; image
+                    // annotations are dropped with the session.
+                    if viewer_kind(Some(path)) == ViewerKind::Image {
+                        self.store.set(&format!("dirty:{}", path), "0");
+                        continue;
+                    }
                     if let Some(ed) = self.editors.get(&id) {
                         self.store.set(&format!("buffer:{}", path), &ed.text_string());
                         self.store.set(&format!("dirty:{}", path), "1");
@@ -3578,6 +3650,285 @@ fn build_highlight_mask(
         );
     }
     Some(mask.pixels().iter().map(|p| p.alpha()).collect())
+}
+
+/// The file name of a path, for messages.
+fn file_name_of(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
+}
+
+/// Whether an orientation swaps the width and the height.
+fn orientation_swaps_axes(orientation: image::metadata::Orientation) -> bool {
+    matches!(
+        orientation,
+        image::metadata::Orientation::Rotate90
+            | image::metadata::Orientation::Rotate270
+            | image::metadata::Orientation::Rotate90FlipH
+            | image::metadata::Orientation::Rotate270FlipH
+    )
+}
+
+/// Whether an image format can store an alpha channel.
+fn format_has_alpha(format: image::ImageFormat) -> bool {
+    !matches!(format, image::ImageFormat::Jpeg | image::ImageFormat::Pnm)
+}
+
+/// Rasterize the annotation strokes onto the image and write the result back.
+///
+/// The image is decoded with the orientation the preview shows, so the file
+/// that comes out looks the same as what the user was annotating, and it
+/// keeps the format it came in with.
+fn bake_annotated_image(path: &str, strokes: &[InkStroke]) -> Result<(), String> {
+    let name = file_name_of(path);
+
+    let mut reader = image::ImageReader::open(path)
+        .map_err(|e| format!("Could not read {name}: {e}"))?
+        .with_guessed_format()
+        .map_err(|e| format!("Could not read {name}: {e}"))?;
+    let format = reader.format().unwrap_or(image::ImageFormat::Png);
+    let mut decoder = reader
+        .into_decoder()
+        .map_err(|e| format!("Could not decode {name}: {e}"))?;
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut source = image::DynamicImage::from_decoder(decoder)
+        .map_err(|e| format!("Could not decode {name}: {e}"))?;
+    // The preview shows the picture upright, so the saved file has to be too.
+    source.apply_orientation(orientation);
+
+    let (img_w, img_h) = (source.width() as f32, source.height() as f32);
+
+    // How far the strokes reach outside the image.
+    let mut min_x = 0.0f32;
+    let mut min_y = 0.0f32;
+    let mut max_x = img_w;
+    let mut max_y = img_h;
+    for stroke in strokes {
+        let pad = stroke.width;
+        for p in &stroke.points {
+            min_x = min_x.min(p.0 - pad);
+            min_y = min_y.min(p.1 - pad);
+            max_x = max_x.max(p.0 + pad);
+            max_y = max_y.max(p.1 + pad);
+        }
+    }
+    let off_x = (-min_x).max(0.0).ceil() as i64;
+    let off_y = (-min_y).max(0.0).ceil() as i64;
+    let canvas_w = (max_x.ceil() as i64 + off_x).max(1) as u32;
+    let canvas_h = (max_y.ceil() as i64 + off_y).max(1) as u32;
+
+    let Some(mut canvas) = tiny_skia::Pixmap::new(canvas_w, canvas_h) else {
+        return Err(format!("Could not make room for the annotations in {name}"));
+    };
+    let has_alpha = format_has_alpha(format);
+    if !has_alpha {
+        // Without an alpha channel the area outside the picture would end up
+        // black, so start from opaque white instead.
+        canvas.fill(
+            tiny_skia::Color::from_rgba(1.0, 1.0, 1.0, 1.0).unwrap_or(tiny_skia::Color::WHITE),
+        );
+    }
+
+    // Draw the source image into the canvas. The rows are copied straight
+    // across, which keeps this quick even for a twelve megapixel photo.
+    {
+        let src_stride = source.width() as usize;
+        let data = canvas.data_mut();
+        let dst_stride = canvas_w as usize * 4;
+        match source.color() {
+            image::ColorType::Rgb8 => {
+                let src = source.as_bytes();
+                for y in 0..source.height() as usize {
+                    let row = &src[y * src_stride * 3..y * src_stride * 3 + src_stride * 3];
+                    let dst = (y as i64 + off_y) as usize * dst_stride + off_x as usize * 4;
+                    for x in 0..src_stride {
+                        let d = dst + x * 4;
+                        if d + 4 > data.len() {
+                            break;
+                        }
+                        data[d] = row[x * 3];
+                        data[d + 1] = row[x * 3 + 1];
+                        data[d + 2] = row[x * 3 + 2];
+                        data[d + 3] = 255;
+                    }
+                }
+            }
+            image::ColorType::Rgba8 => {
+                let src = source.as_bytes();
+                for y in 0..source.height() as usize {
+                    let row = &src[y * src_stride * 4..y * src_stride * 4 + src_stride * 4];
+                    let dst = (y as i64 + off_y) as usize * dst_stride + off_x as usize * 4;
+                    for x in 0..src_stride {
+                        let d = dst + x * 4;
+                        if d + 4 > data.len() {
+                            break;
+                        }
+                        let a = row[x * 4 + 3] as u16;
+                        // The canvas stores premultiplied colour.
+                        data[d] = ((row[x * 4] as u16 * a) / 255) as u8;
+                        data[d + 1] = ((row[x * 4 + 1] as u16 * a) / 255) as u8;
+                        data[d + 2] = ((row[x * 4 + 2] as u16 * a) / 255) as u8;
+                        data[d + 3] = a as u8;
+                    }
+                }
+            }
+            _ => {
+                let rgba = source.to_rgba8();
+                let src = rgba.as_raw();
+                let stride = rgba.width() as usize * 4;
+                for y in 0..rgba.height() as usize {
+                    let row = &src[y * stride..y * stride + stride];
+                    let dst = (y as i64 + off_y) as usize * dst_stride + off_x as usize * 4;
+                    for x in 0..rgba.width() as usize {
+                        let d = dst + x * 4;
+                        if d + 4 > data.len() {
+                            break;
+                        }
+                        let a = row[x * 4 + 3] as u16;
+                        data[d] = ((row[x * 4] as u16 * a) / 255) as u8;
+                        data[d + 1] = ((row[x * 4 + 1] as u16 * a) / 255) as u8;
+                        data[d + 2] = ((row[x * 4 + 2] as u16 * a) / 255) as u8;
+                        data[d + 3] = a as u8;
+                    }
+                }
+            }
+        }
+    }
+
+    // The pen is opaque, so it can be drawn straight onto the canvas.
+    for stroke in strokes.iter().filter(|s| s.tool == ink::TOOL_PEN) {
+        let Some(path) = stroke_path(stroke, off_x as f32, off_y as f32) else {
+            continue;
+        };
+        let mut paint = tiny_skia::Paint::default();
+        paint.anti_alias = true;
+        paint.set_color(
+            tiny_skia::Color::from_rgba(0.0, 0.0, 0.0, 1.0).unwrap_or(tiny_skia::Color::BLACK),
+        );
+        let mut style = tiny_skia::Stroke::default();
+        style.width = stroke.width;
+        style.line_cap = tiny_skia::LineCap::Round;
+        style.line_join = tiny_skia::LineJoin::Round;
+        canvas.stroke_path(
+            &path,
+            &paint,
+            &style,
+            tiny_skia::Transform::identity(),
+            None,
+        );
+    }
+
+    // The highlighter is translucent, so the strokes are first merged into a
+    // coverage mask. Overlapping strokes then keep a single layer of colour
+    // instead of stacking their opacity.
+    let highlights: Vec<&InkStroke> = strokes
+        .iter()
+        .filter(|s| s.tool == ink::TOOL_HIGHLIGHTER)
+        .collect();
+    if !highlights.is_empty() {
+        if let Some(mask) =
+            build_highlight_mask(&highlights, off_x as f32, off_y as f32, canvas_w, canvas_h)
+        {
+            let data = canvas.data_mut();
+            for (i, p) in data.chunks_exact_mut(4).enumerate() {
+                let a = mask[i];
+                if a == 0 {
+                    continue;
+                }
+                let alpha = a as f32 / 255.0 * 0.47;
+                let r = p[0] as f32;
+                let g = p[1] as f32;
+                let b = p[2] as f32;
+                let nr = 255.0f32 * alpha + r * (1.0 - alpha);
+                let ng = 235.0f32 * alpha + g * (1.0 - alpha);
+                let nb = 40.0f32 * alpha + b * (1.0 - alpha);
+                p[0] = nr.round() as u8;
+                p[1] = ng.round() as u8;
+                p[2] = nb.round() as u8;
+                p[3] = 255;
+            }
+        }
+    }
+
+    // Turn the canvas back into an image, undoing the premultiplication.
+    let mut bytes: Vec<u8> = Vec::with_capacity(canvas_w as usize * canvas_h as usize * 4);
+    {
+        let data = canvas.data();
+        let stride = canvas_w as usize * 4;
+        for row in data.chunks_exact(stride) {
+            let opaque = row.chunks_exact(4).all(|px| px[3] == 255);
+            if opaque {
+                // Premultiplied and straight colour are the same here.
+                bytes.extend_from_slice(row);
+            } else {
+                for px in row.chunks_exact(4) {
+                    let a = px[3];
+                    if a == 0 {
+                        bytes.extend_from_slice(&[0, 0, 0, 0]);
+                    } else {
+                        let un = |c: u8| (((c as u16 * 255) / a as u16).min(255)) as u8;
+                        bytes.extend_from_slice(&[un(px[0]), un(px[1]), un(px[2]), a]);
+                    }
+                }
+            }
+        }
+    }
+    let out = image::RgbaImage::from_raw(canvas_w, canvas_h, bytes)
+        .ok_or_else(|| format!("Could not build the picture data for {name}"))?;
+    let picture = image::DynamicImage::ImageRgba8(out);
+
+    // Write it back in the format it came in with. The encoders are tuned for
+    // speed: a twelve megapixel photo should not take ten seconds to write.
+    let mut encoded: Vec<u8> = Vec::new();
+    {
+        let mut writer = std::io::Cursor::new(&mut encoded);
+        match format {
+            image::ImageFormat::Png => {
+                let encoder = image::codecs::png::PngEncoder::new_with_quality(
+                    &mut writer,
+                    image::codecs::png::CompressionType::Fast,
+                    image::codecs::png::FilterType::Adaptive,
+                );
+                encoder
+                    .write_image(
+                        picture.as_bytes(),
+                        picture.width(),
+                        picture.height(),
+                        image::ExtendedColorType::Rgba8,
+                    )
+                    .map_err(|e| format!("Could not encode {name}: {e}"))?;
+            }
+            image::ImageFormat::Jpeg => {
+                // The JPEG encoder only takes grey or RGB, so drop the alpha
+                // channel. The canvas was filled with opaque white, so every
+                // pixel is opaque already.
+                let mut rgb: Vec<u8> = Vec::with_capacity(canvas_w as usize * canvas_h as usize * 3);
+                for px in canvas.data().chunks_exact(4) {
+                    rgb.extend_from_slice(&px[0..3]);
+                }
+                let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut writer, 85);
+                encoder
+                    .write_image(
+                        &rgb,
+                        canvas_w,
+                        canvas_h,
+                        image::ExtendedColorType::Rgb8,
+                    )
+                    .map_err(|e| format!("Could not encode {name}: {e}"))?;
+            }
+            _ => {
+                picture
+                    .write_to(&mut writer, format)
+                    .map_err(|e| format!("Could not encode {name}: {e}"))?;
+            }
+        }
+    }
+    std::fs::write(path, &encoded).map_err(|e| format!("Could not save {name}: {e}"))?;
+    Ok(())
 }
 
 /// Whether a polyline (in window coordinates) overlaps the given rectangle.
