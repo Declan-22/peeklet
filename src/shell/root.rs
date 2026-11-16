@@ -66,6 +66,16 @@ impl FileInfo {
     }
 }
 
+/// The colours offered for the pen and the highlighter.
+pub const INK_PALETTE: [u32; 16] = [
+    0xFFD200, 0xFFA000, 0xF4511E, 0xE53935, 0x8E24AA, 0x7B1FA2, 0xD81B60, 0xEC407A,
+    0x29B6F6, 0x1E88E5, 0x1565C0, 0x7CB342, 0x43A047, 0xFFFFFF, 0xE0E0E0, 0x212121,
+];
+
+/// Smallest and largest stroke size, in screen pixels at the fit zoom.
+pub const INK_SIZE_MIN: f32 = 1.0;
+pub const INK_SIZE_MAX: f32 = 40.0;
+
 pub(crate) const ACCEPTED_FILE_EXTENSIONS: &[&str] = &[
     "txt", "md", "markdown", "rs", "toml", "json", "yaml", "yml", "xml", "html", "css",
     "js", "ts", "jsx", "tsx", "py", "go", "java", "c", "h", "cpp", "hpp", "sql", "ini",
@@ -518,6 +528,24 @@ pub struct RootView {
     image_ink_path: String,
     /// A transient message shown in the status bar.
     status_message: Option<(String, Instant)>,
+    /// Colour of the pen strokes, as 0xRRGGBB.
+    pub ink_pen_color: u32,
+    /// Width of the pen strokes, in screen pixels at the fit zoom.
+    pub ink_pen_size: f32,
+    /// Colour of the highlighter strokes, as 0xRRGGBB.
+    pub ink_highlighter_color: u32,
+    /// Width of the highlighter strokes, in screen pixels at the fit zoom.
+    pub ink_highlighter_size: f32,
+    /// The ink tool whose settings popup is open, if any.
+    pub ink_popup: Option<u8>,
+    /// True while the size slider is being dragged.
+    pub ink_slider_dragging: bool,
+    /// The thickness the handle is currently showing, in pixels.
+    pub ink_handle: f32,
+    /// The thickness the handle is heading for.
+    pub ink_handle_target: f32,
+    /// True while the handle is sliding.
+    pub ink_handle_active: bool,
     /// Currently selected image-toolbar tool (0 = cursor, ...).
     pub image_toolbar_tool: usize,
     /// Whether the shapes dropdown is open.
@@ -669,6 +697,15 @@ impl RootView {
             image_fit: 1.0,
             image_ink_path: String::new(),
             status_message: None,
+            ink_pen_color: INK_PALETTE[15],
+            ink_pen_size: 4.0,
+            ink_highlighter_color: INK_PALETTE[0],
+            ink_highlighter_size: 20.0,
+            ink_popup: None,
+            ink_slider_dragging: false,
+            ink_handle: 4.0,
+            ink_handle_target: 4.0,
+            ink_handle_active: false,
             image_toolbar_tool: 0,
             image_shapes_dropdown_open: false,
             image_shapes_selected: 0,
@@ -703,6 +740,27 @@ impl RootView {
             cursor_trail: Vec::new(),
         };
         view.dirty_tabs = dirty_restored;
+        // Restore the ink colour and size settings.
+        if let Some(v) = view.store.get("ink.pen.color").and_then(|v| v.parse::<u32>().ok()) {
+            view.ink_pen_color = v;
+        }
+        if let Some(v) = view.store.get("ink.pen.size").and_then(|v| v.parse::<f32>().ok()) {
+            view.ink_pen_size = v;
+        }
+        if let Some(v) = view
+            .store
+            .get("ink.highlighter.color")
+            .and_then(|v| v.parse::<u32>().ok())
+        {
+            view.ink_highlighter_color = v;
+        }
+        if let Some(v) = view
+            .store
+            .get("ink.highlighter.size")
+            .and_then(|v| v.parse::<f32>().ok())
+        {
+            view.ink_highlighter_size = v;
+        }
         // Preload reopened files into their buffers.
         for (id, content) in preloaded {
             view.editors
@@ -1659,7 +1717,9 @@ impl RootView {
                 };
                 self.image_drawing = true;
                 self.image_ink_path = path.to_string();
-                self.image_current_stroke = Some(InkStroke::new(tool, width, vec![(x, y)]));
+                let color = self.ink_color(tool);
+                self.image_current_stroke =
+                    Some(InkStroke::new(tool, color, width, vec![(x, y)]));
             }
             ink::TOOL_ERASER => {
                 self.image_drawing = true;
@@ -1861,6 +1921,93 @@ impl RootView {
         self.dirty_tabs.insert(tab_id);
         // Persist lazily (on close/exit) to avoid per-keystroke SQLite writes.
         let _ = (path, tab_id);
+    }
+
+    /// The colour an ink tool draws with.
+    pub fn ink_color(&self, tool: u8) -> u32 {
+        match tool {
+            ink::TOOL_HIGHLIGHTER => self.ink_highlighter_color,
+            _ => self.ink_pen_color,
+        }
+    }
+
+    /// The width an ink tool draws with, in screen pixels at the fit zoom.
+    pub fn ink_size(&self, tool: u8) -> f32 {
+        match tool {
+            ink::TOOL_HIGHLIGHTER => self.ink_highlighter_size,
+            _ => self.ink_pen_size,
+        }
+    }
+
+    /// Pick the colour of an ink tool and remember it.
+    pub fn set_ink_color(&mut self, tool: u8, color: u32) {
+        match tool {
+            ink::TOOL_HIGHLIGHTER => {
+                self.ink_highlighter_color = color;
+                self.store.set("ink.highlighter.color", &color.to_string());
+            }
+            ink::TOOL_PEN => {
+                self.ink_pen_color = color;
+                self.store.set("ink.pen.color", &color.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    /// Pick the width of an ink tool and remember it.
+    pub fn set_ink_size(&mut self, tool: u8, size: f32, cx: &mut Context<Self>) {
+        let size = size.clamp(INK_SIZE_MIN, INK_SIZE_MAX);
+        self.slide_ink_handle(size, cx);
+        match tool {
+            ink::TOOL_HIGHLIGHTER => {
+                self.ink_highlighter_size = size;
+                self.store.set("ink.highlighter.size", &size.to_string());
+            }
+            ink::TOOL_PEN => {
+                self.ink_pen_size = size;
+                self.store.set("ink.pen.size", &size.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    /// Slide the thickness handle towards a thickness.
+    ///
+    /// The handle moves smoothly instead of jumping, so picking a thickness
+    /// reads as the slider gliding to the mark.
+    fn slide_ink_handle(&mut self, size: f32, cx: &mut Context<Self>) {
+        if (self.ink_handle_target - size).abs() < 0.001 {
+            return;
+        }
+        self.ink_handle_target = size;
+        if self.ink_handle_active {
+            return;
+        }
+        self.ink_handle_active = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(12))
+                    .await;
+                let mut done = false;
+                let _ = this.update(cx, |root, cx| {
+                    let delta = root.ink_handle_target - root.ink_handle;
+                    if delta.abs() < 0.01 {
+                        root.ink_handle = root.ink_handle_target;
+                        root.ink_handle_active = false;
+                        done = true;
+                    } else {
+                        // Exponential easing, so the motion is smooth.
+                        root.ink_handle += delta * 0.25;
+                    }
+                    cx.notify();
+                });
+                if done {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     /// Show a transient message in the status bar.
@@ -2594,8 +2741,8 @@ impl RootView {
         // Tool widths are given on screen at the fit-to-window zoom level and
         // stored in image pixels, so they grow as you zoom in.
         self.image_fit = fit;
-        let pen_width = (ink::PEN_SCREEN_WIDTH / fit).max(0.5);
-        let hl_width = (ink::HIGHLIGHTER_SCREEN_WIDTH / fit).max(1.0);
+        let pen_width = (self.ink_pen_size / fit).max(0.5);
+        let hl_width = (self.ink_highlighter_size / fit).max(1.0);
         let eraser_radius = ink::ERASER_SCREEN_RADIUS / scale_x;
 
         // The image rect's origin in window coordinates. Only the ink layer's
@@ -2751,6 +2898,9 @@ impl RootView {
                             hl_width,
                             eraser_radius,
                         );
+                        // Drawing closes the colour and size popup.
+                        root.ink_popup = None;
+                        root.ink_slider_dragging = false;
                         cx.notify();
                     });
                     cx.stop_propagation();
@@ -2820,9 +2970,6 @@ impl RootView {
             strokes.push(current.clone());
         }
 
-        let pen_color = rgba(0x000000ff);
-        let hl_color = rgba(0xffff0078);
-
         let origin_prepaint = origin.clone();
         let canvas = gpui::canvas(
             move |bounds: gpui::Bounds<gpui::Pixels>, _window, _app| {
@@ -2843,8 +2990,9 @@ impl RootView {
                 let ix0 = ox + left;
                 let iy0 = oy + top;
 
-                let mut pen_polys: Vec<Vec<(f32, f32)>> = Vec::new();
-                let mut hl_polys: Vec<Vec<(f32, f32)>> = Vec::new();
+                // The strokes of one colour are merged into a single shape.
+                let mut pen_groups: Vec<(u32, Vec<Vec<(f32, f32)>>)> = Vec::new();
+                let mut hl_groups: Vec<(u32, Vec<Vec<(f32, f32)>>)> = Vec::new();
 
                 for stroke in &strokes {
                     if stroke.points.len() < 2 {
@@ -2861,39 +3009,51 @@ impl RootView {
                     if !visible(&win, ox, oy, vw, vh) {
                         continue;
                     }
+                    // The width is stored in image pixels, so the stroke gets
+                    // thicker as the image is zoomed in.
+                    let w = stroke.width * scale_x;
                     match stroke.tool {
                         ink::TOOL_PEN => {
-                            // The width is stored in image pixels, so the
-                            // stroke gets thicker as the image is zoomed in.
-                            let w = stroke.width * scale_x;
                             let curve = ink::spline(&win, 0.4, 220);
                             let poly = ink::ribbon(&curve, w * 0.5, false);
                             if poly.len() >= 3 {
-                                pen_polys.push(poly);
+                                match pen_groups
+                                    .iter_mut()
+                                    .find(|(c, _)| *c == stroke.color)
+                                {
+                                    Some((_, group)) => group.push(poly),
+                                    None => pen_groups.push((stroke.color, vec![poly])),
+                                }
                             }
                         }
                         ink::TOOL_HIGHLIGHTER => {
-                            // The highlighter is one filled shape for every
-                            // stroke, so overlapping strokes merge instead of
-                            // stacking their opacity.
-                            let w = stroke.width * scale_x;
                             let curve = ink::spline(&win, 1.0, 220);
                             let poly = ink::ribbon(&curve, w * 0.5, true);
                             if poly.len() >= 3 {
-                                hl_polys.push(poly);
+                                match hl_groups
+                                    .iter_mut()
+                                    .find(|(c, _)| *c == stroke.color)
+                                {
+                                    Some((_, group)) => group.push(poly),
+                                    None => hl_groups.push((stroke.color, vec![poly])),
+                                }
                             }
                         }
                         _ => {}
                     }
                 }
 
-                // Every stroke of a tool goes into a single filled path, so
-                // overlapping strokes merge instead of stacking their opacity.
-                if let Some(p) = ink::fill(&pen_polys) {
-                    window.paint_path(p, pen_color);
+                // Every stroke keeps the colour it was drawn in, so changing
+                // the colour later leaves the earlier strokes alone.
+                for (color, group) in pen_groups {
+                    if let Some(p) = ink::fill(&group) {
+                        window.paint_path(p, rgba((color << 8) | 0xff));
+                    }
                 }
-                if let Some(p) = ink::fill(&hl_polys) {
-                    window.paint_path(p, hl_color);
+                for (color, group) in hl_groups {
+                    if let Some(p) = ink::fill(&group) {
+                        window.paint_path(p, rgba((color << 8) | 0x78));
+                    }
                 }
             },
         )
@@ -3228,6 +3388,8 @@ impl Render for RootView {
                     .min_h(px(0.))
                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                         this.close_menu(cx);
+                        this.ink_popup = None;
+                        this.ink_slider_dragging = false;
                     }))
                     .on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, window, cx| {
                         this.drag_to(ev.position.x.as_f32(), cx);
@@ -3806,9 +3968,14 @@ fn bake_annotated_image(path: &str, strokes: &[InkStroke]) -> Result<(), String>
         };
         let mut paint = tiny_skia::Paint::default();
         paint.anti_alias = true;
-        paint.set_color(
-            tiny_skia::Color::from_rgba(0.0, 0.0, 0.0, 1.0).unwrap_or(tiny_skia::Color::BLACK),
-        );
+        let pen_color = stroke.color;
+        paint.set_color(tiny_skia::Color::from_rgba(
+            ((pen_color >> 16) & 0xff) as f32 / 255.0,
+            ((pen_color >> 8) & 0xff) as f32 / 255.0,
+            (pen_color & 0xff) as f32 / 255.0,
+            1.0,
+        )
+        .unwrap_or(tiny_skia::Color::BLACK));
         let mut style = tiny_skia::Stroke::default();
         style.width = stroke.width;
         style.line_cap = tiny_skia::LineCap::Round;
@@ -3825,32 +3992,39 @@ fn bake_annotated_image(path: &str, strokes: &[InkStroke]) -> Result<(), String>
     // The highlighter is translucent, so the strokes are first merged into a
     // coverage mask. Overlapping strokes then keep a single layer of colour
     // instead of stacking their opacity.
-    let highlights: Vec<&InkStroke> = strokes
-        .iter()
-        .filter(|s| s.tool == ink::TOOL_HIGHLIGHTER)
-        .collect();
-    if !highlights.is_empty() {
-        if let Some(mask) =
-            build_highlight_mask(&highlights, off_x as f32, off_y as f32, canvas_w, canvas_h)
-        {
-            let data = canvas.data_mut();
-            for (i, p) in data.chunks_exact_mut(4).enumerate() {
-                let a = mask[i];
-                if a == 0 {
-                    continue;
-                }
-                let alpha = a as f32 / 255.0 * 0.47;
-                let r = p[0] as f32;
-                let g = p[1] as f32;
-                let b = p[2] as f32;
-                let nr = 255.0f32 * alpha + r * (1.0 - alpha);
-                let ng = 235.0f32 * alpha + g * (1.0 - alpha);
-                let nb = 40.0f32 * alpha + b * (1.0 - alpha);
-                p[0] = nr.round() as u8;
-                p[1] = ng.round() as u8;
-                p[2] = nb.round() as u8;
-                p[3] = 255;
+    // The highlighter strokes of one colour are merged into a single shape,
+    // so overlapping strokes keep a single layer of colour.
+    let mut hl_groups: Vec<(u32, Vec<&InkStroke>)> = Vec::new();
+    for stroke in strokes.iter().filter(|s| s.tool == ink::TOOL_HIGHLIGHTER) {
+        match hl_groups.iter_mut().find(|(c, _)| *c == stroke.color) {
+            Some((_, group)) => group.push(stroke),
+            None => hl_groups.push((stroke.color, vec![stroke])),
+        }
+    }
+    for (color, group) in hl_groups {
+        let Some(mask) =
+            build_highlight_mask(&group, off_x as f32, off_y as f32, canvas_w, canvas_h)
+        else {
+            continue;
+        };
+        let hl_color = color;
+        let data = canvas.data_mut();
+        for (i, p) in data.chunks_exact_mut(4).enumerate() {
+            let a = mask[i];
+            if a == 0 {
+                continue;
             }
+            let alpha = a as f32 / 255.0 * 0.47;
+            let r = p[0] as f32;
+            let g = p[1] as f32;
+            let b = p[2] as f32;
+            let nr = ((hl_color >> 16) & 0xff) as f32 * alpha + r * (1.0 - alpha);
+            let ng = ((hl_color >> 8) & 0xff) as f32 * alpha + g * (1.0 - alpha);
+            let nb = (hl_color & 0xff) as f32 * alpha + b * (1.0 - alpha);
+            p[0] = nr.round() as u8;
+            p[1] = ng.round() as u8;
+            p[2] = nb.round() as u8;
+            p[3] = 255;
         }
     }
 

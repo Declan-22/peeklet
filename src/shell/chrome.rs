@@ -1,14 +1,17 @@
 //! Window chrome: top bar (hamburger menu + history + tabs + window controls), bottom bar
 //! (placeholder for per-file-type controls).
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use gpui::{
-    AnyElement, App, MouseButton, WeakEntity, Window, WindowControlArea, canvas, deferred, div,
-    prelude::*, px, rgba, svg,
+    AnyElement, App, Bounds, MouseButton, Pixels, WeakEntity, Window, WindowControlArea, canvas,
+    deferred, div, prelude::*, px, rgba, svg,
 };
 
 use super::dropdown::{ENTRY_HEIGHT, PANEL_PADDING_X, PANEL_PADDING_Y};
 use super::panels::{ICON_PDF, PanelKind};
-use super::root::{RootView, Tab};
+use super::root::{INK_PALETTE, INK_SIZE_MIN, RootView, Tab};
 use crate::theme::WEIGHT_MEDIUM;
 
 pub const TOP_BAR_HEIGHT: f32 = 36.0;
@@ -1097,6 +1100,10 @@ impl gpui::RenderOnce for Toolbar {
         let is_image = root_upgrade.as_ref().map(|r| r.read(cx).active_is_image()).unwrap_or(false);
         let active_tool = root_upgrade.as_ref().map(|r| r.read(cx).image_toolbar_tool).unwrap_or(0);
         let shapes_open = root_upgrade.as_ref().map(|r| r.read(cx).image_shapes_dropdown_open).unwrap_or(false);
+        let ink_popup = root_upgrade
+            .as_ref()
+            .map(|r| r.read(cx).ink_popup)
+            .flatten();
         let left_occ = root_upgrade.as_ref().map(|r| r.read(cx).left_occupancy()).unwrap_or(0.0);
         let right_occ = root_upgrade.as_ref().map(|r| r.read(cx).right_occupancy()).unwrap_or(0.0);
         let content_w = (window.viewport_size().width.as_f32() - left_occ - right_occ).max(0.0);
@@ -1119,7 +1126,19 @@ impl gpui::RenderOnce for Toolbar {
                 .hover(|s| s.bg(rgba(t.bg_darker)))
                 .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                     let _ = root.update(cx, |root, cx| {
-                        root.image_toolbar_tool = index;
+                        // Clicking the tool that is already active opens its
+                        // colour and size settings.
+                        if root.image_toolbar_tool == index && matches!(index, 1 | 2) {
+                            let tool = index as u8;
+                            root.ink_popup = if root.ink_popup == Some(tool) {
+                                None
+                            } else {
+                                Some(tool)
+                            };
+                        } else {
+                            root.image_toolbar_tool = index;
+                            root.ink_popup = None;
+                        }
                         root.image_shapes_dropdown_open = false;
                         cx.notify();
                     });
@@ -1153,10 +1172,37 @@ impl gpui::RenderOnce for Toolbar {
         if is_image {
             // Cursor (0)
             bar = bar.child(tool_button(root.clone(), 0, TOOLBAR_ICON_CURSOR, "Cursor", active_tool == 0));
-            // Pen (1)
-            bar = bar.child(tool_button(root.clone(), 1, TOOLBAR_ICON_PEN, "Pen", active_tool == 1));
-            // Highlighter (2)
-            bar = bar.child(tool_button(root.clone(), 2, TOOLBAR_ICON_HIGHLIGHTER, "Highlighter", active_tool == 2));
+            // Pen (1) and Highlighter (2): clicking the active tool opens
+            // its colour and size settings.
+            for (index, icon) in [(1usize, TOOLBAR_ICON_PEN), (2, TOOLBAR_ICON_HIGHLIGHTER)] {
+                let root_for_popup = root.clone();
+                let mut wrap = div()
+                    .relative()
+                    .child(tool_button(root.clone(), index, icon, if index == 1 { "Pen" } else { "Highlighter" }, active_tool == index));
+                if ink_popup == Some(index as u8) {
+                    let colour = root_upgrade
+                        .as_ref()
+                        .map(|r| r.read(cx).ink_color(index as u8))
+                        .unwrap_or(0);
+                    let size = root_upgrade
+                        .as_ref()
+                        .map(|r| r.read(cx).ink_size(index as u8))
+                        .unwrap_or(4.0);
+                    let handle = root_upgrade
+                        .as_ref()
+                        .map(|r| r.read(cx).ink_handle)
+                        .unwrap_or(0.0);
+                    wrap = wrap.child(ink_settings_popup(
+                        &t,
+                        root_for_popup.clone(),
+                        index as u8,
+                        colour,
+                        size,
+                        handle,
+                    ));
+                }
+                bar = bar.child(wrap);
+            }
             // Eraser (3)
             bar = bar.child(tool_button(root.clone(), 3, TOOLBAR_ICON_ERASER, "Eraser", active_tool == 3));
             // Shapes (4) with dropdown
@@ -1278,7 +1324,278 @@ impl gpui::RenderOnce for Toolbar {
     }
 }
 
-// ---------- Bottom bar ----------
+/// How many thickness steps the pen and the highlighter offer. One step is
+/// one pixel of thickness.
+const INK_PEN_STEPS: usize = 10;
+const INK_HIGHLIGHTER_STEPS: usize = 20;
+
+/// Width of the ink settings popup.
+const INK_POPUP_WIDTH: f32 = 300.0;
+/// Height of the slider.
+const INK_SLIDER_HEIGHT: f32 = 26.0;
+/// Space between the slider's outline and the fill inside it.
+const INK_SLIDER_PADDING: f32 = 3.0;
+/// Width of the thickness number.
+const INK_VALUE_WIDTH: f32 = 30.0;
+/// Width of the slider handle.
+const INK_TOGGLE_WIDTH: f32 = 4.0;
+/// Extra room around the handle so it is easy to grab.
+const INK_TOGGLE_GRAB: f32 = 5.0;
+
+/// The colour and size settings of the pen or the highlighter.
+fn ink_settings_popup(
+    t: &crate::theme::Theme,
+    root: WeakEntity<RootView>,
+    tool: u8,
+    color: u32,
+    size: f32,
+    handle: f32,
+) -> impl IntoElement {
+    let steps = if tool == 2 {
+        INK_HIGHLIGHTER_STEPS
+    } else {
+        INK_PEN_STEPS
+    };
+    let thickness = size.round().clamp(1.0, steps as f32);
+    // The handle glides to the thickness instead of jumping to it.
+    let handle = if handle > 0.0 {
+        handle.clamp(1.0, steps as f32)
+    } else {
+        thickness
+    };
+
+    // The geometry of the slider, laid out like the reference: an outlined
+    // box with the fill inset from the outline.
+    let slider_width = INK_POPUP_WIDTH - PANEL_PADDING_X * 2.0;
+    let track_left = 1.0 + INK_SLIDER_PADDING;
+    let value_left = slider_width - 8.0 - INK_VALUE_WIDTH;
+    // The handle stops before the number, so the two never collide.
+    let travel = (value_left - 6.0 - INK_TOGGLE_WIDTH - track_left).max(1.0);
+    let fraction = if steps > 1 {
+        (handle - 1.0) / (steps - 1) as f32
+    } else {
+        0.0
+    };
+    let toggle_x = track_left + fraction * travel;
+
+    // The slider needs to know where its track starts on screen, which only
+    // the layout knows. A tiny canvas reports it during prepaint.
+    let track_origin: Rc<Cell<f32>> = Rc::new(Cell::new(0.0));
+    let probe_origin = track_origin.clone();
+    let probe = canvas(
+        move |bounds: Bounds<Pixels>, _window, _app| {
+            probe_origin.set(bounds.origin.x.as_f32());
+        },
+        |_bounds, _unit, _window, _app| {},
+    )
+    .absolute()
+    .left(px(0.))
+    .top(px(0.))
+    .w(px(1.))
+    .h(px(1.));
+
+    // A mark for every pixel of thickness.
+    let mut ticks = div().absolute().left(px(track_left)).top(px(0.)).bottom(px(0.));
+    for step in 0..steps {
+        let x = track_left + (step as f32 / (steps - 1).max(1) as f32) * travel;
+        ticks = ticks.child(
+            div()
+                .absolute()
+                .left(px(x - track_left))
+                .top(px(INK_SLIDER_HEIGHT / 2.0 - 1.))
+                .w(px(2.))
+                .h(px(2.))
+                .rounded(px(1.))
+                .bg(rgba(t.text_secondary)),
+        );
+    }
+
+    let root_down = root.clone();
+    let origin_down = track_origin.clone();
+    let origin_move = track_origin.clone();
+    let root_move = root.clone();
+    let root_up = root.clone();
+
+    let slider = div()
+        .id("ink-size-track")
+        .relative()
+        .w(px(slider_width))
+        .h(px(INK_SLIDER_HEIGHT))
+        .border_1()
+        .border_color(rgba(t.menu_border_color))
+        .rounded(px(8.))
+        .on_mouse_down(MouseButton::Left, move |ev, _window, cx| {
+            let value = INK_SIZE_MIN
+                + ((ev.position.x.as_f32() - origin_down.get() - track_left) / travel).clamp(0.0, 1.0)
+                    * (steps as f32 - 1.0);
+            let _ = root_down.update(cx, |root, cx| {
+                root.ink_slider_dragging = true;
+                root.set_ink_size(tool, value, cx);
+                cx.notify();
+            });
+            cx.stop_propagation();
+        })
+        .on_mouse_move(move |ev, _window, cx| {
+            let dragging = root_move
+                .upgrade()
+                .map(|r| r.read(cx).ink_slider_dragging)
+                .unwrap_or(false);
+            if !dragging {
+                return;
+            }
+            let value = INK_SIZE_MIN
+                + ((ev.position.x.as_f32() - origin_move.get() - track_left) / travel).clamp(0.0, 1.0)
+                    * (steps as f32 - 1.0);
+            let _ = root_move.update(cx, |root, cx| {
+                root.set_ink_size(tool, value, cx);
+                cx.notify();
+            });
+        })
+        .on_mouse_up(MouseButton::Left, move |_ev, _window, cx| {
+            let _ = root_up.update(cx, |root, _cx| {
+                root.ink_slider_dragging = false;
+            });
+        })
+        // The filled part of the track, up to the handle.
+        .child(
+            div()
+                .absolute()
+                .left(px(track_left))
+                .top(px(1.0 + INK_SLIDER_PADDING))
+                .bottom(px(1.0 + INK_SLIDER_PADDING))
+                .w(px((toggle_x - 2.0 - track_left).max(0.0)))
+                .rounded(px(5.))
+                .bg(rgba(t.bg_secondary)),
+        )
+        .child(ticks)
+        // The handle, with a wider area around it to grab.
+        .child(
+            div()
+                .id("ink-toggle-handle")
+                .group("ink-toggle")
+                .absolute()
+                .left(px(toggle_x - INK_TOGGLE_GRAB))
+                .top_0()
+                .bottom_0()
+                .w(px(INK_TOGGLE_WIDTH + INK_TOGGLE_GRAB * 2.0))
+                .cursor_pointer()
+                .child(
+                    div()
+                        .group_hover("ink-toggle", |style| {
+                            style.bg(rgba(t.empty_text_primary))
+                        })
+                        .absolute()
+                        .left(px(INK_TOGGLE_GRAB))
+                        .top(px(2.))
+                        .bottom(px(2.))
+                        .w(px(INK_TOGGLE_WIDTH))
+                        .rounded(px(3.))
+                        .bg(rgba(t.text_secondary)),
+                ),
+        )
+        // The thickness, always at the right of the slider.
+        .child(
+            div()
+                .absolute()
+                .left(px(value_left))
+                .top_0()
+                .bottom_0()
+                .w(px(INK_VALUE_WIDTH))
+                .flex()
+                .items_center()
+                .justify_end()
+                .text_sm()
+                .font_weight(WEIGHT_MEDIUM)
+                .text_color(rgba(t.empty_text_primary))
+                .child(format!("{}", thickness as i32)),
+        )
+        .child(probe);
+
+    let swatch = |root: WeakEntity<RootView>, tool: u8, value: u32, selected: bool| {
+        div()
+            .id(format!("ink-swatch-{tool}-{value}"))
+            .w(px(20.))
+            .h(px(20.))
+            .rounded(px(5.))
+            .border_2()
+            .border_color(rgba(if selected { t.text_primary } else { 0x00000000 }))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                let _ = root.update(cx, |root, cx| {
+                    root.set_ink_color(tool, value);
+                    cx.notify();
+                });
+                cx.stop_propagation();
+            })
+            .child(
+                div()
+                    .w(px(12.))
+                    .h(px(12.))
+                    .rounded(px(3.))
+                    .bg(rgba((value << 8) | 0xff)),
+            )
+    };
+
+    let mut palette = div().flex().flex_col().gap(px(5.));
+    for row in INK_PALETTE.chunks(8) {
+        let mut line = div().flex().flex_row().gap(px(5.));
+        for value in row {
+            line = line.child(swatch(root.clone(), tool, *value, *value == color));
+        }
+        palette = palette.child(line);
+    }
+
+    // A preview of a stroke in the colour and thickness that will be used.
+    let preview = div()
+        .w_full()
+        .h(px(thickness))
+        .rounded(px((thickness / 2.0).min(4.0)))
+        .border_1()
+        .border_color(rgba(t.chrome_border_color))
+        .bg(rgba((color << 8) | if tool == 2 { 0x78 } else { 0xff }));
+
+    deferred(
+        div()
+            .absolute()
+            .top(px(32.))
+            .left(px(0.))
+            .w(px(INK_POPUP_WIDTH))
+            .occlude()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .px(px(PANEL_PADDING_X))
+            .py(px(PANEL_PADDING_Y))
+            .bg(rgba(t.bg_primary))
+            .border_1()
+            .border_color(rgba(t.menu_border_color))
+            .rounded(px(10.))
+            .shadow(vec![t.shadow_lg()])
+            .on_mouse_down(MouseButton::Left, |_ev, _window, cx| cx.stop_propagation())
+            .child(palette)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .ml(px(INK_SLIDER_PADDING))
+                            .text_xs()
+                            .text_color(rgba(t.empty_text_primary))
+                            .child("Thickness"),
+                    )
+                    .child(slider),
+            )
+            .child(preview),
+    )
+    .with_priority(1000)
+}
+
+// ---------- Bottom bar ----------// ---------- Bottom bar ----------// ---------- Bottom bar ----------// ---------- Bottom bar ----------
 
 #[derive(IntoElement)]
 pub struct BottomBar {

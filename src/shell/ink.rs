@@ -34,6 +34,9 @@ static NEXT_STROKE_ID: AtomicU64 = AtomicU64::new(1);
 pub struct InkStroke {
     pub id: u64,
     pub tool: u8,
+    /// The colour the stroke was drawn in, as 0xRRGGBB. Keeping it on the
+    /// stroke means changing the colour later leaves earlier strokes alone.
+    pub color: u32,
     /// Stroke width in source image pixels.
     pub width: f32,
     /// Points in source image pixels.
@@ -41,10 +44,11 @@ pub struct InkStroke {
 }
 
 impl InkStroke {
-    pub fn new(tool: u8, width: f32, points: Vec<(f32, f32)>) -> Self {
+    pub fn new(tool: u8, color: u32, width: f32, points: Vec<(f32, f32)>) -> Self {
         Self {
             id: NEXT_STROKE_ID.fetch_add(1, Ordering::Relaxed),
             tool,
+            color,
             width,
             points,
         }

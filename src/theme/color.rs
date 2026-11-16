@@ -8,7 +8,7 @@
 
 // Backgrounds: DARKER → LIGHTER
 pub const DARK_BG_PRIMARY: u32 = 0x20201eff; // 3rd darkest — brighter than SECONDARY, darker than TERTIARY and DARKER
-pub const DARK_BG_SECONDARY: u32 = 0x1d1d1bff; // Darkest — darkest background
+pub const DARK_BG_SECONDARY: u32 = 0x171715ff; // Darkest — darkest background
 pub const DARK_BG_TERTIARY: u32 = 0x242422ff; // 2nd brightest — brighter than PRIMARY and SECONDARY, darker than DARKER
 pub const DARK_BG_DARKER: u32 = 0x252523ff; // Brightest — lightest background
 
