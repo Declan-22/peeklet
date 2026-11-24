@@ -2,7 +2,7 @@
 //! right dock), bottom bar, menu overlay. Owns tabs, dock layout, menus,
 //! hover tweens, and drag-resize state.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::rc::Rc;
@@ -13,21 +13,21 @@ use chrono::Datelike;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, ClipboardItem, Context, FocusHandle, Font, FontFeatures, FontStyle, FontWeight, Hsla,
-    ImageSource, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseExitEvent, ObjectFit,
-    Point, Render,
-    ScrollDelta, ScrollWheelEvent, ShapedLine, TextRun, WeakEntity, Window, deferred, div, img, prelude::*,
-    px, rgba, svg,
+    App, ClipboardItem, Context, FocusHandle, Font, FontFeatures, FontStyle, FontWeight,
+    HighlightStyle, Hsla, ImageSource, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseExitEvent, ObjectFit, Path, Point, Render, ScrollDelta, ScrollWheelEvent, ShapedLine,
+    StyledText, TextRun, WeakEntity, Window, deferred, div, img, prelude::*, px, rgba, svg,
 };
 
 use super::chrome::{BOTTOM_BAR_HEIGHT, BottomBar, SidebarBottomBar, TOOLBAR_HEIGHT, Toolbar, TOP_BAR_HEIGHT, TopBar};
 use super::dock::{DOCK_DEFAULT_WIDTH, DockView};
 use super::dropdown::AppMenu;
 use super::ink::{self, InkHistory, InkStroke};
+use super::markdown;
 use super::panels::{DockSide, PanelKind};
 use crate::editor::EditorState;
 use crate::persist::{Store, TabRecord};
-use crate::theme::{Theme, WEIGHT_MEDIUM};
+use crate::theme::{ThemeMode, WEIGHT_MEDIUM};
 
 /// Folder icon for Open File.
 const ICON_OPEN_FILE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
@@ -84,6 +84,16 @@ pub(crate) const ACCEPTED_FILE_EXTENSIONS: &[&str] = &[
     "avi", "mkv", "webm", "m4v", "obj", "fbx", "gltf", "glb", "stl", "ply", "3ds", "dae",
     "blend",
 ];
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MarkdownViewMode {
+    /// Neither toolbar toggle active: plain editable Markdown with accented symbols.
+    Plain,
+    /// Left: editable raw Markdown; Right: live rendered Markdown preview.
+    Split,
+    /// Live preview: every line rendered except the active cursor line.
+    Stacked,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ViewerKind {
@@ -284,55 +294,65 @@ struct PreviewGeometry {
     wrap: bool,
 }
 
-fn preview_geometry(view_w: f32, left_occ: f32, right_occ: f32, wrap: bool) -> PreviewGeometry {
+type InkPath = (u32, Path<gpui::Pixels>);
+const MAX_CACHED_INK_VERTICES: usize = 50_000;
+
+struct InkRenderCache {
+    path: String,
+    key: (u64, u32, u32, u32, u32, u32, u32),
+    pen: Vec<InkPath>,
+    highlighter: Vec<InkPath>,
+}
+
+const LINE_NUMBER_GUTTER_WIDTH: f32 = 76.0;
+
+fn preview_geometry(
+    view_w: f32,
+    left_occ: f32,
+    right_occ: f32,
+    wrap: bool,
+    gutter: f32,
+) -> PreviewGeometry {
     let col = (view_w - left_occ - right_occ).max(0.0);
-    let min = MIN_COLUMN_MARGIN;
-    let (measure, text_width, margin) = if wrap {
-        let m = (col - 2.0 * min).max(0.0);
-        (m, m, min)
+    let left_margin = if gutter > 0.0 { gutter } else { MIN_COLUMN_MARGIN };
+    let right_margin = MIN_COLUMN_MARGIN;
+    let (measure, text_width) = if wrap {
+        let m = (col - left_margin - right_margin).max(0.0);
+        (m, m)
     } else {
-        (f32::MAX, (col - min).max(0.0), min)
+        (f32::MAX, (col - left_margin).max(0.0))
     };
-    PreviewGeometry { col_w: col, left_occ, margin, measure, text_width, wrap }
+    PreviewGeometry { col_w: col, left_occ, margin: left_margin, measure, text_width, wrap }
 }
 
 fn preview_text_left(geo: &PreviewGeometry) -> f32 {
     geo.left_occ + geo.margin
 }
 
-/// Render-ready snapshot of the active buffer. Keeps borrows short: the
-/// entity builds this once, then renders from plain data.
-#[derive(Clone)]
-struct SnapshotSeg {
+/// Cached visual wrap map for a single text buffer.
+///
+/// Only built when wrapping is enabled (`measure != f32::MAX`). When wrapping
+/// is off, visual row `i` is always buffer line `i` so no wrap map is needed.
+/// Moving the cursor or dragging a selection never invalidates this cache.
+struct EditorWrapCache {
+    /// Visual rows: `(buffer_line, start_byte, end_byte)`.
+    rows: Vec<(usize, usize, usize)>,
+}
+
+/// Render-ready visible row computed only for rows currently on screen.
+/// Rendered as a single `StyledText` run so glyph positions match `shape_row`
+/// to the exact subpixel with zero flexbox rounding drift.
+struct VisibleRow {
     text: String,
-    size: f32,
-    weight: FontWeight,
-    mono: bool,
-    color: u32,
-    src_start: usize,
-    src_end: usize,
-}
-
-struct BuiltRow {
-    segs: Vec<SnapshotSeg>,
-}
-
-#[derive(Clone)]
-struct SnapshotRow {
-    segs: Vec<SnapshotSeg>,
+    highlights: Vec<(std::ops::Range<usize>, HighlightStyle)>,
     buffer_line: usize,
+    is_first_wrap_row: bool,
+    is_last_wrap_row: bool,
+    in_code_block: bool,
     /// Caret (x, height) within the row, if the cursor is here.
     caret: Option<(f32, f32)>,
     /// Selection x-range (px) within the row, if any overlaps it.
     sel_px: Option<(f32, f32)>,
-}
-
-#[derive(Clone)]
-struct EditorSnapshot {
-    rows: Vec<SnapshotRow>,
-    can_undo: bool,
-    can_redo: bool,
-    has_selection: bool,
 }
 
 /// Shape-measured width of a preview string via the window text system.
@@ -380,100 +400,32 @@ fn shape_row(
         .shape_line(text.to_string().into(), px(size), &[run], None)
 }
 
-fn locate_src(shaped: &[(SnapshotSeg, ShapedLine, f32)], src: usize) -> (f32, f32) {
-    let mut x = 0.0;
-    for (seg, sh, w) in shaped {
-        if src < seg.src_start { return (x, seg.size); }
-        if src <= seg.src_end {
-            let rel = (src - seg.src_start).min(seg.text.len());
-            return (x + sh.split_at(rel).0.width().as_f32(), seg.size);
-        }
-        x += w;
-    }
-    let size = shaped.last().map(|(s, _, _)| s.size).unwrap_or(PREVIEW_FONT_SIZE);
-    (x, size)
-}
-
-/// Lay out one buffer line into rows: wrap the raw text to the measure and
-/// slice it into plain segments. No markup is interpreted — a preview shows
-/// the file exactly as it is stored.
-fn layout_line(
-    line_text: &str,
-    measure: f32,
-    window: &mut Window,
-    t: crate::theme::Theme,
+/// Convert syntax spans on `line_text` into `StyledText` highlight ranges
+/// relative to the wrapped row slice `rs..re`.
+fn row_highlights(
+    rs: usize,
+    re: usize,
+    default_color: u32,
     spans: &[(u32, usize, usize)],
-) -> Vec<BuiltRow> {
-    let color = Hsla::from(rgba(t.text_primary));
-    if measure == f32::MAX {
-        // Non-wrapped: one visual row per buffer line, no measurement.
-        let mut segs = Vec::new();
-        for (c, s, e) in spans {
-            let s = (*s).min(line_text.len());
-            let e = (*e).min(line_text.len());
-            if s < e {
-                segs.push(SnapshotSeg {
-                    text: line_text[s..e].to_string(),
-                    size: PREVIEW_FONT_SIZE,
-                    weight: FontWeight::NORMAL,
-                    mono: false,
-                    color: *c,
-                    src_start: s,
-                    src_end: e,
-                });
-            }
+) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
+    let mut out = Vec::new();
+    for &(c, s, e) in spans {
+        if c == default_color {
+            continue;
         }
-        if segs.is_empty() {
-            segs.push(SnapshotSeg {
-                text: line_text.to_string(),
-                size: PREVIEW_FONT_SIZE,
-                weight: FontWeight::NORMAL,
-                mono: false,
-                color: t.text_primary,
-                src_start: 0,
-                src_end: line_text.len(),
-            });
+        let a = s.max(rs);
+        let b = e.min(re);
+        if a < b {
+            out.push((
+                (a - rs)..(b - rs),
+                HighlightStyle {
+                    color: Some(Hsla::from(rgba(c))),
+                    ..Default::default()
+                },
+            ));
         }
-        return vec![BuiltRow { segs }];
     }
-    let mut width_of = |s: &str| {
-        measure_text(window, s, color, PREVIEW_FONT_SIZE, FontWeight::NORMAL, false)
-    };
-    crate::editor::wrap_line(0, line_text, measure, &mut width_of)
-        .into_iter()
-        .map(|row| {
-            let rs = row.start_byte;
-            let re = row.end_byte;
-            let mut segs = Vec::new();
-            for (c, s, e) in spans {
-                let a = (*s).max(rs);
-                let b = (*e).min(re);
-                if a < b {
-                    segs.push(SnapshotSeg {
-                        text: line_text[a..b].to_string(),
-                        size: PREVIEW_FONT_SIZE,
-                        weight: FontWeight::NORMAL,
-                        mono: false,
-                        color: *c,
-                        src_start: a,
-                        src_end: b,
-                    });
-                }
-            }
-            if segs.is_empty() {
-                segs.push(SnapshotSeg {
-                    text: line_text[rs..re].to_string(),
-                    size: PREVIEW_FONT_SIZE,
-                    weight: FontWeight::NORMAL,
-                    mono: false,
-                    color: t.text_primary,
-                    src_start: rs,
-                    src_end: re,
-                });
-            }
-            BuiltRow { segs }
-        })
-        .collect()
+    out
 }
 
 pub struct RootView {
@@ -511,7 +463,7 @@ pub struct RootView {
     image_zoom_tween_active: bool,
     image_drag: Option<(MouseButton, f32, f32, f32, f32)>,
     /// Annotation strokes per image path, in source-image pixel space.
-    image_strokes: HashMap<String, Vec<InkStroke>>,
+    image_strokes: HashMap<String, Rc<Vec<InkStroke>>>,
     /// Undo/redo history for the annotations of each image.
     image_history: HashMap<String, InkHistory>,
     /// Strokes removed by the eraser during the current drag, so the whole
@@ -526,6 +478,10 @@ pub struct RootView {
     image_fit: f32,
     /// Path of the image that is currently being annotated.
     image_ink_path: String,
+    /// Last time an in-progress annotation caused a view repaint.
+    image_last_ink_notify: Instant,
+    image_ink_revision: u64,
+    image_ink_cache: Rc<RefCell<Option<InkRenderCache>>>,
     /// A transient message shown in the status bar.
     status_message: Option<(String, Instant)>,
     /// Colour of the pen strokes, as 0xRRGGBB.
@@ -536,8 +492,13 @@ pub struct RootView {
     pub ink_highlighter_color: u32,
     /// Width of the highlighter strokes, in screen pixels at the fit zoom.
     pub ink_highlighter_size: f32,
-    /// The ink tool whose settings popup is open, if any.
+    /// The ink tool whose settings popup is logically open, if any.
     pub ink_popup: Option<u8>,
+    /// The ink tool whose popup is currently rendered (kept alive while closing).
+    pub ink_popup_display: Option<u8>,
+    /// Open/close transition progress in `0.0..=1.0`.
+    pub ink_popup_progress: f32,
+    ink_popup_animating: bool,
     /// True while the size slider is being dragged.
     pub ink_slider_dragging: bool,
     /// The thickness the handle is currently showing, in pixels.
@@ -556,13 +517,17 @@ pub struct RootView {
     editors: HashMap<usize, EditorState>,
     /// Tab ids with unsaved edits (dirty).
     dirty_tabs: HashSet<usize>,
+    /// Bumped only when text buffer content changes (never on cursor/selection
+    /// moves) so the wrap cache stays valid across clicks, drags, and arrows.
     editor_version: u64,
-    cached_snapshot: Option<EditorSnapshot>,
-    cached_snapshot_key: (usize, u64, u32),
+    cached_wrap: Option<Rc<EditorWrapCache>>,
+    cached_wrap_key: (usize, u64, u32),
     /// Preview focus follows the active tab.
     pub focus: FocusHandle,
-    /// Caret blink state, toggled on a timer.
-    caret_visible: bool,
+    /// Instant of the last cursor move or edit; resets the 530ms blink phase
+    /// so clicks and cursor moves never flash off prematurely.
+    caret_blink_epoch: Instant,
+    last_caret_visible: bool,
     blink_started: bool,
     /// Vertical scroll offset (px) of the preview viewport.
     scroll_offset: f32,
@@ -571,6 +536,15 @@ pub struct RootView {
     /// Number of rendered preview rows from the most recent frame.
     scroll_content_rows: usize,
     scrollbar_hovered: bool,
+    /// Horizontal scroll offset (px) for unwrapped text/code files.
+    scroll_x: f32,
+    /// Horizontal scrollbar drag: (pointer start x, scroll_x at start, track_w, thumb_w, max_x).
+    scroll_x_drag: Option<(f32, f32, f32, f32, f32)>,
+    /// Cached max pixel width across all lines when unwrapped.
+    scroll_x_content_w: f32,
+    scrollbar_x_hovered: bool,
+    cached_max_line_w: f32,
+    cached_max_line_key: (usize, u64),
     /// True while the left button is held for mouse selection.
     mouse_select: bool,
     // -- hamburger menu state (Parametric behavior) --
@@ -582,6 +556,18 @@ pub struct RootView {
     pub wrap_code_files: bool,
     pub line_numbers: bool,
     pub syntax_highlighting: bool,
+    /// Active view mode for Markdown files (Plain, Split, or Stacked).
+    pub markdown_mode: MarkdownViewMode,
+    /// Horizontal split ratio (0.2..=0.8) for Markdown Split view; snaps to 0.5.
+    md_split_ratio: f32,
+    /// True while dragging the Markdown Split view divider.
+    md_split_dragging: bool,
+    /// True while the Markdown heading dropdown menu in the toolbar is open.
+    pub md_heading_dropdown_open: bool,
+    /// Cached printable-ASCII glyph widths for O(N) zero-shaping line wrapping
+    /// while resizing the sidebar or split divider on large wrapped files.
+    ascii_char_widths: Option<[f32; 128]>,
+    ascii_max_width: f32,
     pub active_menu: Option<usize>,
     pub menu_animation: f32,
     pub icon_animation: f32,
@@ -696,12 +682,18 @@ impl RootView {
             image_drawing: false,
             image_fit: 1.0,
             image_ink_path: String::new(),
+            image_last_ink_notify: Instant::now(),
+            image_ink_revision: 0,
+            image_ink_cache: Rc::new(RefCell::new(None)),
             status_message: None,
             ink_pen_color: INK_PALETTE[15],
             ink_pen_size: 4.0,
             ink_highlighter_color: INK_PALETTE[0],
             ink_highlighter_size: 20.0,
             ink_popup: None,
+            ink_popup_display: None,
+            ink_popup_progress: 0.0,
+            ink_popup_animating: false,
             ink_slider_dragging: false,
             ink_handle: 4.0,
             ink_handle_target: 4.0,
@@ -712,15 +704,22 @@ impl RootView {
             editors: HashMap::new(),
             dirty_tabs: HashSet::new(),
             editor_version: 0,
-            cached_snapshot: None,
-            cached_snapshot_key: (usize::MAX, 0, 0),
+            cached_wrap: None,
+            cached_wrap_key: (usize::MAX, 0, 0),
             focus: cx.focus_handle(),
-            caret_visible: true,
+            caret_blink_epoch: Instant::now(),
+            last_caret_visible: true,
             blink_started: false,
             scroll_offset: 0.0,
             scroll_drag: None,
             scroll_content_rows: 0,
             scrollbar_hovered: false,
+            scroll_x: 0.0,
+            scroll_x_drag: None,
+            scroll_x_content_w: 0.0,
+            scrollbar_x_hovered: false,
+            cached_max_line_w: 0.0,
+            cached_max_line_key: (usize::MAX, 0),
             mouse_select: false,
             menu_open: false,
             settings_open: false,
@@ -730,6 +729,12 @@ impl RootView {
             wrap_code_files,
             line_numbers,
             syntax_highlighting,
+            markdown_mode: MarkdownViewMode::Plain,
+            md_split_ratio: 0.5,
+            md_split_dragging: false,
+            md_heading_dropdown_open: false,
+            ascii_char_widths: None,
+            ascii_max_width: 0.0,
             active_menu: None,
             menu_animation: 0.0,
             icon_animation: 0.0,
@@ -964,8 +969,23 @@ impl RootView {
         let (left_occ, right_occ) = self.dock_occupancy();
         let active_path = self.tabs.get(self.active_tab).and_then(|t| t.path.clone());
         let is_code = active_path.as_deref().map(is_code_path).unwrap_or(false);
+        let is_markdown = active_path
+            .as_deref()
+            .map(markdown::is_markdown_path)
+            .unwrap_or(false);
         let wrap = if is_code { self.wrap_code_files } else { self.wrap_text_files };
-        preview_geometry(view_w, left_occ, right_occ, wrap)
+        let gutter = if is_code && self.line_numbers {
+            LINE_NUMBER_GUTTER_WIDTH
+        } else {
+            0.0
+        };
+        let effective_right_occ = if is_markdown && self.markdown_mode == MarkdownViewMode::Split {
+            let full_col = (view_w - left_occ - right_occ).max(0.0);
+            right_occ + full_col * (1.0 - self.md_split_ratio)
+        } else {
+            right_occ
+        };
+        preview_geometry(view_w, left_occ, effective_right_occ, wrap, gutter)
     }
 
     // ----- undo / redo (active tab's buffer) -----
@@ -976,6 +996,19 @@ impl RootView {
             return None;
         }
         Some(self.editors.entry(tab.id).or_insert_with(EditorState::new))
+    }
+
+    /// Reset the caret blink phase so it stays visible for a full 530ms half-
+    /// period after any click, cursor move, or edit instead of flashing off.
+    fn reset_caret_blink(&mut self) {
+        self.caret_blink_epoch = Instant::now();
+        self.last_caret_visible = true;
+    }
+
+    /// Crisp on/off caret visibility derived from `caret_blink_epoch`.
+    fn caret_visible(&self) -> bool {
+        const HALF_PERIOD_MS: u128 = 530;
+        (self.caret_blink_epoch.elapsed().as_millis() / HALF_PERIOD_MS) % 2 == 0
     }
 
     fn handle_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -996,7 +1029,8 @@ impl RootView {
                         if let Some(text) = ed.selected_text() {
                             cx.write_to_clipboard(ClipboardItem::new_string(text));
                             ed.delete_selection();
-                            self.caret_visible = true;
+                            self.reset_caret_blink();
+                            self.editor_version = self.editor_version.wrapping_add(1);
                             if let Some(tab) = self.tabs.get(self.active_tab) {
                                 self.mark_tab_dirty(tab.id);
                             }
@@ -1011,7 +1045,8 @@ impl RootView {
                             if let Some(text) = item.text() {
                                 ed.delete_selection();
                                 ed.insert_str(&text);
-                                self.caret_visible = true;
+                                self.reset_caret_blink();
+                                self.editor_version = self.editor_version.wrapping_add(1);
                                 if let Some(tab) = self.tabs.get(self.active_tab) {
                                     self.mark_tab_dirty(tab.id);
                                 }
@@ -1024,7 +1059,7 @@ impl RootView {
                 "a" => {
                     if let Some(ed) = self.active_editor_mut() {
                         ed.select_all();
-                        self.editor_version = self.editor_version.wrapping_add(1);
+                        self.reset_caret_blink();
                         cx.notify();
                     }
                     return;
@@ -1038,6 +1073,7 @@ impl RootView {
         let key = ev.keystroke.key.as_str();
         let clean = !mods.control && !mods.platform && !mods.alt;
         let extend = mods.shift;
+        let mut mutated_text = false;
         match key {
             "left" if clean => ed.move_left(extend),
             "right" if clean => ed.move_right(extend),
@@ -1045,9 +1081,23 @@ impl RootView {
             "end" if clean => ed.line_end(extend),
             "up" if clean => self.move_visual(-1, extend, window, cx),
             "down" if clean => self.move_visual(1, extend, window, cx),
-            "backspace" if clean => ed.backspace(),
-            "delete" if clean => ed.delete_forward(),
-            "enter" if clean => ed.insert_str("\n"),
+            "backspace" if clean => {
+                ed.backspace();
+                mutated_text = true;
+            }
+            "delete" if clean => {
+                ed.delete_forward();
+                mutated_text = true;
+            }
+            "enter" if clean => {
+                match list_enter_action(ed) {
+                    ListEnterAction::Insert(text) => ed.insert_str(&text),
+                    ListEnterAction::ClearLine { start, end } => {
+                        ed.replace_char_range(start, end, "", start, None);
+                    }
+                }
+                mutated_text = true;
+            }
             "tab" => return,
             _ => {
                 if !clean {
@@ -1060,15 +1110,18 @@ impl RootView {
                             return;
                         }
                         ed.insert_str(&filtered);
+                        mutated_text = true;
                     }
                     None => return,
                 }
             }
         }
-        self.caret_visible = true;
-        self.editor_version = self.editor_version.wrapping_add(1);
-        if let Some(tab) = self.tabs.get(self.active_tab) {
-            self.mark_tab_dirty(tab.id);
+        self.reset_caret_blink();
+        if mutated_text {
+            self.editor_version = self.editor_version.wrapping_add(1);
+            if let Some(tab) = self.tabs.get(self.active_tab) {
+                self.mark_tab_dirty(tab.id);
+            }
         }
         cx.notify();
     }
@@ -1116,32 +1169,95 @@ impl RootView {
         }
         let (cur_row, size, weight) = rows[current].clone();
         let (target_row, target_size, target_weight) = rows[target as usize].clone();
-        // Caret x on the current row, then the widest prefix fitting it.
+        // Caret x on the current row, then the closest byte on the target row
+        // using the exact same single-run shaping as rendered text.
         let rel = cur_byte.min(cur_row.end_byte).saturating_sub(cur_row.start_byte);
         let row_text = ed.line_text(cur_row.buffer_line);
         let row_slice = &row_text[cur_row.start_byte..cur_row.end_byte.min(row_text.len())];
-        let prefix = &row_slice[..rel.min(row_slice.len())];
-        let x = measure_text(window, prefix, color, size, weight, false);
+        let x = if row_slice.is_empty() {
+            0.0
+        } else {
+            shape_row(window, row_slice, color, size, weight, false)
+                .x_for_index(rel.min(row_slice.len()))
+                .as_f32()
+        };
         let target_text = ed.line_text(target_row.buffer_line);
         let target_slice =
             &target_text[target_row.start_byte..target_row.end_byte.min(target_text.len())];
-        let lo = crate::editor::byte_for_x(target_slice, x, &mut |s: &str| {
-            measure_text(window, s, color, target_size, target_weight, false)
-        });
+        let lo = if target_slice.is_empty() || x <= 0.0 {
+            0
+        } else {
+            shape_row(window, target_slice, color, target_size, target_weight, false)
+                .closest_index_for_x(px(x))
+        };
         ed.set_cursor_line_byte(target_row.buffer_line, target_row.start_byte + lo, extend);
     }
 
-    /// Wheel scrolling over the preview viewport.
+    /// Wheel scrolling over the preview viewport (vertical + horizontal).
     fn handle_wheel(&mut self, ev: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let dy = match ev.delta {
-            ScrollDelta::Pixels(p) => p.y.as_f32(),
-            ScrollDelta::Lines(p) => p.y * PREVIEW_LINE_HEIGHT,
+        let (raw_dx, raw_dy) = match ev.delta {
+            ScrollDelta::Pixels(p) => (p.x.as_f32(), p.y.as_f32()),
+            ScrollDelta::Lines(p) => (p.x * 24.0, p.y * PREVIEW_LINE_HEIGHT),
         };
-        if dy == 0.0 {
-            return;
+        let (dx, dy) = if ev.modifiers.shift && raw_dx == 0.0 {
+            (raw_dy, 0.0)
+        } else {
+            (raw_dx, raw_dy)
+        };
+        let mut changed = false;
+        if dy != 0.0 {
+            let max = self.scroll_max_for_geometry(Self::viewport_h(window), 0.0);
+            let next = (self.scroll_offset - dy).clamp(0.0, max);
+            if (next - self.scroll_offset).abs() > 1e-3 {
+                self.scroll_offset = next;
+                changed = true;
+            }
         }
-        let max = self.scroll_max_for_geometry(Self::viewport_h(window), 0.0);
-        self.scroll_offset = (self.scroll_offset - dy).clamp(0.0, max);
+        if dx != 0.0 {
+            let geo = self.geometry(window);
+            if geo.measure == f32::MAX {
+                let max_x = (self.scroll_x_content_w - geo.text_width).max(0.0);
+                let next_x = (self.scroll_x - dx).clamp(0.0, max_x);
+                if (next_x - self.scroll_x).abs() > 1e-3 {
+                    self.scroll_x = next_x;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn begin_scroll_x_drag(
+        &mut self,
+        pointer_x: f32,
+        track_left: f32,
+        thumb_left: f32,
+        thumb_w: f32,
+        track_w: f32,
+        max_x: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let local_x = pointer_x - track_left;
+        if local_x >= thumb_left && local_x <= thumb_left + thumb_w {
+            self.scroll_x_drag = Some((pointer_x, self.scroll_x, track_w, thumb_w, max_x));
+        } else if max_x > 0.0 {
+            let target = (local_x - thumb_w / 2.0).clamp(0.0, (track_w - thumb_w).max(0.0));
+            self.scroll_x = target / (track_w - thumb_w).max(1.0) * max_x;
+            self.scroll_x_drag = Some((pointer_x, self.scroll_x, track_w, thumb_w, max_x));
+        }
+        cx.notify();
+    }
+
+    fn scroll_x_drag_to(&mut self, pointer_x: f32, cx: &mut Context<Self>) {
+        let Some((start_x, start_offset, track_w, thumb_w, max_x)) = self.scroll_x_drag else {
+            return;
+        };
+        let travel = (track_w - thumb_w).max(1.0);
+        let delta = (pointer_x - start_x) / travel * max_x;
+        self.scroll_x = (start_offset + delta).clamp(0.0, max_x);
         cx.notify();
     }
 
@@ -1202,66 +1318,65 @@ impl RootView {
         if x_col > geo.col_w - 18.0 {
             return;
         }
-        let y_view = y_win - TOP_BAR_HEIGHT;
+        // The text viewport starts below both the top bar and the image/text
+        // toolbar. Omitting the toolbar offset makes clicks resolve one or
+        // more rows below the pointer.
+        let y_view = y_win - TOP_BAR_HEIGHT - TOOLBAR_HEIGHT;
         let view_h = Self::viewport_h(window);
         let ed = self.editors.entry(tab_id).or_insert_with(EditorState::new);
-        // Use cached snapshot rows for O(1) lookup instead of rebuilding all rows.
-        let snap_opt = self.cached_snapshot.clone();
-        let (buffer_line, row_start, row_end, size, weight) = if let Some(snap) = snap_opt {
-            if snap.rows.is_empty() {
+        let (buffer_line, row_start, row_end) = if geo.measure == f32::MAX {
+            // Unwrapped: visual rows map 1-to-1 to buffer lines in O(1).
+            let total_rows = ed.len_lines().max(1);
+            let total_h = total_rows as f32 * PREVIEW_LINE_HEIGHT;
+            let max = (total_h - view_h).max(0.0);
+            let offset = self.scroll_offset.min(max);
+            let content_y = y_view + offset;
+            let idx = ((content_y - PREVIEW_TOP_PAD) / PREVIEW_LINE_HEIGHT)
+                .floor()
+                .max(0.0) as usize;
+            let line = idx.min(total_rows - 1);
+            (line, 0, usize::MAX)
+        } else if let Some(wrap) = self.cached_wrap.as_ref() {
+            if wrap.rows.is_empty() {
                 return;
             }
-            let total_h = snap.rows.len() as f32 * PREVIEW_LINE_HEIGHT;
+            let total_h = wrap.rows.len() as f32 * PREVIEW_LINE_HEIGHT;
             let max = (total_h - view_h).max(0.0);
             let offset = self.scroll_offset.min(max);
             let content_y = y_view + offset;
             let idx = ((content_y - PREVIEW_TOP_PAD) / PREVIEW_LINE_HEIGHT)
                 .floor()
                 .max(0.0) as usize;
-            let idx = idx.min(snap.rows.len() - 1);
-            let row = &snap.rows[idx];
-            let bs = row.segs.first().map(|s| s.src_start).unwrap_or(0);
-            let be = row.segs.last().map(|s| s.src_end).unwrap_or(0);
-            let be = if be == 0 { ed.line_char_len(row.buffer_line) } else { be };
-            (row.buffer_line, bs, be, PREVIEW_FONT_SIZE, FontWeight::NORMAL)
+            wrap.rows[idx.min(wrap.rows.len() - 1)]
         } else {
-            // Fallback: build rows (slow for huge files).
-            let mut rows: Vec<(crate::editor::VisualRow, f32, FontWeight)> = Vec::new();
-            for line_no in 0..ed.len_lines() {
-                let text = ed.line_text(line_no);
-                let size = PREVIEW_FONT_SIZE;
-                let weight = FontWeight::NORMAL;
-                let mut width_of = |s: &str| measure_text(window, s, color, size, weight, false);
-                rows.extend(
-                    crate::editor::wrap_line(line_no, &text, geo.measure, &mut width_of)
-                        .into_iter()
-                        .map(|r| (r, size, weight)),
-                );
-            }
-            if rows.is_empty() { return; }
-            let total_h = rows.len() as f32 * PREVIEW_LINE_HEIGHT;
-            let max = (total_h - view_h).max(0.0);
-            let offset = self.scroll_offset.min(max);
-            let content_y = y_view + offset;
-            let idx = ((content_y - PREVIEW_TOP_PAD) / PREVIEW_LINE_HEIGHT)
-                .floor()
-                .max(0.0) as usize;
-            let idx = idx.min(rows.len() - 1);
-            let (row, size, weight) = rows[idx].clone();
-            (row.buffer_line, row.start_byte, row.end_byte, size, weight)
+            return;
         };
         let text_left = preview_text_left(&geo);
-        let x_text = x_win - text_left;
+        let max_x = (self.scroll_x_content_w - geo.text_width).max(0.0);
+        let offset_x = if geo.measure == f32::MAX {
+            self.scroll_x.clamp(0.0, max_x)
+        } else {
+            0.0
+        };
+        let x_text = x_win - text_left + offset_x;
         let row_text = ed.line_text(buffer_line);
+        let start = row_start.min(row_text.len());
         let end = row_end.min(row_text.len());
-        let row_slice = &row_text[row_start..end];
-        let byte = crate::editor::byte_for_x(row_slice, x_text, &mut |s: &str| {
-            measure_text(window, s, color, size, weight, false)
-        });
-        ed.set_cursor_line_byte(buffer_line, row_start + byte, extend);
-        self.caret_visible = true;
-        self.editor_version = self.editor_version.wrapping_add(1);
-        cx.notify();
+        let row_slice = &row_text[start..end];
+        let byte = if row_slice.is_empty() || x_text <= 0.0 {
+            0
+        } else {
+            shape_row(window, row_slice, color, PREVIEW_FONT_SIZE, FontWeight::NORMAL, false)
+                .closest_index_for_x(px(x_text))
+        };
+        let old_cursor = ed.cursor();
+        let old_sel = ed.selection_range();
+        ed.set_cursor_line_byte(buffer_line, start + byte, extend);
+        let changed = ed.cursor() != old_cursor || ed.selection_range() != old_sel;
+        if changed || !extend {
+            self.reset_caret_blink();
+            cx.notify();
+        }
     }
 
     pub fn undo(&mut self, cx: &mut Context<Self>) {
@@ -1272,6 +1387,7 @@ impl RootView {
         if let Some(ed) = self.active_editor_mut() {
             ed.undo();
         }
+        self.reset_caret_blink();
         self.editor_version = self.editor_version.wrapping_add(1);
         cx.notify();
     }
@@ -1284,6 +1400,7 @@ impl RootView {
         if let Some(ed) = self.active_editor_mut() {
             ed.redo();
         }
+        self.reset_caret_blink();
         self.editor_version = self.editor_version.wrapping_add(1);
         cx.notify();
     }
@@ -1293,14 +1410,14 @@ impl RootView {
         let Some(path) = self.active_image_path() else {
             return false;
         };
-        let mut strokes = self.image_strokes.get(&path).cloned().unwrap_or_default();
         let Some(history) = self.image_history.get_mut(&path) else {
             return false;
         };
-        if !history.undo(&mut strokes) {
+        let strokes = self.image_strokes.entry(path.clone()).or_default();
+        if !history.undo(Rc::make_mut(strokes)) {
             return false;
         }
-        self.image_strokes.insert(path.clone(), strokes);
+        self.invalidate_image_ink_cache();
         self.sync_image_dirty(&path);
         true
     }
@@ -1310,16 +1427,21 @@ impl RootView {
         let Some(path) = self.active_image_path() else {
             return false;
         };
-        let mut strokes = self.image_strokes.get(&path).cloned().unwrap_or_default();
         let Some(history) = self.image_history.get_mut(&path) else {
             return false;
         };
-        if !history.redo(&mut strokes) {
+        let strokes = self.image_strokes.entry(path.clone()).or_default();
+        if !history.redo(Rc::make_mut(strokes)) {
             return false;
         }
-        self.image_strokes.insert(path.clone(), strokes);
+        self.invalidate_image_ink_cache();
         self.sync_image_dirty(&path);
         true
+    }
+
+    fn invalidate_image_ink_cache(&mut self) {
+        self.image_ink_revision = self.image_ink_revision.wrapping_add(1);
+        *self.image_ink_cache.borrow_mut() = None;
     }
 
     /// The path of the image in the active tab, if there is one.
@@ -1680,10 +1802,239 @@ impl RootView {
             .is_some_and(|path| viewer_kind(Some(path)) == ViewerKind::Image)
     }
 
+    pub(crate) fn active_is_markdown(&self) -> bool {
+        self.tabs
+            .get(self.active_tab)
+            .and_then(|tab| tab.path.as_deref())
+            .is_some_and(markdown::is_markdown_path)
+    }
+
+    pub fn toggle_markdown_mode(&mut self, target: MarkdownViewMode, cx: &mut Context<Self>) {
+        self.markdown_mode = if self.markdown_mode == target {
+            MarkdownViewMode::Plain
+        } else {
+            target
+        };
+        self.md_heading_dropdown_open = false;
+        self.cached_wrap_key = (usize::MAX, 0, 0);
+        cx.notify();
+    }
+
+    /// Heading level (`1..=6`) on the active cursor line, or `0` for paragraph.
+    pub(crate) fn active_markdown_heading_level(&self) -> usize {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return 0;
+        };
+        let Some(ed) = self.editors.get(&tab.id) else {
+            return 0;
+        };
+        let (line_no, _) = ed.cursor_line_col();
+        if line_no >= ed.len_lines() {
+            return 0;
+        }
+        let line = ed.line_text(line_no);
+        let trimmed = line.trim_start();
+        let level = trimmed.bytes().take_while(|&b| b == b'#').count();
+        if (1..=6).contains(&level)
+            && (level == trimmed.len() || trimmed.as_bytes()[level] == b' ')
+        {
+            level
+        } else {
+            0
+        }
+    }
+
+    fn finish_md_edit(&mut self, cx: &mut Context<Self>) {
+        self.reset_caret_blink();
+        self.editor_version = self.editor_version.wrapping_add(1);
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            self.mark_tab_dirty(tab.id);
+        }
+        cx.notify();
+    }
+
+    /// Wrap or unwrap the current selection (or insert empty delimiters at the
+    /// cursor) with inline Markdown markers like `**`, `*`, `~~`, or `` ` ``.
+    pub fn md_wrap_inline(&mut self, prefix: &str, suffix: &str, cx: &mut Context<Self>) {
+        self.md_heading_dropdown_open = false;
+        let Some(ed) = self.active_editor_mut() else {
+            return;
+        };
+        let p_chars = prefix.chars().count();
+        let s_chars = suffix.chars().count();
+        if let Some((a, b)) = ed.selection_range() {
+            let selected = ed.selected_text().unwrap_or_default();
+            if selected.starts_with(prefix)
+                && selected.ends_with(suffix)
+                && selected.len() >= prefix.len() + suffix.len()
+            {
+                let inner = &selected[prefix.len()..selected.len() - suffix.len()];
+                let inner_chars = inner.chars().count();
+                ed.replace_char_range(a, b, inner, a + inner_chars, Some(a));
+            } else {
+                let wrapped = format!("{prefix}{selected}{suffix}");
+                let sel_chars = selected.chars().count();
+                ed.replace_char_range(
+                    a,
+                    b,
+                    &wrapped,
+                    a + p_chars + sel_chars,
+                    Some(a + p_chars),
+                );
+            }
+        } else {
+            let pos = ed.cursor();
+            let empty = format!("{prefix}{suffix}");
+            ed.replace_char_range(pos, pos, &empty, pos + p_chars, None);
+            let _ = s_chars;
+        }
+        self.finish_md_edit(cx);
+    }
+
+    /// Insert or wrap a Markdown link `[label](url)`.
+    pub fn md_insert_link(&mut self, cx: &mut Context<Self>) {
+        self.md_heading_dropdown_open = false;
+        let Some(ed) = self.active_editor_mut() else {
+            return;
+        };
+        if let Some((a, b)) = ed.selection_range() {
+            let selected = ed.selected_text().unwrap_or_default();
+            let sel_chars = selected.chars().count();
+            let replacement = format!("[{selected}](url)");
+            let url_start = a + 1 + sel_chars + 2;
+            ed.replace_char_range(a, b, &replacement, url_start + 3, Some(url_start));
+        } else {
+            let pos = ed.cursor();
+            ed.replace_char_range(pos, pos, "[](url)", pos + 1, None);
+        }
+        self.finish_md_edit(cx);
+    }
+
+    /// Toggle inline code (single line) or a fenced code block (multi-line
+    /// selection or empty line).
+    pub fn md_toggle_code(&mut self, cx: &mut Context<Self>) {
+        self.md_heading_dropdown_open = false;
+        let is_multiline = self
+            .active_editor_mut()
+            .and_then(|ed| ed.selected_text())
+            .is_some_and(|s| s.contains('\n'));
+        if is_multiline {
+            self.md_wrap_inline("```\n", "\n```", cx);
+        } else {
+            self.md_wrap_inline("`", "`", cx);
+        }
+    }
+
+    /// Set the current line's heading level (`0` = paragraph, `1..=6` = H1..H6).
+    pub fn md_set_heading(&mut self, level: usize, cx: &mut Context<Self>) {
+        self.md_heading_dropdown_open = false;
+        let Some(ed) = self.active_editor_mut() else {
+            return;
+        };
+        let (line_no, col) = ed.cursor_line_col();
+        if line_no >= ed.len_lines() {
+            return;
+        }
+        let line_start = ed.line_start_char(line_no);
+        let line = ed.line_text(line_no);
+        let leading_ws = line.len() - line.trim_start().len();
+        let trimmed = &line[leading_ws..];
+        let existing_hashes = trimmed.bytes().take_while(|&b| b == b'#').count();
+        let existing_prefix_bytes = if (1..=6).contains(&existing_hashes)
+            && (existing_hashes == trimmed.len() || trimmed.as_bytes()[existing_hashes] == b' ')
+        {
+            let space = usize::from(
+                existing_hashes < trimmed.len() && trimmed.as_bytes()[existing_hashes] == b' ',
+            );
+            leading_ws + existing_hashes + space
+        } else {
+            leading_ws
+        };
+        let existing_prefix_chars = line[..existing_prefix_bytes].chars().count();
+        let new_prefix = if level == 0 {
+            String::new()
+        } else {
+            format!("{} ", "#".repeat(level.min(6)))
+        };
+        let new_prefix_chars = new_prefix.chars().count();
+        let new_col = col
+            .saturating_sub(existing_prefix_chars)
+            .saturating_add(new_prefix_chars);
+        ed.replace_char_range(
+            line_start,
+            line_start + existing_prefix_chars,
+            &new_prefix,
+            line_start + new_col,
+            None,
+        );
+        self.finish_md_edit(cx);
+    }
+
+    /// Toggle a line-start prefix (`> `, `- `, or `1. `) on the current line
+    /// or all lines covered by the selection.
+    pub fn md_toggle_line_prefix(&mut self, prefix: &str, numbered: bool, cx: &mut Context<Self>) {
+        self.md_heading_dropdown_open = false;
+        let Some(ed) = self.active_editor_mut() else {
+            return;
+        };
+        let (start_line, end_line) = if let Some((a, b)) = ed.selection_range() {
+            (ed.char_to_line(a), ed.char_to_line(b.saturating_sub(1).max(a)))
+        } else {
+            let (l, _) = ed.cursor_line_col();
+            (l, l)
+        };
+        if start_line >= ed.len_lines() {
+            return;
+        }
+        let end_line = end_line.min(ed.len_lines() - 1);
+        let range_start = ed.line_start_char(start_line);
+        let range_end = ed.line_start_char(end_line) + ed.line_char_len(end_line);
+
+        let lines: Vec<String> = (start_line..=end_line).map(|l| ed.line_text(l)).collect();
+        let strip_prefix = |s: &str| -> Option<String> {
+            let trimmed = s.trim_start();
+            let ws = &s[..s.len() - trimmed.len()];
+            if numbered {
+                let d = trimmed.bytes().take_while(|b| b.is_ascii_digit()).count();
+                if d > 0 && d + 1 < trimmed.len() && trimmed.as_bytes()[d] == b'.' && trimmed.as_bytes()[d + 1] == b' ' {
+                    return Some(format!("{ws}{}", &trimmed[d + 2..]));
+                }
+                None
+            } else {
+                trimmed.strip_prefix(prefix).map(|rest| format!("{ws}{rest}"))
+            }
+        };
+        let all_prefixed = lines.iter().all(|l| strip_prefix(l).is_some());
+        let rebuilt: Vec<String> = lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                if all_prefixed {
+                    strip_prefix(l).unwrap_or_else(|| l.clone())
+                } else if numbered {
+                    format!("{}. {l}", i + 1)
+                } else {
+                    format!("{prefix}{l}")
+                }
+            })
+            .collect();
+        let replacement = rebuilt.join("\n");
+        let rep_chars = replacement.chars().count();
+        let new_anchor = (start_line != end_line).then_some(range_start);
+        ed.replace_char_range(
+            range_start,
+            range_end,
+            &replacement,
+            range_start + rep_chars,
+            new_anchor,
+        );
+        self.finish_md_edit(cx);
+    }
+
     /// Remove strokes (or parts of them) near the given image-space point.
     pub fn erase_image_strokes(&mut self, path: &str, point: (f32, f32), radius: f32) {
         let removed = match self.image_strokes.get_mut(path) {
-            Some(strokes) => ink::erase(strokes, point.0, point.1, radius),
+            Some(strokes) => ink::erase(Rc::make_mut(strokes), point.0, point.1, radius),
             None => Vec::new(),
         };
         if removed.is_empty() {
@@ -1691,6 +2042,7 @@ impl RootView {
         }
         // The whole drag is one undo step, so hold on to what it removed.
         self.image_erased.extend(removed);
+        self.invalidate_image_ink_cache();
         self.mark_path_dirty(path);
     }
 
@@ -1732,14 +2084,15 @@ impl RootView {
     }
 
     /// Extend the stroke in progress to an image-space point.
-    pub fn extend_ink_stroke(&mut self, x: f32, y: f32, eraser_radius: f32) {
+    pub fn extend_ink_stroke(&mut self, x: f32, y: f32, eraser_radius: f32) -> bool {
         if !self.image_drawing {
-            return;
+            return false;
         }
         if self.image_toolbar_tool as u8 == ink::TOOL_ERASER {
             let path = self.image_ink_path.clone();
+            let before = self.image_erased.len();
             self.erase_image_strokes(&path, (x, y), eraser_radius);
-            return;
+            return self.image_erased.len() != before;
         }
         if let Some(stroke) = &mut self.image_current_stroke {
             // Ignore samples that are too close together; they add nothing but
@@ -1756,8 +2109,10 @@ impl RootView {
             };
             if !too_close {
                 stroke.points.push((x, y));
+                return true;
             }
         }
+        false
     }
 
     /// Finish the stroke in progress and store it.
@@ -1766,9 +2121,10 @@ impl RootView {
         let path = std::mem::take(&mut self.image_ink_path);
         if let Some(stroke) = self.image_current_stroke.take() {
             if stroke.points.len() >= 2 {
-                let strokes = self.image_strokes.entry(path.clone()).or_default();
+                let strokes = Rc::make_mut(self.image_strokes.entry(path.clone()).or_default());
                 let index = strokes.len();
                 strokes.push(stroke.clone());
+                self.invalidate_image_ink_cache();
                 self.image_history
                     .entry(path.clone())
                     .or_default()
@@ -1954,6 +2310,88 @@ impl RootView {
         }
     }
 
+    /// Open or close the ink colour/thickness popup with a smooth transition.
+    pub fn set_ink_popup(&mut self, next: Option<u8>, cx: &mut Context<Self>) {
+        if self.ink_popup == next {
+            return;
+        }
+        self.ink_popup = next;
+        if let Some(tool) = next {
+            let current_size = self.ink_size(tool);
+            self.ink_handle = current_size;
+            self.ink_handle_target = current_size;
+            if self.ink_popup_display != Some(tool) {
+                self.ink_popup_display = Some(tool);
+                self.ink_popup_progress = 0.0;
+            }
+        } else {
+            self.ink_slider_dragging = false;
+        }
+        if self.ink_popup_animating {
+            cx.notify();
+            return;
+        }
+        self.ink_popup_animating = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(12))
+                    .await;
+                let mut done = false;
+                let alive = this
+                    .update(cx, |root, cx| {
+                        let target = if root.ink_popup.is_some() { 1.0 } else { 0.0 };
+                        let delta = target - root.ink_popup_progress;
+                        if delta.abs() < 0.01 {
+                            root.ink_popup_progress = target;
+                            if target == 0.0 {
+                                root.ink_popup_display = None;
+                            }
+                            root.ink_popup_animating = false;
+                            done = true;
+                        } else {
+                            root.ink_popup_progress += delta * 0.30;
+                        }
+                        cx.notify();
+                    })
+                    .is_ok();
+                if !alive || done {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Update the thickness while actively dragging the slider (tracks the
+    /// magnetically-pulled pointer position directly without lag).
+    pub fn drag_ink_size(&mut self, tool: u8, size: f32) {
+        let size = size.clamp(INK_SIZE_MIN, INK_SIZE_MAX);
+        self.ink_handle = size;
+        self.ink_handle_target = size;
+        match tool {
+            ink::TOOL_HIGHLIGHTER => self.ink_highlighter_size = size,
+            ink::TOOL_PEN => self.ink_pen_size = size,
+            _ => {}
+        }
+    }
+
+    /// Release the thickness slider and smoothly ease it to the nearest
+    /// integer pixel tick.
+    pub fn release_ink_slider(&mut self, cx: &mut Context<Self>) {
+        if !self.ink_slider_dragging {
+            return;
+        }
+        self.ink_slider_dragging = false;
+        if let Some(tool) = self.ink_popup {
+            let max_step = if tool == ink::TOOL_HIGHLIGHTER { 20.0 } else { 10.0 };
+            let snapped = self.ink_size(tool).round().clamp(1.0, max_step);
+            self.set_ink_size(tool, snapped, cx);
+            cx.notify();
+        }
+    }
+
     /// Pick the width of an ink tool and remember it.
     pub fn set_ink_size(&mut self, tool: u8, size: f32, cx: &mut Context<Self>) {
         let size = size.clamp(INK_SIZE_MIN, INK_SIZE_MAX);
@@ -2101,7 +2539,7 @@ impl RootView {
         if strokes.is_empty() {
             return;
         }
-        let strokes = strokes.clone();
+        let strokes = (**strokes).clone();
         let path = path.to_string();
         let name = file_name_of(&path);
         self.set_status_message(format!("Saving {name}..."));
@@ -2111,19 +2549,28 @@ impl RootView {
                 .background_executor()
                 .spawn(async move { bake_annotated_image(&job_path, &strokes) })
                 .await;
-            this.update(cx, |root, cx| {
+            let _ = this.update(cx, |root, cx| {
                 match result {
-                    Ok(()) => {
-                        // The strokes are now part of the file, so drop them
-                        // and reload the image. Saving again would otherwise
-                        // bake them a second time.
+                    Ok(loaded) => {
+                        // The strokes are now part of the file, so drop them.
+                        // Reuse the encoded bytes we just wrote instead of
+                        // re-reading and re-decoding the file from disk.
                         root.image_strokes.remove(&path);
                         root.image_history.remove(&path);
                         root.image_erased.clear();
-                        root.image_assets.remove(&path);
+                        root.invalidate_image_ink_cache();
                         root.image_loading.remove(&path);
                         root.image_load_errors.remove(&path);
-                        root.start_image_load(&path, cx);
+                        if let Some(loaded) = loaded {
+                            root.image_assets.insert(
+                                path.clone(),
+                                (loaded.image, loaded.width, loaded.height),
+                            );
+                            root.prune_image_cache(&path);
+                        } else {
+                            root.image_assets.remove(&path);
+                            root.start_image_load(&path, cx);
+                        }
                         root.set_status_message(format!("Saved {name}"));
                     }
                     Err(message) => root.set_status_message(message),
@@ -2205,11 +2652,41 @@ impl RootView {
         }
     }
 
+    pub fn begin_md_split_drag(&mut self, cx: &mut Context<Self>) {
+        self.md_split_dragging = true;
+        cx.notify();
+    }
+
+    fn drag_md_split_to(&mut self, x: f32, view_w: f32, cx: &mut Context<Self>) {
+        if !self.md_split_dragging {
+            return;
+        }
+        let (left_occ, right_occ) = self.dock_occupancy();
+        let full_col = (view_w - left_occ - right_occ).max(1.0);
+        let rel_x = x - left_occ;
+        // Magnetic snap to exact center (50/50) within 14px.
+        let ratio = if (rel_x - full_col * 0.5).abs() <= 14.0 {
+            0.5
+        } else {
+            (rel_x / full_col).clamp(0.2, 0.8)
+        };
+        if (self.md_split_ratio - ratio).abs() > 1e-4 {
+            self.md_split_ratio = ratio;
+            self.cached_wrap_key = (usize::MAX, 0, 0);
+            cx.notify();
+        }
+    }
+
     fn end_drag(&mut self, cx: &mut Context<Self>) {
+        self.release_ink_slider(cx);
+        let was_split = std::mem::take(&mut self.md_split_dragging);
+        let was_scroll_x = self.scroll_x_drag.take().is_some();
         let was_dragging = self.drag.take().is_some() || self.scroll_drag.take().is_some();
         self.mouse_select = false;
-        if was_dragging {
-            self.save_layout();
+        if was_dragging || was_split || was_scroll_x {
+            if was_dragging {
+                self.save_layout();
+            }
             cx.notify();
         }
     }
@@ -2236,17 +2713,17 @@ impl RootView {
     fn render_preview(
         &mut self,
         root: WeakEntity<RootView>,
-        snapshot: Option<EditorSnapshot>,
+        wrap_cache: Option<Rc<EditorWrapCache>>,
         focus: FocusHandle,
         geo: &PreviewGeometry,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let (title, image_path) = self
+        let (tab_id, title, image_path) = self
             .tabs
             .get(self.active_tab)
-            .map(|tab| (tab.title.clone(), tab.path.clone()))
-            .unwrap_or_default();
+            .map(|tab| (Some(tab.id), tab.title.clone(), tab.path.clone()))
+            .unwrap_or((None, String::new(), None));
         if title == "Welcome" {
             return self.render_welcome(root, cx);
         }
@@ -2261,39 +2738,72 @@ impl RootView {
             return self.render_pdf_preview(path, root, window, cx);
         }
         let t = *crate::theme::active(cx);
-        let snap = snapshot.unwrap_or(EditorSnapshot {
-            rows: vec![SnapshotRow {
-                segs: vec![SnapshotSeg {
-                    text: String::new(), size: PREVIEW_FONT_SIZE,
-                    weight: FontWeight::NORMAL, mono: false,
-                    color: t.text_primary,
-                    src_start: 0, src_end: 0,
-                }],
-                buffer_line: 0,
-                caret: Some((0.0, CARET_HEIGHT)),
-                sel_px: None,
-            }],
-            can_undo: false,
-            can_redo: false,
-            has_selection: false,
-        });
-        // No caret while any selection is visible.
-        let show_caret = self.caret_visible && !snap.has_selection;
-        let active_path = self.tabs.get(self.active_tab).and_then(|t| t.path.clone()).unwrap_or_default();
+        let is_dark = crate::theme::mode(cx) == ThemeMode::Dark;
+        let active_path = image_path.unwrap_or_default();
         let is_code = is_code_path(&active_path);
+        let is_markdown = markdown::is_markdown_path(&active_path);
+        let md_mode = if is_markdown {
+            self.markdown_mode
+        } else {
+            MarkdownViewMode::Plain
+        };
+        let highlight = (is_code && self.syntax_highlighting) || is_markdown;
+        let preview_ext = std::path::Path::new(&active_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
         let show_line_numbers = self.line_numbers && is_code;
-        let gutter_width = if show_line_numbers { 64.0 } else { 0.0 };
+        let gutter_width = if show_line_numbers { LINE_NUMBER_GUTTER_WIDTH } else { 0.0 };
+
+        let ed = tab_id.and_then(|id| self.editors.get(&id));
+        let has_selection = ed.is_some_and(|e| e.selection_range().is_some());
+        let caret_visible_now = self.caret_visible();
+        self.last_caret_visible = caret_visible_now;
+        let show_caret = caret_visible_now && !has_selection;
+
+        let total_rows = match (&wrap_cache, ed) {
+            (Some(wrap), _) => wrap.rows.len().max(1),
+            (None, Some(e)) => e.len_lines().max(1),
+            (None, None) => 1,
+        };
 
         // Scrollbar geometry (Zed-style: thick low-opacity thumb + a 2px
         // accent line at the cursor row).
         let view_h = Self::viewport_h(window);
-        let total_h = snap.rows.len() as f32 * PREVIEW_LINE_HEIGHT;
+        let total_h = total_rows as f32 * PREVIEW_LINE_HEIGHT;
         let offset = self.scroll_offset.min((total_h - view_h).max(0.0));
         let start_row = (offset / PREVIEW_LINE_HEIGHT).floor() as usize;
         let visible_count = (view_h / PREVIEW_LINE_HEIGHT).ceil() as usize + 2;
-        let end_row = (start_row + visible_count).min(snap.rows.len());
+        let end_row = (start_row + visible_count).min(total_rows);
         let top_offset = offset - start_row as f32 * PREVIEW_LINE_HEIGHT;
         let show_scroll = total_h > view_h;
+        let max_x = if geo.measure == f32::MAX {
+            (self.scroll_x_content_w - geo.text_width).max(0.0)
+        } else {
+            0.0
+        };
+        let offset_x = if geo.measure == f32::MAX {
+            self.scroll_x.clamp(0.0, max_x)
+        } else {
+            0.0
+        };
+        let show_scroll_x = geo.measure == f32::MAX && max_x > 1.0;
+        // Flush with the left edge of the editor column and the right vertical
+        // scrollbar, matching the vertical scrollbar's exact geometry.
+        let track_w_x = (geo.col_w - if show_scroll { 8.0 } else { 0.0 }).max(0.0);
+        let thumb_w_x = if show_scroll_x && self.scroll_x_content_w > 0.0 {
+            (geo.text_width / self.scroll_x_content_w * track_w_x)
+                .max(24.0)
+                .min(track_w_x)
+        } else {
+            0.0
+        };
+        let thumb_left_x = if show_scroll_x && max_x > 0.0 {
+            (offset_x / max_x) * (track_w_x - thumb_w_x).max(0.0)
+        } else {
+            0.0
+        };
         let track_h = view_h.max(0.0);
         let thumb_h = if show_scroll {
             (view_h / total_h * track_h).max(24.0).min(track_h)
@@ -2310,12 +2820,272 @@ impl RootView {
         } else {
             0.0
         };
+
+        let (cur_line, cur_byte) = ed.map(|e| e.cursor_line_byte()).unwrap_or((0, 0));
+        let sel_chars = ed.and_then(|e| e.selection_range());
+        let cursor_row_idx = if let Some(wrap) = &wrap_cache {
+            let first = wrap.rows.partition_point(|&(l, _, _)| l < cur_line);
+            let mut found = first.min(wrap.rows.len().saturating_sub(1));
+            for (offset_i, &(l, rs, re)) in wrap.rows[first..].iter().enumerate() {
+                if l != cur_line {
+                    break;
+                }
+                found = first + offset_i;
+                if rs <= cur_byte && cur_byte <= re {
+                    break;
+                }
+            }
+            found
+        } else {
+            cur_line.min(total_rows - 1)
+        };
         let cursor_y = if show_scroll && total_h > 0.0 {
-            let idx = snap.rows.iter().position(|r| r.caret.is_some()).unwrap_or(0);
-            ((idx as f32 * PREVIEW_LINE_HEIGHT + PREVIEW_LINE_HEIGHT / 2.0) / total_h)
+            ((cursor_row_idx as f32 * PREVIEW_LINE_HEIGHT + PREVIEW_LINE_HEIGHT / 2.0) / total_h)
                 * track_h
         } else {
             0.0
+        };
+
+        // Build only the rows currently visible in the viewport: syntax
+        // highlighting and glyph shaping never run for off-screen lines.
+        let primary_hsla = Hsla::from(rgba(t.text_primary));
+        let mut visible_rows: Vec<VisibleRow> = Vec::with_capacity(end_row.saturating_sub(start_row));
+        if let Some(ed) = ed {
+            // Track fenced code block state up to the first visible line when
+            // rendering Markdown preview (Split or Stacked).
+            let mut in_code_block = false;
+            if md_mode != MarkdownViewMode::Plain && start_row < end_row {
+                let first_buf_line = if let Some(wrap) = &wrap_cache {
+                    wrap.rows.get(start_row).map(|r| r.0).unwrap_or(0)
+                } else {
+                    start_row
+                };
+                for l in 0..first_buf_line.min(ed.len_lines()) {
+                    if markdown::is_fence_line(&ed.line_text(l)) {
+                        in_code_block = !in_code_block;
+                    }
+                }
+            }
+
+            let mut cached_line_no: Option<usize> = None;
+            let mut cached_line_text = String::new();
+            let mut cached_spans: Vec<(u32, usize, usize)> = Vec::new();
+            let mut cached_sel_bytes: Option<(usize, usize)> = None;
+            let mut cached_in_code_block = in_code_block;
+            let mut caret_placed = false;
+
+            for row_idx in start_row..end_row {
+                let (buffer_line, rs, re) = if let Some(wrap) = &wrap_cache {
+                    if row_idx < wrap.rows.len() {
+                        wrap.rows[row_idx]
+                    } else {
+                        (0, 0, 0)
+                    }
+                } else {
+                    (row_idx, 0, usize::MAX)
+                };
+
+                if cached_line_no != Some(buffer_line) {
+                    cached_line_no = Some(buffer_line);
+                    cached_line_text = if buffer_line < ed.len_lines() {
+                        ed.line_text(buffer_line)
+                    } else {
+                        String::new()
+                    };
+                    if md_mode != MarkdownViewMode::Plain {
+                        if markdown::is_fence_line(&cached_line_text) {
+                            cached_in_code_block = in_code_block;
+                            in_code_block = !in_code_block;
+                        } else {
+                            cached_in_code_block = in_code_block;
+                        }
+                    }
+                    cached_spans = if is_markdown {
+                        markdown::markdown_symbol_spans(&cached_line_text, t.accent, t.text_primary)
+                    } else if highlight {
+                        highlight_line_spans(&cached_line_text, &preview_ext, is_dark, t.text_primary)
+                    } else {
+                        Vec::new()
+                    };
+                    cached_sel_bytes = sel_chars.and_then(|(a, b)| {
+                        if buffer_line >= ed.len_lines() {
+                            return None;
+                        }
+                        let ls = ed.line_start_char(buffer_line);
+                        let llen = ed.line_char_len(buffer_line);
+                        let o0 = a.max(ls);
+                        let o1 = b.min(ls + llen);
+                        if o0 >= o1 {
+                            None
+                        } else {
+                            Some((
+                                EditorState::col_to_bytes(&cached_line_text, o0 - ls),
+                                EditorState::col_to_bytes(&cached_line_text, o1 - ls),
+                            ))
+                        }
+                    });
+                }
+
+                let row_rs = rs.min(cached_line_text.len());
+                let row_re = re.min(cached_line_text.len());
+                let row_slice = &cached_line_text[row_rs..row_re];
+                let highlights = if highlight {
+                    row_highlights(row_rs, row_re, t.text_primary, &cached_spans)
+                } else {
+                    Vec::new()
+                };
+                let row_contains_cursor = row_rs <= cur_byte && cur_byte <= row_re;
+                let needs_caret = !caret_placed && buffer_line == cur_line && row_contains_cursor;
+                let sel_on_row = cached_sel_bytes.and_then(|(s0, s1)| {
+                    let a = s0.max(row_rs);
+                    let b = s1.min(row_re);
+                    (a < b).then(|| (a - row_rs, b - row_rs))
+                });
+
+                let (caret, sel_px) = if needs_caret || sel_on_row.is_some() {
+                    let shaped = if row_slice.is_empty() {
+                        None
+                    } else {
+                        Some(shape_row(
+                            window,
+                            row_slice,
+                            primary_hsla,
+                            PREVIEW_FONT_SIZE,
+                            FontWeight::NORMAL,
+                            false,
+                        ))
+                    };
+                    let caret = if needs_caret {
+                        let rel = (cur_byte - row_rs).min(row_slice.len());
+                        let x = shaped
+                            .as_ref()
+                            .map(|sh| sh.x_for_index(rel).as_f32())
+                            .unwrap_or(0.0);
+                        caret_placed = true;
+                        Some((x, (PREVIEW_FONT_SIZE + 4.0).min(PREVIEW_LINE_HEIGHT - 2.0)))
+                    } else {
+                        None
+                    };
+                    let sel_px = sel_on_row.and_then(|(a, b)| {
+                        let sh = shaped.as_ref()?;
+                        Some((sh.x_for_index(a).as_f32(), sh.x_for_index(b).as_f32()))
+                    });
+                    (caret, sel_px)
+                } else {
+                    (None, None)
+                };
+
+                visible_rows.push(VisibleRow {
+                    text: row_slice.to_string(),
+                    highlights,
+                    buffer_line,
+                    is_first_wrap_row: row_rs == 0,
+                    is_last_wrap_row: row_re >= cached_line_text.len(),
+                    in_code_block: cached_in_code_block,
+                    caret,
+                    sel_px,
+                });
+            }
+        } else {
+            visible_rows.push(VisibleRow {
+                text: String::new(),
+                highlights: Vec::new(),
+                buffer_line: 0,
+                is_first_wrap_row: true,
+                is_last_wrap_row: true,
+                in_code_block: false,
+                caret: Some((0.0, CARET_HEIGHT)),
+                sel_px: None,
+            });
+        }
+
+        // In Split mode, prepare the right-hand rendered Markdown preview rows
+        // (grouping contiguous Markdown table lines into proper bordered tables)
+        // before `visible_rows` is consumed by the left-hand editor column.
+        let split_preview_rows: Option<Vec<gpui::AnyElement>> = if md_mode == MarkdownViewMode::Split {
+            let mut elements: Vec<gpui::AnyElement> = Vec::with_capacity(visible_rows.len());
+            let mut idx = 0usize;
+            while idx < visible_rows.len() {
+                let row = &visible_rows[idx];
+                if let Some(ed_ref) = ed {
+                    let kind = table_row_kind(ed_ref, row.buffer_line);
+                    if kind == markdown::TableRowKind::Header && row.is_first_wrap_row {
+                        let header_line = ed_ref.line_text(row.buffer_line);
+                        let mut body_lines: Vec<String> = Vec::new();
+                        let mut end_line = row.buffer_line + 1; // separator
+                        let mut scan = row.buffer_line + 2;
+                        while scan < ed_ref.len_lines() {
+                            let l = ed_ref.line_text(scan);
+                            if markdown::parse_table_cells(&l).is_some()
+                                && !markdown::is_table_separator(&l)
+                            {
+                                body_lines.push(l);
+                                end_line = scan;
+                                scan += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        let header_cells =
+                            markdown::parse_table_cells(&header_line).unwrap_or_default();
+                        let body_cells: Vec<Vec<&str>> = body_lines
+                            .iter()
+                            .filter_map(|l| markdown::parse_table_cells(l))
+                            .collect();
+                        elements.push(markdown::render_markdown_table(
+                            &header_cells,
+                            &body_cells,
+                            PREVIEW_FONT_SIZE,
+                            &t,
+                        ));
+                        while idx < visible_rows.len() && visible_rows[idx].buffer_line <= end_line {
+                            idx += 1;
+                        }
+                        continue;
+                    }
+                    if kind != markdown::TableRowKind::None {
+                        let full_line = ed_ref.line_text(row.buffer_line);
+                        elements.push(markdown::render_markdown_table_line(
+                            &full_line,
+                            kind,
+                            row.is_first_wrap_row,
+                            PREVIEW_LINE_HEIGHT,
+                            PREVIEW_FONT_SIZE,
+                            &t,
+                        ));
+                        idx += 1;
+                        continue;
+                    }
+                }
+                let full_line = ed
+                    .filter(|e| row.buffer_line < e.len_lines())
+                    .map(|e| e.line_text(row.buffer_line))
+                    .unwrap_or_default();
+                let q_pos = ed
+                    .map(|e| {
+                        quote_pos_for_row(
+                            e,
+                            row.buffer_line,
+                            row.is_first_wrap_row,
+                            row.is_last_wrap_row,
+                        )
+                    })
+                    .unwrap_or_default();
+                elements.push(markdown::render_markdown_wrapped_row(
+                    &row.text,
+                    &full_line,
+                    row.is_first_wrap_row,
+                    row.in_code_block,
+                    q_pos,
+                    PREVIEW_LINE_HEIGHT,
+                    PREVIEW_FONT_SIZE,
+                    &t,
+                ));
+                idx += 1;
+            }
+            Some(elements)
+        } else {
+            None
         };
 
         div()
@@ -2343,14 +3113,30 @@ impl RootView {
                         move |ev: &MouseDownEvent, window, cx| {
                             window.focus(&fh, cx);
                             let _ = root.update(cx, |root, cx| {
-                                root.mouse_select = true;
                                 root.position_from_point(
                                     ev.position.x.as_f32(),
                                     ev.position.y.as_f32(),
                                     window,
-                                    ev.modifiers.shift,
+                                    ev.modifiers.shift && ev.click_count <= 1,
                                     cx,
                                 );
+                                if ev.click_count == 2 {
+                                    root.mouse_select = false;
+                                    if let Some(ed) = root.active_editor_mut() {
+                                        ed.select_word_at_cursor();
+                                    }
+                                    root.reset_caret_blink();
+                                    cx.notify();
+                                } else if ev.click_count >= 3 {
+                                    root.mouse_select = false;
+                                    if let Some(ed) = root.active_editor_mut() {
+                                        ed.select_line_at_cursor();
+                                    }
+                                    root.reset_caret_blink();
+                                    cx.notify();
+                                } else {
+                                    root.mouse_select = true;
+                                }
                             });
                         }
                     })
@@ -2388,15 +3174,15 @@ impl RootView {
                                         .absolute()
                                         .left(px(preview_text_left(geo) - gutter_width))
                                         .top_0()
+                                        .pt(px(PREVIEW_TOP_PAD))
                                         .w(px(gutter_width))
                                         .flex()
                                         .flex_col()
                                         .items_end()
-                                        .pr(px(12.))
+                                        .pr(px(24.))
                                         .pl(px(8.))
-                                        .children(snap.rows[start_row..end_row].iter().map(|row| {
-                                            let is_first = row.segs.first().map(|s| s.src_start).unwrap_or(0) == 0;
-                                            let label = if is_first {
+                                        .children(visible_rows.iter().map(|row| {
+                                            let label = if row.is_first_wrap_row {
                                                 (row.buffer_line + 1).to_string()
                                             } else {
                                                 String::new()
@@ -2417,15 +3203,68 @@ impl RootView {
                                 div()
                                     .w(px(geo.text_width))
                                     .ml(px(preview_text_left(geo)))
-                                    .flex()
-                                    .flex_col()
-                                    .pt(px(PREVIEW_TOP_PAD))
-                                    .children(snap.rows[start_row..end_row].iter().map(|row| {
-                                        // The text always renders as one
-                                        // unsplit run, so shaping (kerning,
-                                        // ligatures) never shifts when the
-                                        // selection or caret moves.
+                                    .overflow_hidden()
+                                    .child(
+                                        div()
+                                            .w(px(self.scroll_x_content_w.max(geo.text_width)))
+                                            .ml(px(-offset_x))
+                                            .flex()
+                                            .flex_col()
+                                            .pt(px(PREVIEW_TOP_PAD))
+                                            .children(visible_rows.into_iter().map(|row| {
+                                        // In Stacked (live preview) mode, render
+                                        // every non-active, unselected Markdown
+                                        // line as formatted preview while the
+                                        // active cursor line shows raw symbols.
+                                        if md_mode == MarkdownViewMode::Stacked
+                                            && row.buffer_line != cur_line
+                                            && row.sel_px.is_none()
+                                        {
+                                            let full_line = ed
+                                                .filter(|e| row.buffer_line < e.len_lines())
+                                                .map(|e| e.line_text(row.buffer_line))
+                                                .unwrap_or_default();
+                                            let t_kind = ed
+                                                .map(|e| table_row_kind(e, row.buffer_line))
+                                                .unwrap_or(markdown::TableRowKind::None);
+                                            if t_kind != markdown::TableRowKind::None {
+                                                return markdown::render_markdown_table_line(
+                                                    &full_line,
+                                                    t_kind,
+                                                    row.is_first_wrap_row,
+                                                    PREVIEW_LINE_HEIGHT,
+                                                    PREVIEW_FONT_SIZE,
+                                                    &t,
+                                                );
+                                            }
+                                            let q_pos = ed
+                                                .map(|e| {
+                                                    quote_pos_for_row(
+                                                        e,
+                                                        row.buffer_line,
+                                                        row.is_first_wrap_row,
+                                                        row.is_last_wrap_row,
+                                                    )
+                                                })
+                                                .unwrap_or_default();
+                                            return markdown::render_markdown_wrapped_row(
+                                                &row.text,
+                                                &full_line,
+                                                row.is_first_wrap_row,
+                                                row.in_code_block,
+                                                q_pos,
+                                                PREVIEW_LINE_HEIGHT,
+                                                PREVIEW_FONT_SIZE,
+                                                &t,
+                                            );
+                                        }
+
+                                        // Render the whole row as one StyledText
+                                        // run so kerning and subpixel glyph
+                                        // advances match `shape_row` exactly.
                                         // Selection and caret are overlays.
+                                        let styled = StyledText::new(row.text)
+                                            .with_highlights(row.highlights);
                                         div()
                                             .relative()
                                             .w_full()
@@ -2435,14 +3274,11 @@ impl RootView {
                                             .items_center()
                                             .whitespace_nowrap()
                                             .overflow_hidden()
-                                            .children(row.segs.iter().map(|seg| {
-                                                div()
-                                                    .font_family(if seg.mono { crate::theme::FONT_MONO } else { crate::theme::FONT_TEXT })
-                                                    .text_size(px(seg.size))
-                                                    .font_weight(seg.weight)
-                                                    .text_color(rgba(seg.color))
-                                                    .child(seg.text.clone())
-                                            }))
+                                            .font_family(crate::theme::FONT_TEXT)
+                                            .text_size(px(PREVIEW_FONT_SIZE))
+                                            .font_weight(FontWeight::NORMAL)
+                                            .text_color(rgba(t.text_primary))
+                                            .child(styled)
                                             .when_some(row.sel_px, |r, range| {
                                                 let (x0, x1) = range;
                                                 r.child(
@@ -2472,10 +3308,114 @@ impl RootView {
                                                     )
                                                 },
                                             )
-                                    })
-                                )
+                                            .into_any_element()
+                                    }))
+                                    )
                             )
+                            .when_some(split_preview_rows, |d, preview_rows| {
+                                let (left_occ, right_occ) = self.dock_occupancy();
+                                let full_col =
+                                    (window.viewport_size().width.as_f32() - left_occ - right_occ)
+                                        .max(0.0);
+                                let split_x = geo.left_occ + geo.col_w;
+                                let right_w = (full_col - geo.col_w - 1.0).max(0.0);
+                                let root_split = root.clone();
+                                d.child(
+                                    div()
+                                        .absolute()
+                                        .left(px(split_x + 1.0))
+                                        .top(px(0.))
+                                        .w(px(right_w))
+                                        .flex()
+                                        .flex_col()
+                                        .pt(px(PREVIEW_TOP_PAD))
+                                        .px(px(MIN_COLUMN_MARGIN))
+                                        .cursor_default()
+                                        .children(preview_rows),
+                                )
+                                .child(
+                                    div()
+                                        .id("md-split-divider")
+                                        .absolute()
+                                        .left(px(split_x - 3.0))
+                                        .top(px(top_offset))
+                                        .w(px(7.))
+                                        .h(px(view_h))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor_col_resize()
+                                        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                            let _ = root_split.update(cx, |root, cx| {
+                                                root.begin_md_split_drag(cx);
+                                            });
+                                            cx.stop_propagation();
+                                        })
+                                        .child(
+                                            div()
+                                                .w(px(1.))
+                                                .h_full()
+                                                .bg(rgba(t.chrome_border_color)),
+                                        ),
+                                )
+                            })
                 )
+                .when(show_scroll_x, |v| {
+                    let track_left_x = geo.left_occ;
+                    v.child(
+                        div()
+                            .id("manuscript-scrollbar-x")
+                            .absolute()
+                            .left(px(track_left_x))
+                            .bottom(px(0.))
+                            .w(px(track_w_x))
+                            .h(px(8.))
+                            .cursor_pointer()
+                            .on_hover({
+                                let root = root.clone();
+                                move |hovered, _, cx| {
+                                    let _ = root.update(cx, |this, cx| {
+                                        let next = *hovered;
+                                        if this.scrollbar_x_hovered != next {
+                                            this.scrollbar_x_hovered = next;
+                                            cx.notify();
+                                        }
+                                    });
+                                }
+                            })
+                            .on_mouse_down(MouseButton::Left, {
+                                let root = root.clone();
+                                move |ev: &MouseDownEvent, _, cx| {
+                                    let _ = root.update(cx, |this, cx| {
+                                        this.begin_scroll_x_drag(
+                                            ev.position.x.as_f32(),
+                                            track_left_x,
+                                            thumb_left_x,
+                                            thumb_w_x,
+                                            track_w_x,
+                                            max_x,
+                                            cx,
+                                        );
+                                    });
+                                    cx.stop_propagation();
+                                }
+                            })
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(px(thumb_left_x))
+                                    .top(px(0.))
+                                    .bottom(px(0.))
+                                    .w(px(thumb_w_x))
+                                    .bg(rgba(t.text_secondary))
+                                    .opacity(if self.scrollbar_x_hovered || self.scroll_x_drag.is_some() {
+                                        0.30
+                                    } else {
+                                        0.16
+                                    }),
+                            ),
+                    )
+                })
                 .when(show_scroll, |v| {
                     v.child(
                         div()
@@ -2899,8 +3839,7 @@ impl RootView {
                             eraser_radius,
                         );
                         // Drawing closes the colour and size popup.
-                        root.ink_popup = None;
-                        root.ink_slider_dragging = false;
+                        root.set_ink_popup(None, cx);
                         cx.notify();
                     });
                     cx.stop_propagation();
@@ -2915,8 +3854,12 @@ impl RootView {
                     let ix = (ev.position.x.as_f32() - ox) / scale_x;
                     let iy = (ev.position.y.as_f32() - oy) / scale_y;
                     let _ = root_move.update(cx, |root, cx| {
-                        root.extend_ink_stroke(ix, iy, eraser_radius);
-                        cx.notify();
+                        if root.extend_ink_stroke(ix, iy, eraser_radius)
+                            && root.image_last_ink_notify.elapsed() >= Duration::from_millis(8)
+                        {
+                            root.image_last_ink_notify = Instant::now();
+                            cx.notify();
+                        }
                     });
                 },
             );
@@ -2964,11 +3907,15 @@ impl RootView {
         origin: Rc<Cell<(f32, f32)>>,
         _cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let mut strokes: Vec<InkStroke> = self.image_strokes.get(path).cloned().unwrap_or_default();
-        // The stroke currently being drawn is rendered live.
-        if let Some(current) = &self.image_current_stroke {
-            strokes.push(current.clone());
-        }
+        let committed: Rc<Vec<InkStroke>> = self
+            .image_strokes
+            .get(path)
+            .cloned()
+            .unwrap_or_default();
+        let current_stroke = self.image_current_stroke.clone();
+        let cache = self.image_ink_cache.clone();
+        let revision = self.image_ink_revision;
+        let cache_path = path.to_string();
 
         let origin_prepaint = origin.clone();
         let canvas = gpui::canvas(
@@ -2990,69 +3937,60 @@ impl RootView {
                 let ix0 = ox + left;
                 let iy0 = oy + top;
 
-                // The strokes of one colour are merged into a single shape.
-                let mut pen_groups: Vec<(u32, Vec<Vec<(f32, f32)>>)> = Vec::new();
-                let mut hl_groups: Vec<(u32, Vec<Vec<(f32, f32)>>)> = Vec::new();
-
-                for stroke in &strokes {
-                    if stroke.points.len() < 2 {
-                        continue;
-                    }
-                    // Smooth in image space, so the shape of a stroke does not
-                    // change as the image is zoomed.
-                    let pts = ink::smooth(&stroke.points);
-                    let win: Vec<(f32, f32)> = pts
+                let key = (revision, scale_x.to_bits(), scale_y.to_bits(), ix0.to_bits(), iy0.to_bits(), vw.to_bits(), vh.to_bits());
+                let cached = cache
+                    .borrow()
+                    .as_ref()
+                    .filter(|c| c.path == cache_path && c.key == key)
+                    .map(|c| (c.pen.clone(), c.highlighter.clone()));
+                let (pen_paths, hl_paths) = if let Some(paths) = cached {
+                    paths
+                } else {
+                    // Drop the previous zoom/viewport cache before allocating
+                    // the replacement, keeping peak memory bounded.
+                    *cache.borrow_mut() = None;
+                    let (pen_groups, hl_groups) = build_ink_groups(
+                        &committed, ix0, iy0, ox, oy, vw, vh, scale_x, scale_y,
+                    );
+                    let pen = fill_ink_groups(pen_groups);
+                    let highlighter = fill_ink_groups(hl_groups);
+                    let vertices = pen
                         .iter()
-                        .map(|p| (ix0 + p.0 * scale_x, iy0 + p.1 * scale_y))
-                        .collect();
-                    // Skip strokes that are entirely off screen.
-                    if !visible(&win, ox, oy, vw, vh) {
-                        continue;
+                        .chain(highlighter.iter())
+                        .map(|(_, path)| path.vertices.len())
+                        .sum::<usize>();
+                    if vertices <= MAX_CACHED_INK_VERTICES {
+                        *cache.borrow_mut() = Some(InkRenderCache {
+                            path: cache_path.clone(),
+                            key,
+                            pen: pen.clone(),
+                            highlighter: highlighter.clone(),
+                        });
                     }
-                    // The width is stored in image pixels, so the stroke gets
-                    // thicker as the image is zoomed in.
-                    let w = stroke.width * scale_x;
-                    match stroke.tool {
-                        ink::TOOL_PEN => {
-                            let curve = ink::spline(&win, 0.4, 220);
-                            let poly = ink::ribbon(&curve, w * 0.5, false);
-                            if poly.len() >= 3 {
-                                match pen_groups
-                                    .iter_mut()
-                                    .find(|(c, _)| *c == stroke.color)
-                                {
-                                    Some((_, group)) => group.push(poly),
-                                    None => pen_groups.push((stroke.color, vec![poly])),
-                                }
-                            }
-                        }
-                        ink::TOOL_HIGHLIGHTER => {
-                            let curve = ink::spline(&win, 1.0, 220);
-                            let poly = ink::ribbon(&curve, w * 0.5, true);
-                            if poly.len() >= 3 {
-                                match hl_groups
-                                    .iter_mut()
-                                    .find(|(c, _)| *c == stroke.color)
-                                {
-                                    Some((_, group)) => group.push(poly),
-                                    None => hl_groups.push((stroke.color, vec![poly])),
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+                    (pen, highlighter)
+                };
 
                 // Every stroke keeps the colour it was drawn in, so changing
                 // the colour later leaves the earlier strokes alone.
-                for (color, group) in pen_groups {
-                    if let Some(p) = ink::fill(&group) {
-                        window.paint_path(p, rgba((color << 8) | 0xff));
-                    }
+                for (color, path) in pen_paths {
+                    window.paint_path(path, rgba((color << 8) | 0xff));
                 }
-                for (color, group) in hl_groups {
-                    if let Some(p) = ink::fill(&group) {
-                        window.paint_path(p, rgba((color << 8) | 0x78));
+                for (color, path) in hl_paths {
+                    window.paint_path(path, rgba((color << 8) | 0x78));
+                }
+                if let Some(current) = &current_stroke {
+                    let (pen_groups, hl_groups) = build_ink_groups(
+                        std::slice::from_ref(current), ix0, iy0, ox, oy, vw, vh, scale_x, scale_y,
+                    );
+                    for (color, group) in pen_groups {
+                        if let Some(p) = ink::fill(&group) {
+                            window.paint_path(p, rgba((color << 8) | 0xff));
+                        }
+                    }
+                    for (color, group) in hl_groups {
+                        if let Some(p) = ink::fill(&group) {
+                            window.paint_path(p, rgba((color << 8) | 0x78));
+                        }
                     }
                 }
             },
@@ -3214,18 +4152,38 @@ impl Render for RootView {
         let t = *crate::theme::active(cx);
         let root = cx.entity().downgrade();
 
-        // Caret blink ticker, started once for the entity's lifetime.
+        // Crisp instant caret blink ticker, started once for the entity's
+        // lifetime. Only notifies when `caret_visible()` actually flips so
+        // clicking or moving the cursor never triggers an early flash.
         if !self.blink_started {
             self.blink_started = true;
             cx.spawn(async move |weak, cx| {
                 loop {
                     cx.background_executor()
-                        .timer(Duration::from_millis(530))
+                        .timer(Duration::from_millis(80))
                         .await;
                     let alive = weak
                         .update(cx, |root, cx| {
-                            root.caret_visible = !root.caret_visible;
-                            cx.notify();
+                            let is_text_tab = root.tabs.get(root.active_tab).is_some_and(|tab| {
+                                tab.title != "Welcome"
+                                    && viewer_kind(tab.path.as_deref()) == ViewerKind::Text
+                            });
+                            if !is_text_tab {
+                                return;
+                            }
+                            let has_sel = root
+                                .tabs
+                                .get(root.active_tab)
+                                .and_then(|tab| root.editors.get(&tab.id))
+                                .is_some_and(|ed| ed.selection_range().is_some());
+                            if has_sel {
+                                return;
+                            }
+                            let visible = root.caret_visible();
+                            if visible != root.last_caret_visible {
+                                root.last_caret_visible = visible;
+                                cx.notify();
+                            }
                         })
                         .is_ok();
                     if !alive {
@@ -3239,108 +4197,122 @@ impl Render for RootView {
         // Geometry first: everything preview-related derives from it.
         let geo = self.geometry(window);
 
-        // Snapshot the active buffer once per frame: wrapped visual rows
-        // with caret/selection x-edges and history flags. Welcome tabs have
-        // no buffer.
+        // Build or reuse the wrap map only when wrapping is enabled and the
+        // buffer text or wrap width changed. Unwrapped files and cursor /
+        // selection changes do O(1) work here.
+        let active_text_tab_id = self
+            .tabs
+            .get(self.active_tab)
+            .filter(|tab| {
+                tab.title != "Welcome" && viewer_kind(tab.path.as_deref()) == ViewerKind::Text
+            })
+            .map(|tab| tab.id);
         let measure_bits = geo.measure.to_bits();
-        let cache_key = (self.active_tab, self.editor_version, measure_bits);
-        let snapshot: Option<EditorSnapshot> = if self.cached_snapshot_key == cache_key {
-            self.cached_snapshot.clone()
+        let wrap_key = (self.active_tab, self.editor_version, measure_bits);
+        // Populate the printable-ASCII glyph width LUT once so wrapping and
+        // unwrapped horizontal scroll bounds run with zero per-line font shaping.
+        if active_text_tab_id.is_some() && self.ascii_char_widths.is_none() {
+            let color = Hsla::from(rgba(t.text_primary));
+            let mut lut = [0.0f32; 128];
+            let mut max_w = 0.0f32;
+            let mut buf = [0u8; 1];
+            for b in 32u8..=126u8 {
+                buf[0] = b;
+                let s = std::str::from_utf8(&buf).unwrap();
+                let w = measure_text(window, s, color, PREVIEW_FONT_SIZE, FontWeight::NORMAL, false);
+                lut[b as usize] = w;
+                if w > max_w {
+                    max_w = w;
+                }
+            }
+            lut[b'\t' as usize] = lut[b' ' as usize] * 4.0;
+            self.ascii_char_widths = Some(lut);
+            self.ascii_max_width = max_w.max(1.0);
+        }
+
+        let wrap_cache: Option<Rc<EditorWrapCache>> = if geo.measure == f32::MAX {
+            None
+        } else if self.cached_wrap_key == wrap_key {
+            self.cached_wrap.clone()
         } else {
-            let built = self
-                .tabs
-                .get(self.active_tab)
-                .filter(|tab| tab.title != "Welcome")
-                .map(|tab| tab.id)
-                .map(|id| {
+            let color = Hsla::from(rgba(t.text_primary));
+            let lut = self.ascii_char_widths.unwrap();
+            let max_w = self.ascii_max_width;
+
+            let built = active_text_tab_id.map(|id| {
                 let ed = self.editors.entry(id).or_insert_with(EditorState::new);
-                let (cur_line, cur_byte) = ed.cursor_line_byte();
-                let sel_chars = ed.selection_range();
-                let mut rows = Vec::new();
-                let mut caret_placed = false;
-                let active_path = self.tabs.get(self.active_tab).and_then(|t| t.path.clone()).unwrap_or_default();
-                let is_code = is_code_path(&active_path);
-                let highlight = is_code && self.syntax_highlighting;
-                let ext = std::path::Path::new(&active_path)
-                    .extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+                let mut rows = Vec::with_capacity(ed.len_lines());
                 for line_no in 0..ed.len_lines() {
                     let text = ed.line_text(line_no);
-                    let spans = if highlight {
-                        highlight_line_spans(&text, &ext)
-                    } else {
-                        vec![(t.text_primary, 0, text.len())]
-                    };
-                    let ls = ed.line_start_char(line_no);
-                    let llen = ed.line_char_len(line_no);
-                    let sel_bytes = sel_chars.and_then(|(a, b)| {
-                        let o0 = a.max(ls);
-                        let o1 = b.min(ls + llen);
-                        if o0 >= o1 {
-                            None
-                        } else {
-                            Some((
-                                EditorState::col_to_bytes(&text, o0 - ls),
-                                EditorState::col_to_bytes(&text, o1 - ls),
-                            ))
-                        }
-                    });
-                    for built in layout_line(&text, geo.measure, window, t, &spans) {
-                        let mut shaped = Vec::new();
-                        for seg in &built.segs {
-                            let color = Hsla::from(rgba(seg.color));
-                            let sh = shape_row(window, &seg.text, color, seg.size, seg.weight, seg.mono);
-                            let w = sh.width().as_f32();
-                            shaped.push((seg.clone(), sh, w));
-                        }
-                        let row_contains_cursor = if let (Some(first), Some(last)) =
-                            (built.segs.first(), built.segs.last())
-                        {
-                            first.src_start <= cur_byte && cur_byte <= last.src_end
-                        } else {
-                            cur_byte == 0
+                    if text.is_empty()
+                        || (text.is_ascii() && (text.len() as f32) * max_w <= geo.measure)
+                    {
+                        rows.push((line_no, 0, text.len()));
+                        continue;
+                    }
+                    if text.is_ascii() {
+                        let mut width_of = |s: &str| {
+                            s.bytes().map(|b| lut[b as usize]).sum::<f32>() * 1.01
                         };
-                        let caret = if !caret_placed
-                            && line_no == cur_line
-                            && row_contains_cursor
-                        {
-                            let (x, size) = locate_src(&shaped, cur_byte);
-                            caret_placed = true;
-                            Some((x, (size + 4.0).min(PREVIEW_LINE_HEIGHT - 2.0)))
-                        } else { None };
-                        let sel_px = sel_bytes.and_then(|(s0, s1)| {
-                            let mut x0 = None;
-                            let mut x1 = None;
-                            let mut x = 0.0;
-                            for (seg, sh, w) in &shaped {
-                                let a = s0.max(seg.src_start);
-                                let b = s1.min(seg.src_end);
-                                if a < b {
-                                    let local_a = sh.split_at(a - seg.src_start).0.width().as_f32();
-                                    let local_b = sh.split_at(b - seg.src_start).0.width().as_f32();
-                                    x0 = Some(x0.unwrap_or(x + local_a));
-                                    x1 = Some(x + local_b);
-                                }
-                                x += *w;
-                            }
-                            x0.zip(x1)
-                        });
-                        rows.push(SnapshotRow { segs: built.segs, buffer_line: line_no, caret, sel_px });
+                        for row in crate::editor::wrap_line(line_no, &text, geo.measure, &mut width_of) {
+                            rows.push((row.buffer_line, row.start_byte, row.end_byte));
+                        }
+                    } else {
+                        let mut width_of = |s: &str| {
+                            measure_text(window, s, color, PREVIEW_FONT_SIZE, FontWeight::NORMAL, false)
+                        };
+                        for row in crate::editor::wrap_line(line_no, &text, geo.measure, &mut width_of) {
+                            rows.push((row.buffer_line, row.start_byte, row.end_byte));
+                        }
                     }
                 }
-                EditorSnapshot {
-                    rows,
-                    can_undo: ed.can_undo(),
-                    can_redo: ed.can_redo(),
-                    has_selection: ed.selection_range().is_some(),
-                }
+                Rc::new(EditorWrapCache { rows })
             });
-            self.cached_snapshot = built.clone();
-            self.cached_snapshot_key = cache_key;
+            self.cached_wrap = built.clone();
+            self.cached_wrap_key = wrap_key;
             built
         };
-        let can_undo = snapshot.as_ref().is_some_and(|s| s.can_undo);
-        let can_redo = snapshot.as_ref().is_some_and(|s| s.can_redo);
-        self.scroll_content_rows = snapshot.as_ref().map(|s| s.rows.len()).unwrap_or(0);
+
+        // Compute cached max line pixel width for unwrapped horizontal scrolling.
+        if geo.measure == f32::MAX {
+            if let Some(id) = active_text_tab_id {
+                let max_key = (self.active_tab, self.editor_version);
+                if self.cached_max_line_key != max_key {
+                    let ed = self.editors.entry(id).or_insert_with(EditorState::new);
+                    let lut = self.ascii_char_widths.unwrap_or([8.0; 128]);
+                    let mut widest = 0.0f32;
+                    for line_no in 0..ed.len_lines() {
+                        let text = ed.line_text(line_no);
+                        let w: f32 = text
+                            .bytes()
+                            .map(|b| if b < 128 { lut[b as usize] } else { 8.5 })
+                            .sum();
+                        if w > widest {
+                            widest = w;
+                        }
+                    }
+                    self.cached_max_line_w = widest + 40.0;
+                    self.cached_max_line_key = max_key;
+                }
+                self.scroll_x_content_w = self.cached_max_line_w;
+            } else {
+                self.scroll_x_content_w = 0.0;
+            }
+        } else {
+            self.scroll_x_content_w = 0.0;
+            self.scroll_x = 0.0;
+        }
+        let active_ed = active_text_tab_id.and_then(|id| {
+            self.editors.entry(id).or_insert_with(EditorState::new);
+            self.editors.get(&id)
+        });
+        let can_undo = active_ed.is_some_and(|ed| ed.can_undo());
+        let can_redo = active_ed.is_some_and(|ed| ed.can_redo());
+        self.scroll_content_rows = match (&wrap_cache, active_ed) {
+            (Some(wrap), _) => wrap.rows.len(),
+            (None, Some(ed)) => ed.len_lines(),
+            (None, None) => 0,
+        };
         let sidebar_width = self.left_width * self.left_sidebar_progress;
         let sidebar_dock = self.visible_left.map(|kind| DockView {
             root: root.clone(),
@@ -3366,8 +4338,24 @@ impl Render for RootView {
             .font_weight(FontWeight::NORMAL)
             .bg(rgba(t.bg_primary))
             .text_color(rgba(t.text_primary))
-            // Clear canvas drags even when the button is released over a
-            // dock, bar, or another child that is not the image surface.
+            // Track drags across the entire window (including over the top and
+            // bottom bars) so scrollbar/split/sidebar drags never stall until
+            // the left button is actually released.
+            .on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, window, cx| {
+                this.drag_to(ev.position.x.as_f32(), cx);
+                this.drag_md_split_to(
+                    ev.position.x.as_f32(),
+                    window.viewport_size().width.as_f32(),
+                    cx,
+                );
+                this.scroll_x_drag_to(ev.position.x.as_f32(), cx);
+                let thumb_h = this.scrollbar_thumb_height(window);
+                let view_h = Self::viewport_h(window);
+                this.scroll_drag_to(ev.position.y.as_f32(), view_h, view_h, thumb_h, cx);
+            }))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| {
+                this.end_drag(cx);
+            }))
             .on_mouse_up(MouseButton::Right, cx.listener(|this, _, _, cx| {
                 this.image_drag = None;
                 cx.notify();
@@ -3388,17 +4376,11 @@ impl Render for RootView {
                     .min_h(px(0.))
                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                         this.close_menu(cx);
-                        this.ink_popup = None;
-                        this.ink_slider_dragging = false;
-                    }))
-                    .on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, window, cx| {
-                        this.drag_to(ev.position.x.as_f32(), cx);
-                        let thumb_h = this.scrollbar_thumb_height(window);
-                        let view_h = Self::viewport_h(window);
-                        this.scroll_drag_to(ev.position.y.as_f32(), view_h, view_h, thumb_h, cx);
-                    }))
-                    .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| {
-                        this.end_drag(cx);
+                        this.set_ink_popup(None, cx);
+                        if this.md_heading_dropdown_open {
+                            this.md_heading_dropdown_open = false;
+                            cx.notify();
+                        }
                     }))
                     .child(
                         div()
@@ -3410,7 +4392,7 @@ impl Render for RootView {
                             .child(Toolbar { root: root.clone() })
                             .child(self.render_preview(
                                 root.clone(),
-                                snapshot,
+                                wrap_cache,
                                 self.focus.clone(),
                                 &geo,
                                 window,
@@ -3529,90 +4511,272 @@ impl Render for RootView {
             .when(self.settings_open, |d| {
                 let shell = root.clone();
                 let shell_click = shell.clone();
+                let shell_close = shell.clone();
+                let shell_light = shell.clone();
+                let shell_dark = shell.clone();
                 let wrap_text = self.wrap_text_files;
                 let wrap_code = self.wrap_code_files;
                 let line_numbers = self.line_numbers;
                 let syntax_highlighting = self.syntax_highlighting;
+                let is_dark = crate::theme::mode(cx) == ThemeMode::Dark;
                 let tab = self.settings_tab;
+                let section_title = if tab == 0 { "General" } else { "Formatting" };
                 d.child(
-                    div()
-                        .absolute()
-                        .top(px(0.))
-                        .bottom(px(0.))
-                        .left(px(0.))
-                        .right(px(0.))
-                        .bg(rgba(0x00000066))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                            let _ = shell_click.update(cx, |root, cx| {
-                                root.settings_open = false;
-                                cx.notify();
-                            });
-                        })
-                        .child(
-                            div()
-                                .w(px(640.))
-                                .h(px(420.))
-                                .rounded(px(12.))
-                                .bg(rgba(t.bg_primary))
-                                .border_1()
-                                .border_color(rgba(t.chrome_border_color))
-                                .flex()
-                                .flex_row()
-                                .overflow_hidden()
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .child(
-                                    div()
-                                        .w(px(160.))
-                                        .h_full()
-                                        .bg(rgba(t.bg_secondary))
-                                        .border_r_1()
-                                        .border_color(rgba(t.chrome_border_color))
-                                        .flex()
-                                        .flex_col()
-                                        .p(px(8.))
-                                        .gap(px(4.))
-                                        .child(settings_tab_button(t, shell.clone(), 0, "General", tab == 0))
-                                        .child(settings_tab_button(t, shell.clone(), 1, "Formatting", tab == 1)),
-                                )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .h_full()
-                                        .p(px(16.))
-                                        .flex()
-                                        .flex_col()
-                                        .gap(px(12.))
-                                        .when(tab == 0, |c| {
-                                            c.child(div().text_lg().child("General"))
-                                                .child(div().child("Theme and general options."))
-                                        })
-                                        .when(tab == 1, |c| {
-                                            c.child(div().text_lg().child("Formatting"))
-                                                .child(settings_toggle(t, shell.clone(), "Wrap text files", wrap_text, "wrap_text"))
-                                                .child(settings_toggle(t, shell.clone(), "Wrap code files", wrap_code, "wrap_code"))
-                                                .child(settings_toggle(t, shell.clone(), "Line numbers", line_numbers, "line_numbers"))
-                                                .child(settings_toggle(t, shell.clone(), "Syntax highlighting", syntax_highlighting, "syntax_highlighting"))
-                                        }),
-                                ),
-                        ),
+                    deferred(
+                        div()
+                            .absolute()
+                            .top(px(0.))
+                            .bottom(px(0.))
+                            .left(px(0.))
+                            .right(px(0.))
+                            .bg(rgba(0x00000055))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                let _ = shell_click.update(cx, |root, cx| {
+                                    root.settings_open = false;
+                                    cx.notify();
+                                });
+                            })
+                            .child(
+                                div()
+                                    .w(px(620.))
+                                    .h(px(410.))
+                                    .rounded(px(12.))
+                                    .bg(rgba(t.bg_primary))
+                                    .border_1()
+                                    .border_color(rgba(t.component_border_color))
+                                    .shadow(vec![t.shadow_lg()])
+                                    .flex()
+                                    .flex_row()
+                                    .overflow_hidden()
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                    .child(
+                                        div()
+                                            .w(px(168.))
+                                            .h_full()
+                                            .bg(rgba(t.bg_secondary))
+                                            .border_r_1()
+                                            .border_color(rgba(t.chrome_border_color))
+                                            .flex()
+                                            .flex_col()
+                                            .p(px(12.))
+                                            .gap(px(4.))
+                                            .child(
+                                                div()
+                                                    .px(px(8.))
+                                                    .pb(px(6.))
+                                                    .text_xs()
+                                                    .font_weight(WEIGHT_MEDIUM)
+                                                    .text_color(rgba(t.empty_text_secondary))
+                                                    .child("Settings"),
+                                            )
+                                            .child(settings_tab_button(t, shell.clone(), 0, "General", tab == 0))
+                                            .child(settings_tab_button(t, shell.clone(), 1, "Formatting", tab == 1)),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .h_full()
+                                            .flex()
+                                            .flex_col()
+                                            .child(
+                                                div()
+                                                    .px(px(20.))
+                                                    .py(px(14.))
+                                                    .border_b_1()
+                                                    .border_color(rgba(t.chrome_border_color))
+                                                    .flex()
+                                                    .flex_row()
+                                                    .items_center()
+                                                    .justify_between()
+                                                    .child(
+                                                        div()
+                                                            .text_base()
+                                                            .font_weight(FontWeight::SEMIBOLD)
+                                                            .text_color(rgba(t.text_primary))
+                                                            .child(section_title),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .id("settings-close")
+                                                            .w(px(24.))
+                                                            .h(px(24.))
+                                                            .rounded(px(6.))
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_center()
+                                                            .cursor_pointer()
+                                                            .text_sm()
+                                                            .text_color(rgba(t.text_secondary))
+                                                            .hover(|s| s.bg(rgba(t.bg_darker)).text_color(rgba(t.text_primary)))
+                                                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                                                let _ = shell_close.update(cx, |root, cx| {
+                                                                    root.settings_open = false;
+                                                                    cx.notify();
+                                                                });
+                                                            })
+                                                            .child("✕"),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .px(px(20.))
+                                                    .py(px(14.))
+                                                    .flex()
+                                                    .flex_col()
+                                                    .when(tab == 0, |c| {
+                                                        c.child(
+                                                            div()
+                                                                .py(px(10.))
+                                                                .flex()
+                                                                .flex_row()
+                                                                .items_center()
+                                                                .justify_between()
+                                                                .gap(px(16.))
+                                                                .child(
+                                                                    div()
+                                                                        .flex()
+                                                                        .flex_col()
+                                                                        .gap(px(2.))
+                                                                        .child(
+                                                                            div()
+                                                                                .text_sm()
+                                                                                .font_weight(WEIGHT_MEDIUM)
+                                                                                .text_color(rgba(t.text_primary))
+                                                                                .child("Appearance"),
+                                                                        )
+                                                                        .child(
+                                                                            div()
+                                                                                .text_xs()
+                                                                                .text_color(rgba(t.text_secondary))
+                                                                                .child("Switch between Paper Light and Paper Dark."),
+                                                                        ),
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .p(px(2.))
+                                                                        .rounded(px(8.))
+                                                                        .bg(rgba(t.bg_secondary))
+                                                                        .border_1()
+                                                                        .border_color(rgba(t.border_color))
+                                                                        .flex()
+                                                                        .flex_row()
+                                                                        .gap(px(2.))
+                                                                        .child(
+                                                                            div()
+                                                                                .id("settings-theme-light")
+                                                                                .px(px(12.))
+                                                                                .py(px(4.))
+                                                                                .rounded(px(6.))
+                                                                                .cursor_pointer()
+                                                                                .text_xs()
+                                                                                .font_weight(WEIGHT_MEDIUM)
+                                                                                .bg(rgba(if !is_dark { t.bg_primary } else { 0x00000000 }))
+                                                                                .text_color(rgba(if !is_dark { t.text_primary } else { t.text_secondary }))
+                                                                                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                                                                    crate::theme::state::set_mode(ThemeMode::Light, cx);
+                                                                                    let _ = shell_light.update(cx, |root, cx| {
+                                                                                        root.store.set("theme", "light");
+                                                                                        cx.notify();
+                                                                                    });
+                                                                                })
+                                                                                .child("Light"),
+                                                                        )
+                                                                        .child(
+                                                                            div()
+                                                                                .id("settings-theme-dark")
+                                                                                .px(px(12.))
+                                                                                .py(px(4.))
+                                                                                .rounded(px(6.))
+                                                                                .cursor_pointer()
+                                                                                .text_xs()
+                                                                                .font_weight(WEIGHT_MEDIUM)
+                                                                                .bg(rgba(if is_dark { t.bg_primary } else { 0x00000000 }))
+                                                                                .text_color(rgba(if is_dark { t.text_primary } else { t.text_secondary }))
+                                                                                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                                                                    crate::theme::state::set_mode(ThemeMode::Dark, cx);
+                                                                                    let _ = shell_dark.update(cx, |root, cx| {
+                                                                                        root.store.set("theme", "dark");
+                                                                                        cx.notify();
+                                                                                    });
+                                                                                })
+                                                                                .child("Dark"),
+                                                                        ),
+                                                                ),
+                                                        )
+                                                    })
+                                                    .when(tab == 1, |c| {
+                                                        c.child(settings_toggle(
+                                                            t,
+                                                            shell.clone(),
+                                                            "Wrap text files",
+                                                            "Wrap long lines in plain text and Markdown documents.",
+                                                            wrap_text,
+                                                            "wrap_text",
+                                                            true,
+                                                        ))
+                                                        .child(settings_toggle(
+                                                            t,
+                                                            shell.clone(),
+                                                            "Wrap code files",
+                                                            "Wrap long lines in source code instead of scrolling horizontally.",
+                                                            wrap_code,
+                                                            "wrap_code",
+                                                            true,
+                                                        ))
+                                                        .child(settings_toggle(
+                                                            t,
+                                                            shell.clone(),
+                                                            "Line numbers",
+                                                            "Show the line number gutter beside source code.",
+                                                            line_numbers,
+                                                            "line_numbers",
+                                                            true,
+                                                        ))
+                                                        .child(settings_toggle(
+                                                            t,
+                                                            shell.clone(),
+                                                            "Syntax highlighting",
+                                                            "Colorize keywords, strings, and comments in code files.",
+                                                            syntax_highlighting,
+                                                            "syntax_highlighting",
+                                                            false,
+                                                        ))
+                                                    }),
+                                            ),
+                                    ),
+                            ),
+                    )
+                    .with_priority(10000),
                 )
             })
     }
 }
 
-fn settings_tab_button(t: crate::theme::Theme, shell: gpui::WeakEntity<crate::shell::root::RootView>, index: usize, label: &'static str, active: bool) -> gpui::AnyElement {
+fn settings_tab_button(
+    t: crate::theme::Theme,
+    shell: gpui::WeakEntity<crate::shell::root::RootView>,
+    index: usize,
+    label: &'static str,
+    active: bool,
+) -> gpui::AnyElement {
     use gpui::prelude::*;
     div()
         .id(format!("settings-tab-{}", index))
         .w_full()
-        .px(gpui::px(8.))
+        .px(gpui::px(10.))
         .py(gpui::px(6.))
-        .rounded(gpui::px(6.))
+        .rounded(gpui::px(7.))
         .cursor_pointer()
-        .bg(gpui::rgba(if active { t.bg_tertiary } else { t.bg_secondary }))
+        .text_sm()
+        .font_weight(if active { WEIGHT_MEDIUM } else { FontWeight::NORMAL })
+        .text_color(gpui::rgba(if active { t.text_primary } else { t.text_secondary }))
+        .border_1()
+        .border_color(gpui::rgba(if active { t.border_color } else { 0x00000000 }))
+        .bg(gpui::rgba(if active { t.bg_darker } else { 0x00000000 }))
         .hover(|s| s.bg(gpui::rgba(t.menu_hover_bg)))
         .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
             let _ = shell.update(cx, |root, cx| {
@@ -3624,38 +4788,217 @@ fn settings_tab_button(t: crate::theme::Theme, shell: gpui::WeakEntity<crate::sh
         .into_any_element()
 }
 
-fn settings_toggle(t: crate::theme::Theme, shell: gpui::WeakEntity<crate::shell::root::RootView>, label: &'static str, value: bool, kind: &'static str) -> gpui::AnyElement {
+fn settings_toggle(
+    t: crate::theme::Theme,
+    shell: gpui::WeakEntity<crate::shell::root::RootView>,
+    label: &'static str,
+    description: &'static str,
+    value: bool,
+    kind: &'static str,
+    divider: bool,
+) -> gpui::AnyElement {
     use gpui::prelude::*;
     let shell2 = shell.clone();
-    div()
+    let mut row = div()
+        .w_full()
+        .py(gpui::px(12.))
         .flex()
         .flex_row()
         .items_center()
         .justify_between()
-        .w_full()
-        .child(div().child(label))
-        .child(
-            div()
-                .id(format!("settings-toggle-{}", label))
-                .px(gpui::px(10.))
-                .py(gpui::px(4.))
-                .rounded(gpui::px(6.))
-                .cursor_pointer()
-                .bg(gpui::rgba(if value { t.menu_hover_bg } else { t.bg_tertiary }))
-                .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
-                    let _ = shell2.update(cx, |root, cx| {
-                        match kind {
-                            "wrap_text" => root.set_wrap_text_files(!value, cx),
-                            "wrap_code" => root.set_wrap_code_files(!value, cx),
-                            "line_numbers" => root.set_line_numbers(!value, cx),
-                            "syntax_highlighting" => root.set_syntax_highlighting(!value, cx),
-                            _ => {}
-                        }
-                    });
-                })
-                .child(if value { "On" } else { "Off" }),
-        )
-        .into_any_element()
+        .gap(gpui::px(16.));
+    if divider {
+        row = row.border_b_1().border_color(gpui::rgba(t.border_color));
+    }
+    row.child(
+        div()
+            .flex()
+            .flex_col()
+            .gap(gpui::px(2.))
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(WEIGHT_MEDIUM)
+                    .text_color(gpui::rgba(t.text_primary))
+                    .child(label),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(gpui::rgba(t.text_secondary))
+                    .child(description),
+            ),
+    )
+    .child(
+        div()
+            .id(format!("settings-toggle-{}", label))
+            .relative()
+            .flex_shrink_0()
+            .w(gpui::px(36.))
+            .h(gpui::px(20.))
+            .rounded(gpui::px(10.))
+            .cursor_pointer()
+            .border_1()
+            .border_color(gpui::rgba(if value {
+                t.accent
+            } else {
+                t.component_border_color
+            }))
+            .bg(gpui::rgba(if value { t.accent } else { t.bg_darker }))
+            .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
+                let _ = shell2.update(cx, |root, cx| match kind {
+                    "wrap_text" => root.set_wrap_text_files(!value, cx),
+                    "wrap_code" => root.set_wrap_code_files(!value, cx),
+                    "line_numbers" => root.set_line_numbers(!value, cx),
+                    "syntax_highlighting" => root.set_syntax_highlighting(!value, cx),
+                    _ => {}
+                });
+            })
+            .child(
+                div()
+                    .absolute()
+                    .top(gpui::px(2.))
+                    .left(gpui::px(if value { 18.0 } else { 2.0 }))
+                    .w(gpui::px(14.))
+                    .h(gpui::px(14.))
+                    .rounded(gpui::px(7.))
+                    .bg(gpui::rgba(if value { 0xffffffff } else { t.text_secondary })),
+            ),
+    )
+    .into_any_element()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ListEnterAction {
+    Insert(String),
+    ClearLine { start: usize, end: usize },
+}
+
+/// Compute what Enter should do on a list line:
+/// - If the line has text after the bullet/number/checkbox, continue the list.
+/// - If the line has only the bullet/number/checkbox with no text, clear it.
+fn list_enter_action(ed: &EditorState) -> ListEnterAction {
+    let (line_no, col) = ed.cursor_line_col();
+    if line_no >= ed.len_lines() {
+        return ListEnterAction::Insert("\n".to_string());
+    }
+    let line = ed.line_text(line_no);
+    let leading_ws = line.len() - line.trim_start().len();
+    let ws = &line[..leading_ws];
+    let trimmed = &line[leading_ws..];
+    let ws_chars = ws.chars().count();
+
+    // Unordered / task list (`- `, `* `, `+ `).
+    if trimmed.len() >= 2
+        && matches!(trimmed.as_bytes()[0], b'-' | b'*' | b'+')
+        && trimmed.as_bytes()[1] == b' '
+    {
+        let marker = trimmed.as_bytes()[0] as char;
+        let after = &trimmed[2..];
+        let is_task = after.starts_with("[ ] ")
+            || after.starts_with("[x] ")
+            || after.starts_with("[X] ");
+        let prefix_bytes = if is_task { 6 } else { 2 };
+        let prefix_chars = ws_chars + prefix_bytes;
+        if col >= prefix_chars {
+            if trimmed[prefix_bytes..].trim().is_empty() {
+                let start = ed.line_start_char(line_no);
+                let end = start + ed.line_char_len(line_no);
+                return ListEnterAction::ClearLine { start, end };
+            }
+            return ListEnterAction::Insert(if is_task {
+                format!("\n{ws}{marker} [ ] ")
+            } else {
+                format!("\n{ws}{marker} ")
+            });
+        }
+    }
+
+    // Ordered list (`1. ` or `1) `).
+    let digits = trimmed.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if digits > 0
+        && digits + 1 < trimmed.len()
+        && matches!(trimmed.as_bytes()[digits], b'.' | b')')
+        && trimmed.as_bytes()[digits + 1] == b' '
+    {
+        let prefix_bytes = digits + 2;
+        let prefix_chars = ws_chars + prefix_bytes;
+        if col >= prefix_chars {
+            if trimmed[prefix_bytes..].trim().is_empty() {
+                let start = ed.line_start_char(line_no);
+                let end = start + ed.line_char_len(line_no);
+                return ListEnterAction::ClearLine { start, end };
+            }
+            if let Ok(num) = trimmed[..digits].parse::<usize>() {
+                let delim = trimmed.as_bytes()[digits] as char;
+                return ListEnterAction::Insert(format!("\n{ws}{}{delim} ", num + 1));
+            }
+        }
+    }
+
+    ListEnterAction::Insert("\n".to_string())
+}
+
+/// Compute whether a visual row is the first/last row of a contiguous
+/// multi-line blockquote so its left bar renders as one continuous line.
+fn quote_pos_for_row(
+    ed: &EditorState,
+    line_no: usize,
+    is_first_wrap_row: bool,
+    is_last_wrap_row: bool,
+) -> markdown::QuotePos {
+    let prev_is_quote = line_no > 0 && markdown::is_quote_line(&ed.line_text(line_no - 1));
+    let next_is_quote =
+        line_no + 1 < ed.len_lines() && markdown::is_quote_line(&ed.line_text(line_no + 1));
+    markdown::QuotePos {
+        is_first: is_first_wrap_row && !prev_is_quote,
+        is_last: is_last_wrap_row && !next_is_quote,
+    }
+}
+
+/// Determine whether `line_no` is part of a Markdown table (header, separator,
+/// or body row).
+fn table_row_kind(ed: &EditorState, line_no: usize) -> markdown::TableRowKind {
+    let total = ed.len_lines();
+    if line_no >= total {
+        return markdown::TableRowKind::None;
+    }
+    let line = ed.line_text(line_no);
+    if markdown::is_table_separator(&line) {
+        if line_no > 0 && markdown::parse_table_cells(&ed.line_text(line_no - 1)).is_some() {
+            return markdown::TableRowKind::Separator;
+        }
+        return markdown::TableRowKind::None;
+    }
+    if markdown::parse_table_cells(&line).is_none() {
+        return markdown::TableRowKind::None;
+    }
+    if line_no + 1 < total && markdown::is_table_separator(&ed.line_text(line_no + 1)) {
+        return markdown::TableRowKind::Header;
+    }
+    // Walk up over contiguous table rows to confirm a separator + header above.
+    let mut up = line_no;
+    while up > 0 {
+        up -= 1;
+        let prev = ed.line_text(up);
+        if markdown::is_table_separator(&prev) {
+            if up > 0 && markdown::parse_table_cells(&ed.line_text(up - 1)).is_some() {
+                let next_is_body = line_no + 1 < total && {
+                    let next = ed.line_text(line_no + 1);
+                    markdown::parse_table_cells(&next).is_some()
+                        && !markdown::is_table_separator(&next)
+                };
+                return markdown::TableRowKind::Body {
+                    is_last: !next_is_body,
+                };
+            }
+            return markdown::TableRowKind::None;
+        }
+        if markdown::parse_table_cells(&prev).is_none() {
+            return markdown::TableRowKind::None;
+        }
+    }
+    markdown::TableRowKind::None
 }
 
 fn is_code_path(path: &str) -> bool {
@@ -3719,16 +5062,164 @@ impl Drop for RootView {
 use std::sync::OnceLock;
 
 static SYNTAX_SET: OnceLock<syntect::parsing::SyntaxSet> = OnceLock::new();
-static THEME_SET: OnceLock<syntect::highlighting::ThemeSet> = OnceLock::new();
+static PAPER_LIGHT_THEME: OnceLock<syntect::highlighting::Theme> = OnceLock::new();
+static PAPER_DARK_THEME: OnceLock<syntect::highlighting::Theme> = OnceLock::new();
 
-fn highlight_line_spans(text: &str, ext: &str) -> Vec<(u32, usize, usize)> {
+fn syntect_rgb(hex: u32) -> syntect::highlighting::Color {
+    syntect::highlighting::Color {
+        r: ((hex >> 16) & 0xff) as u8,
+        g: ((hex >> 8) & 0xff) as u8,
+        b: (hex & 0xff) as u8,
+        a: 0xff,
+    }
+}
+
+fn paper_scope(selector: &str, hex: u32) -> syntect::highlighting::ThemeItem {
+    use std::str::FromStr;
+    syntect::highlighting::ThemeItem {
+        scope: syntect::highlighting::ScopeSelectors::from_str(selector)
+            .expect("valid syntect scope selector"),
+        style: syntect::highlighting::StyleModifier {
+            foreground: Some(syntect_rgb(hex)),
+            background: None,
+            font_style: None,
+        },
+    }
+}
+
+/// Build the Paper Light or Paper Dark syntax theme matching the Zed "Paper"
+/// theme palette.
+fn build_paper_syntax_theme(is_dark: bool) -> syntect::highlighting::Theme {
+    let (
+        fg,
+        comment,
+        comment_doc,
+        keyword,
+        operator,
+        function,
+        type_color,
+        string_color,
+        string_escape,
+        number,
+        boolean,
+        constant,
+        property,
+        variable,
+        param,
+        var_special,
+        punctuation,
+        bracket,
+        delimiter,
+        selector,
+        title,
+        diff_plus,
+        diff_minus,
+    ) = if is_dark {
+        (
+            0xd2d2ce, // primary / variable
+            0x777772, // comment
+            0x858580, // comment.doc
+            0x7897ca, // keyword / attribute / tag / label / constructor
+            0x92928c, // operator
+            0xa487bd, // function / preproc
+            0x89a7d8, // type / enum
+            0xc5a35a, // string / string.regex / string.special
+            0xad9b78, // string.escape
+            0xc09a52, // number
+            0xb99958, // boolean
+            0xc1a15a, // constant
+            0xa08da9, // property
+            0xd2d2ce, // variable
+            0xb8b8b2, // variable.parameter
+            0xc09a52, // variable.special
+            0x9a9a94, // punctuation
+            0xaaa9a3, // punctuation.bracket
+            0x858580, // punctuation.delimiter
+            0x819b76, // selector / text.literal
+            0xa08da9, // title
+            0x819b76, // diff.plus
+            0xc17b75, // diff.minus
+        )
+    } else {
+        (
+            0x30302f, // primary / variable
+            0xa1a19e, // comment
+            0x969693, // comment.doc
+            0x5477b8, // keyword / attribute / tag / label / constructor
+            0x6d6d6a, // operator
+            0x845cad, // function / preproc
+            0x5f83bd, // type / enum
+            0xb98922, // string / string.regex / string.special
+            0x9a8760, // string.escape
+            0xa77b2c, // number
+            0xb28a43, // boolean
+            0xb98a32, // constant
+            0x7d6b89, // property
+            0x30302f, // variable
+            0x4d4d4a, // variable.parameter
+            0xa77b2c, // variable.special
+            0x5f5f5c, // punctuation
+            0x777774, // punctuation.bracket
+            0x858582, // punctuation.delimiter
+            0x718d67, // selector / text.literal
+            0x7d6b89, // title
+            0x718d67, // diff.plus
+            0xb96f69, // diff.minus
+        )
+    };
+
+    syntect::highlighting::Theme {
+        name: Some(if is_dark { "Paper Dark" } else { "Paper Light" }.to_string()),
+        author: Some("Declan".to_string()),
+        settings: syntect::highlighting::ThemeSettings {
+            foreground: Some(syntect_rgb(fg)),
+            ..Default::default()
+        },
+        scopes: vec![
+            paper_scope("comment", comment),
+            paper_scope("comment.block.documentation, comment.line.documentation", comment_doc),
+            paper_scope("keyword, storage.type, storage.modifier", keyword),
+            paper_scope("keyword.operator", operator),
+            paper_scope("entity.name.function, support.function, meta.function-call, variable.function", function),
+            paper_scope("meta.preprocessor, support.macro, entity.name.function.macro", function),
+            paper_scope("entity.name.type, entity.name.class, entity.name.struct, entity.name.enum, entity.name.trait, entity.name.interface, support.type, support.class", type_color),
+            paper_scope("entity.name.tag, entity.other.attribute-name, meta.annotation, entity.name.label", keyword),
+            paper_scope("string", string_color),
+            paper_scope("constant.character.escape", string_escape),
+            paper_scope("constant.numeric", number),
+            paper_scope("constant.language.boolean", boolean),
+            paper_scope("constant.language, constant.other, variable.other.constant", constant),
+            paper_scope("variable.other.member, variable.other.property, meta.property-name, support.type.property-name", property),
+            paper_scope("variable", variable),
+            paper_scope("variable.parameter", param),
+            paper_scope("variable.language", var_special),
+            paper_scope("punctuation", punctuation),
+            paper_scope("punctuation.section, punctuation.definition.block, punctuation.definition.parameters, punctuation.definition.group, meta.brace", bracket),
+            paper_scope("punctuation.separator, punctuation.terminator, punctuation.accessor", delimiter),
+            paper_scope("entity.other.attribute-name.class.css, entity.other.attribute-name.id.css, markup.inline.raw", selector),
+            paper_scope("markup.heading, entity.name.section", title),
+            paper_scope("markup.inserted", diff_plus),
+            paper_scope("markup.deleted", diff_minus),
+        ],
+    }
+}
+
+fn highlight_line_spans(
+    text: &str,
+    ext: &str,
+    is_dark: bool,
+    default_color: u32,
+) -> Vec<(u32, usize, usize)> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     use std::sync::Mutex;
+    const MAX_ENTRIES: usize = 8192;
     static CACHE: OnceLock<Mutex<std::collections::HashMap<u64, Vec<(u32, usize, usize)>>>> = OnceLock::new();
     let mut hasher = DefaultHasher::new();
     text.hash(&mut hasher);
     ext.hash(&mut hasher);
+    is_dark.hash(&mut hasher);
+    default_color.hash(&mut hasher);
     let key = hasher.finish();
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     if let Ok(guard) = cache.lock() {
@@ -3737,28 +5228,45 @@ fn highlight_line_spans(text: &str, ext: &str) -> Vec<(u32, usize, usize)> {
         }
     }
     let ss = SYNTAX_SET.get_or_init(syntect::parsing::SyntaxSet::load_defaults_newlines);
-    let ts = THEME_SET.get_or_init(syntect::highlighting::ThemeSet::load_defaults);
+    let theme = if is_dark {
+        PAPER_DARK_THEME.get_or_init(|| build_paper_syntax_theme(true))
+    } else {
+        PAPER_LIGHT_THEME.get_or_init(|| build_paper_syntax_theme(false))
+    };
     let syntax = ss
         .find_syntax_by_extension(ext)
         .unwrap_or_else(|| ss.find_syntax_plain_text());
-    let theme = ts.themes.get("base16-ocean-dark").or_else(|| ts.themes.values().next()).unwrap();
+    let theme_default = theme.settings.foreground;
     let mut h = syntect::easy::HighlightLines::new(syntax, theme);
     let Ok(ranges) = h.highlight_line(text, ss) else {
-        return vec![(0xffffff, 0, text.len())];
+        return vec![(default_color, 0, text.len())];
     };
     let mut out = Vec::new();
     let mut pos = 0;
     for (style, s) in ranges {
         let len = s.len();
         let c = style.foreground;
-        let color = ((c.r as u32) << 24) | ((c.g as u32) << 16) | ((c.b as u32) << 8) | if c.a == 0 { 0xff } else { c.a as u32 };
+        let color = if theme_default == Some(c) {
+            default_color
+        } else {
+            ((c.r as u32) << 24)
+                | ((c.g as u32) << 16)
+                | ((c.b as u32) << 8)
+                | if c.a == 0 { 0xff } else { c.a as u32 }
+        };
         out.push((color, pos, pos + len));
         pos += len;
     }
     if out.is_empty() {
-        out.push((0xffffff, 0, text.len()));
+        out.push((default_color, 0, text.len()));
     }
     if let Ok(mut guard) = cache.lock() {
+        if guard.len() >= MAX_ENTRIES {
+            // This is a reuse cache, not document state. Bound it so opening
+            // a large or varied workspace cannot retain highlight spans for
+            // every line ever viewed.
+            guard.clear();
+        }
         guard.insert(key, out.clone());
     }
     out
@@ -3778,31 +5286,67 @@ fn stroke_path(stroke: &InkStroke, off_x: f32, off_y: f32) -> Option<tiny_skia::
     pb.finish()
 }
 
-/// Rasterize the highlighter strokes into a coverage mask.
+/// Rasterize a same-colour group of highlighter strokes into a tight
+/// bounding-box coverage mask and blend it onto `canvas`.
 ///
-/// Each stroke is drawn with the lighten blend so that where strokes
-/// overlap the coverage is the strongest one rather than the sum, which is
-/// what keeps the highlighter from doubling up its opacity.
-fn build_highlight_mask(
+/// Each stroke is drawn with the lighten blend so overlapping strokes keep a
+/// single layer of opacity instead of stacking, and only the bounding box of
+/// the group is allocated and scanned.
+fn blend_highlighter_group(
+    canvas: &mut tiny_skia::Pixmap,
     strokes: &[&InkStroke],
+    color: u32,
     off_x: f32,
     off_y: f32,
-    width: u32,
-    height: u32,
-) -> Option<Vec<u8>> {
-    let mut mask = tiny_skia::Pixmap::new(width, height)?;
+) {
+    let canvas_w = canvas.width();
+    let canvas_h = canvas.height();
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for stroke in strokes {
+        let pad = stroke.width + 2.0;
+        for &(px, py) in &stroke.points {
+            let x = px + off_x;
+            let y = py + off_y;
+            min_x = min_x.min(x - pad);
+            min_y = min_y.min(y - pad);
+            max_x = max_x.max(x + pad);
+            max_y = max_y.max(y + pad);
+        }
+    }
+    if !min_x.is_finite() {
+        return;
+    }
+    let bx0 = (min_x.floor() as i64).clamp(0, canvas_w as i64) as u32;
+    let by0 = (min_y.floor() as i64).clamp(0, canvas_h as i64) as u32;
+    let bx1 = (max_x.ceil() as i64).clamp(0, canvas_w as i64) as u32;
+    let by1 = (max_y.ceil() as i64).clamp(0, canvas_h as i64) as u32;
+    let bw = bx1.saturating_sub(bx0);
+    let bh = by1.saturating_sub(by0);
+    if bw == 0 || bh == 0 {
+        return;
+    }
+
+    let Some(mut mask) = tiny_skia::Pixmap::new(bw, bh) else {
+        return;
+    };
     let mut paint = tiny_skia::Paint::default();
     paint.anti_alias = true;
-    paint.set_color(tiny_skia::Color::from_rgba(1.0, 1.0, 1.0, 1.0).unwrap_or(tiny_skia::Color::WHITE));
+    paint.set_color(tiny_skia::Color::WHITE);
     paint.blend_mode = tiny_skia::BlendMode::Lighten;
+
+    let mask_off_x = off_x - bx0 as f32;
+    let mask_off_y = off_y - by0 as f32;
     for stroke in strokes {
-        let Some(path) = stroke_path(stroke, off_x, off_y) else {
+        let Some(path) = stroke_path(stroke, mask_off_x, mask_off_y) else {
             continue;
         };
         let mut style = tiny_skia::Stroke::default();
         style.width = stroke.width;
-        style.line_cap = tiny_skia::LineCap::Butt;
-        style.line_join = tiny_skia::LineJoin::Round;
+        style.line_cap = tiny_skia::LineCap::Square;
+        style.line_join = tiny_skia::LineJoin::Bevel;
         mask.stroke_path(
             &path,
             &paint,
@@ -3811,7 +5355,61 @@ fn build_highlight_mask(
             None,
         );
     }
-    Some(mask.pixels().iter().map(|p| p.alpha()).collect())
+
+    let hr = (color >> 16) & 0xff;
+    let hg = (color >> 8) & 0xff;
+    let hb = color & 0xff;
+    let mask_pixels = mask.pixels();
+    let dst_stride = canvas_w as usize * 4;
+    let bw_usize = bw as usize;
+    let data = canvas.data_mut();
+    for y in 0..bh as usize {
+        let mask_row = &mask_pixels[y * bw_usize..(y + 1) * bw_usize];
+        let dst_start = (by0 as usize + y) * dst_stride + bx0 as usize * 4;
+        let dst_row = &mut data[dst_start..dst_start + bw_usize * 4];
+        for (mp, p) in mask_row.iter().zip(dst_row.chunks_exact_mut(4)) {
+            let a = mp.alpha();
+            if a == 0 {
+                continue;
+            }
+            // 120 / 255 ≈ 0.47, matching the 0x78 alpha used in live preview.
+            let alpha = (a as u32 * 120 + 127) / 255;
+            let inv = 255 - alpha;
+            p[0] = ((hr * alpha + p[0] as u32 * inv + 127) / 255) as u8;
+            p[1] = ((hg * alpha + p[1] as u32 * inv + 127) / 255) as u8;
+            p[2] = ((hb * alpha + p[2] as u32 * inv + 127) / 255) as u8;
+            p[3] = (alpha + (p[3] as u32 * inv + 127) / 255).min(255) as u8;
+        }
+    }
+}
+
+/// Undo premultiplication in place on an RGBA8 buffer.
+fn unpremultiply_in_place(data: &mut [u8]) {
+    for px in data.chunks_exact_mut(4) {
+        let a = px[3];
+        if a == 255 || a == 0 {
+            continue;
+        }
+        let a16 = a as u16;
+        px[0] = ((px[0] as u16 * 255) / a16).min(255) as u8;
+        px[1] = ((px[1] as u16 * 255) / a16).min(255) as u8;
+        px[2] = ((px[2] as u16 * 255) / a16).min(255) as u8;
+    }
+}
+
+/// Map an `image::ImageFormat` to the `gpui::ImageFormat` used by the viewer.
+fn to_gpui_image_format(format: image::ImageFormat) -> Option<gpui::ImageFormat> {
+    match format {
+        image::ImageFormat::Png => Some(gpui::ImageFormat::Png),
+        image::ImageFormat::Jpeg => Some(gpui::ImageFormat::Jpeg),
+        image::ImageFormat::WebP => Some(gpui::ImageFormat::Webp),
+        image::ImageFormat::Gif => Some(gpui::ImageFormat::Gif),
+        image::ImageFormat::Bmp => Some(gpui::ImageFormat::Bmp),
+        image::ImageFormat::Tiff => Some(gpui::ImageFormat::Tiff),
+        image::ImageFormat::Ico => Some(gpui::ImageFormat::Ico),
+        image::ImageFormat::Pnm => Some(gpui::ImageFormat::Pnm),
+        _ => None,
+    }
 }
 
 /// The file name of a path, for messages.
@@ -3842,11 +5440,14 @@ fn format_has_alpha(format: image::ImageFormat) -> bool {
 ///
 /// The image is decoded with the orientation the preview shows, so the file
 /// that comes out looks the same as what the user was annotating, and it
-/// keeps the format it came in with.
-fn bake_annotated_image(path: &str, strokes: &[InkStroke]) -> Result<(), String> {
+/// keeps the format it came in with. Returns a ready-to-display `LoadedImage`
+/// when the saved dimensions fit within the viewer's edge budget so the UI
+/// doesn't have to re-read the file from disk.
+fn bake_annotated_image(path: &str, strokes: &[InkStroke]) -> Result<Option<LoadedImage>, String> {
+    const MAX_IMAGE_EDGE: u32 = 8192;
     let name = file_name_of(path);
 
-    let mut reader = image::ImageReader::open(path)
+    let reader = image::ImageReader::open(path)
         .map_err(|e| format!("Could not read {name}: {e}"))?
         .with_guessed_format()
         .map_err(|e| format!("Could not read {name}: {e}"))?;
@@ -3890,52 +5491,65 @@ fn bake_annotated_image(path: &str, strokes: &[InkStroke]) -> Result<(), String>
     if !has_alpha {
         // Without an alpha channel the area outside the picture would end up
         // black, so start from opaque white instead.
-        canvas.fill(
-            tiny_skia::Color::from_rgba(1.0, 1.0, 1.0, 1.0).unwrap_or(tiny_skia::Color::WHITE),
-        );
+        canvas.fill(tiny_skia::Color::WHITE);
     }
 
-    // Draw the source image into the canvas. The rows are copied straight
-    // across, which keeps this quick even for a twelve megapixel photo.
+    // Track whether every pixel in the canvas is guaranteed opaque so we can
+    // skip un-premultiplication and encode opaque PNGs as 3-channel RGB8.
+    let canvas_matches_source =
+        off_x == 0 && off_y == 0 && canvas_w == source.width() && canvas_h == source.height();
+    let mut all_opaque = !has_alpha;
+
+    // Draw the source image into the canvas. Slicing each scanline once lets
+    // LLVM auto-vectorize the row copy without per-pixel bounds checks.
     {
-        let src_stride = source.width() as usize;
+        let src_w = source.width() as usize;
+        let src_h = source.height() as usize;
         let data = canvas.data_mut();
         let dst_stride = canvas_w as usize * 4;
+        let ox = off_x as usize;
+        let oy = off_y as usize;
         match source.color() {
             image::ColorType::Rgb8 => {
+                if canvas_matches_source {
+                    all_opaque = true;
+                }
                 let src = source.as_bytes();
-                for y in 0..source.height() as usize {
-                    let row = &src[y * src_stride * 3..y * src_stride * 3 + src_stride * 3];
-                    let dst = (y as i64 + off_y) as usize * dst_stride + off_x as usize * 4;
-                    for x in 0..src_stride {
-                        let d = dst + x * 4;
-                        if d + 4 > data.len() {
-                            break;
-                        }
-                        data[d] = row[x * 3];
-                        data[d + 1] = row[x * 3 + 1];
-                        data[d + 2] = row[x * 3 + 2];
-                        data[d + 3] = 255;
+                for y in 0..src_h {
+                    let src_row = &src[y * src_w * 3..(y + 1) * src_w * 3];
+                    let dst_start = (y + oy) * dst_stride + ox * 4;
+                    let dst_row = &mut data[dst_start..dst_start + src_w * 4];
+                    for (s, d) in src_row.chunks_exact(3).zip(dst_row.chunks_exact_mut(4)) {
+                        d[0] = s[0];
+                        d[1] = s[1];
+                        d[2] = s[2];
+                        d[3] = 255;
                     }
                 }
             }
             image::ColorType::Rgba8 => {
                 let src = source.as_bytes();
-                for y in 0..source.height() as usize {
-                    let row = &src[y * src_stride * 4..y * src_stride * 4 + src_stride * 4];
-                    let dst = (y as i64 + off_y) as usize * dst_stride + off_x as usize * 4;
-                    for x in 0..src_stride {
-                        let d = dst + x * 4;
-                        if d + 4 > data.len() {
-                            break;
+                let mut src_all_opaque = canvas_matches_source;
+                for y in 0..src_h {
+                    let src_row = &src[y * src_w * 4..(y + 1) * src_w * 4];
+                    let dst_start = (y + oy) * dst_stride + ox * 4;
+                    let dst_row = &mut data[dst_start..dst_start + src_w * 4];
+                    if src_row.chunks_exact(4).all(|p| p[3] == 255) {
+                        dst_row.copy_from_slice(src_row);
+                    } else {
+                        src_all_opaque = false;
+                        for (s, d) in src_row.chunks_exact(4).zip(dst_row.chunks_exact_mut(4)) {
+                            let a = s[3] as u16;
+                            // The canvas stores premultiplied colour.
+                            d[0] = ((s[0] as u16 * a) / 255) as u8;
+                            d[1] = ((s[1] as u16 * a) / 255) as u8;
+                            d[2] = ((s[2] as u16 * a) / 255) as u8;
+                            d[3] = a as u8;
                         }
-                        let a = row[x * 4 + 3] as u16;
-                        // The canvas stores premultiplied colour.
-                        data[d] = ((row[x * 4] as u16 * a) / 255) as u8;
-                        data[d + 1] = ((row[x * 4 + 1] as u16 * a) / 255) as u8;
-                        data[d + 2] = ((row[x * 4 + 2] as u16 * a) / 255) as u8;
-                        data[d + 3] = a as u8;
                     }
+                }
+                if src_all_opaque {
+                    all_opaque = true;
                 }
             }
             _ => {
@@ -3943,23 +5557,27 @@ fn bake_annotated_image(path: &str, strokes: &[InkStroke]) -> Result<(), String>
                 let src = rgba.as_raw();
                 let stride = rgba.width() as usize * 4;
                 for y in 0..rgba.height() as usize {
-                    let row = &src[y * stride..y * stride + stride];
-                    let dst = (y as i64 + off_y) as usize * dst_stride + off_x as usize * 4;
-                    for x in 0..rgba.width() as usize {
-                        let d = dst + x * 4;
-                        if d + 4 > data.len() {
-                            break;
+                    let src_row = &src[y * stride..(y + 1) * stride];
+                    let dst_start = (y + oy) * dst_stride + ox * 4;
+                    let dst_row = &mut data[dst_start..dst_start + stride];
+                    if src_row.chunks_exact(4).all(|p| p[3] == 255) {
+                        dst_row.copy_from_slice(src_row);
+                    } else {
+                        for (s, d) in src_row.chunks_exact(4).zip(dst_row.chunks_exact_mut(4)) {
+                            let a = s[3] as u16;
+                            d[0] = ((s[0] as u16 * a) / 255) as u8;
+                            d[1] = ((s[1] as u16 * a) / 255) as u8;
+                            d[2] = ((s[2] as u16 * a) / 255) as u8;
+                            d[3] = a as u8;
                         }
-                        let a = row[x * 4 + 3] as u16;
-                        data[d] = ((row[x * 4] as u16 * a) / 255) as u8;
-                        data[d + 1] = ((row[x * 4 + 1] as u16 * a) / 255) as u8;
-                        data[d + 2] = ((row[x * 4 + 2] as u16 * a) / 255) as u8;
-                        data[d + 3] = a as u8;
                     }
                 }
             }
         }
     }
+
+    // Drop the decoded source buffer before encoding to keep peak memory low.
+    drop(source);
 
     // The pen is opaque, so it can be drawn straight onto the canvas.
     for stroke in strokes.iter().filter(|s| s.tool == ink::TOOL_PEN) {
@@ -3969,13 +5587,15 @@ fn bake_annotated_image(path: &str, strokes: &[InkStroke]) -> Result<(), String>
         let mut paint = tiny_skia::Paint::default();
         paint.anti_alias = true;
         let pen_color = stroke.color;
-        paint.set_color(tiny_skia::Color::from_rgba(
-            ((pen_color >> 16) & 0xff) as f32 / 255.0,
-            ((pen_color >> 8) & 0xff) as f32 / 255.0,
-            (pen_color & 0xff) as f32 / 255.0,
-            1.0,
-        )
-        .unwrap_or(tiny_skia::Color::BLACK));
+        paint.set_color(
+            tiny_skia::Color::from_rgba(
+                ((pen_color >> 16) & 0xff) as f32 / 255.0,
+                ((pen_color >> 8) & 0xff) as f32 / 255.0,
+                (pen_color & 0xff) as f32 / 255.0,
+                1.0,
+            )
+            .unwrap_or(tiny_skia::Color::BLACK),
+        );
         let mut style = tiny_skia::Stroke::default();
         style.width = stroke.width;
         style.line_cap = tiny_skia::LineCap::Round;
@@ -3989,11 +5609,8 @@ fn bake_annotated_image(path: &str, strokes: &[InkStroke]) -> Result<(), String>
         );
     }
 
-    // The highlighter is translucent, so the strokes are first merged into a
-    // coverage mask. Overlapping strokes then keep a single layer of colour
-    // instead of stacking their opacity.
-    // The highlighter strokes of one colour are merged into a single shape,
-    // so overlapping strokes keep a single layer of colour.
+    // The highlighter is translucent, so strokes of the same colour are merged
+    // in a tight bounding-box mask and blended once onto the canvas.
     let mut hl_groups: Vec<(u32, Vec<&InkStroke>)> = Vec::new();
     for stroke in strokes.iter().filter(|s| s.tool == ink::TOOL_HIGHLIGHTER) {
         match hl_groups.iter_mut().find(|(c, _)| *c == stroke.color) {
@@ -4002,62 +5619,14 @@ fn bake_annotated_image(path: &str, strokes: &[InkStroke]) -> Result<(), String>
         }
     }
     for (color, group) in hl_groups {
-        let Some(mask) =
-            build_highlight_mask(&group, off_x as f32, off_y as f32, canvas_w, canvas_h)
-        else {
-            continue;
-        };
-        let hl_color = color;
-        let data = canvas.data_mut();
-        for (i, p) in data.chunks_exact_mut(4).enumerate() {
-            let a = mask[i];
-            if a == 0 {
-                continue;
-            }
-            let alpha = a as f32 / 255.0 * 0.47;
-            let r = p[0] as f32;
-            let g = p[1] as f32;
-            let b = p[2] as f32;
-            let nr = ((hl_color >> 16) & 0xff) as f32 * alpha + r * (1.0 - alpha);
-            let ng = ((hl_color >> 8) & 0xff) as f32 * alpha + g * (1.0 - alpha);
-            let nb = (hl_color & 0xff) as f32 * alpha + b * (1.0 - alpha);
-            p[0] = nr.round() as u8;
-            p[1] = ng.round() as u8;
-            p[2] = nb.round() as u8;
-            p[3] = 255;
-        }
+        blend_highlighter_group(&mut canvas, &group, color, off_x as f32, off_y as f32);
     }
-
-    // Turn the canvas back into an image, undoing the premultiplication.
-    let mut bytes: Vec<u8> = Vec::with_capacity(canvas_w as usize * canvas_h as usize * 4);
-    {
-        let data = canvas.data();
-        let stride = canvas_w as usize * 4;
-        for row in data.chunks_exact(stride) {
-            let opaque = row.chunks_exact(4).all(|px| px[3] == 255);
-            if opaque {
-                // Premultiplied and straight colour are the same here.
-                bytes.extend_from_slice(row);
-            } else {
-                for px in row.chunks_exact(4) {
-                    let a = px[3];
-                    if a == 0 {
-                        bytes.extend_from_slice(&[0, 0, 0, 0]);
-                    } else {
-                        let un = |c: u8| (((c as u16 * 255) / a as u16).min(255)) as u8;
-                        bytes.extend_from_slice(&[un(px[0]), un(px[1]), un(px[2]), a]);
-                    }
-                }
-            }
-        }
-    }
-    let out = image::RgbaImage::from_raw(canvas_w, canvas_h, bytes)
-        .ok_or_else(|| format!("Could not build the picture data for {name}"))?;
-    let picture = image::DynamicImage::ImageRgba8(out);
 
     // Write it back in the format it came in with. The encoders are tuned for
-    // speed: a twelve megapixel photo should not take ten seconds to write.
-    let mut encoded: Vec<u8> = Vec::new();
+    // speed: PNG uses Fast compression with Sub filtering (avoiding the 5x
+    // per-row cost of Adaptive filtering), and opaque images skip
+    // un-premultiplication and encode 3-channel RGB8 directly.
+    let mut encoded: Vec<u8> = Vec::with_capacity((canvas_w as usize * canvas_h as usize) / 2);
     {
         let mut writer = std::io::Cursor::new(&mut encoded);
         match format {
@@ -4065,48 +5634,133 @@ fn bake_annotated_image(path: &str, strokes: &[InkStroke]) -> Result<(), String>
                 let encoder = image::codecs::png::PngEncoder::new_with_quality(
                     &mut writer,
                     image::codecs::png::CompressionType::Fast,
-                    image::codecs::png::FilterType::Adaptive,
+                    image::codecs::png::FilterType::Sub,
                 );
-                encoder
-                    .write_image(
-                        picture.as_bytes(),
-                        picture.width(),
-                        picture.height(),
-                        image::ExtendedColorType::Rgba8,
-                    )
-                    .map_err(|e| format!("Could not encode {name}: {e}"))?;
+                if all_opaque {
+                    let mut rgb: Vec<u8> =
+                        Vec::with_capacity(canvas_w as usize * canvas_h as usize * 3);
+                    for px in canvas.data().chunks_exact(4) {
+                        rgb.extend_from_slice(&px[0..3]);
+                    }
+                    encoder
+                        .write_image(&rgb, canvas_w, canvas_h, image::ExtendedColorType::Rgb8)
+                        .map_err(|e| format!("Could not encode {name}: {e}"))?;
+                } else {
+                    unpremultiply_in_place(canvas.data_mut());
+                    encoder
+                        .write_image(
+                            canvas.data(),
+                            canvas_w,
+                            canvas_h,
+                            image::ExtendedColorType::Rgba8,
+                        )
+                        .map_err(|e| format!("Could not encode {name}: {e}"))?;
+                }
             }
             image::ImageFormat::Jpeg => {
-                // The JPEG encoder only takes grey or RGB, so drop the alpha
-                // channel. The canvas was filled with opaque white, so every
-                // pixel is opaque already.
-                let mut rgb: Vec<u8> = Vec::with_capacity(canvas_w as usize * canvas_h as usize * 3);
+                // The canvas was filled with opaque white, so every pixel is
+                // already opaque and straight RGB.
+                let mut rgb: Vec<u8> =
+                    Vec::with_capacity(canvas_w as usize * canvas_h as usize * 3);
                 for px in canvas.data().chunks_exact(4) {
                     rgb.extend_from_slice(&px[0..3]);
                 }
                 let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut writer, 85);
                 encoder
-                    .write_image(
-                        &rgb,
-                        canvas_w,
-                        canvas_h,
-                        image::ExtendedColorType::Rgb8,
-                    )
+                    .write_image(&rgb, canvas_w, canvas_h, image::ExtendedColorType::Rgb8)
                     .map_err(|e| format!("Could not encode {name}: {e}"))?;
             }
             _ => {
-                picture
+                if !all_opaque {
+                    unpremultiply_in_place(canvas.data_mut());
+                }
+                let out = image::RgbaImage::from_raw(canvas_w, canvas_h, canvas.take())
+                    .ok_or_else(|| format!("Could not build the picture data for {name}"))?;
+                image::DynamicImage::ImageRgba8(out)
                     .write_to(&mut writer, format)
                     .map_err(|e| format!("Could not encode {name}: {e}"))?;
             }
         }
     }
     std::fs::write(path, &encoded).map_err(|e| format!("Could not save {name}: {e}"))?;
-    Ok(())
+
+    let loaded = if canvas_w.max(canvas_h) <= MAX_IMAGE_EDGE {
+        to_gpui_image_format(format).map(|gpui_format| LoadedImage {
+            image: Arc::new(gpui::Image::from_bytes(gpui_format, encoded)),
+            width: canvas_w,
+            height: canvas_h,
+        })
+    } else {
+        None
+    };
+    Ok(loaded)
 }
 
 /// Whether a polyline (in window coordinates) overlaps the given rectangle.
 /// Used to skip strokes that are entirely off screen.
+fn build_ink_groups(
+    strokes: &[InkStroke],
+    ix0: f32,
+    iy0: f32,
+    ox: f32,
+    oy: f32,
+    vw: f32,
+    vh: f32,
+    scale_x: f32,
+    scale_y: f32,
+) -> (
+    Vec<(u32, Vec<Vec<(f32, f32)>>)>,
+    Vec<(u32, Vec<Vec<(f32, f32)>>)>,
+) {
+    let mut pen_groups: Vec<(u32, Vec<Vec<(f32, f32)>>)> = Vec::new();
+    let mut hl_groups: Vec<(u32, Vec<Vec<(f32, f32)>>)> = Vec::new();
+    for stroke in strokes {
+        if stroke.points.len() < 2 {
+            continue;
+        }
+        let pts = ink::smooth(&stroke.points);
+        let win: Vec<(f32, f32)> = pts
+            .iter()
+            .map(|p| (ix0 + p.0 * scale_x, iy0 + p.1 * scale_y))
+            .collect();
+        if !visible(&win, ox, oy, vw, vh) {
+            continue;
+        }
+        let w = stroke.width * scale_x;
+        match stroke.tool {
+            ink::TOOL_PEN => {
+                let curve = ink::spline(&win, 0.4, 220);
+                let poly = ink::ribbon(&curve, w * 0.5, false);
+                if poly.len() >= 3 {
+                    match pen_groups.iter_mut().find(|(c, _)| *c == stroke.color) {
+                        Some((_, group)) => group.push(poly),
+                        None => pen_groups.push((stroke.color, vec![poly])),
+                    }
+                }
+            }
+            ink::TOOL_HIGHLIGHTER => {
+                let curve = ink::spline(&win, 1.0, 220);
+                let poly = ink::ribbon(&curve, w * 0.5, true);
+                if poly.len() >= 3 {
+                    match hl_groups.iter_mut().find(|(c, _)| *c == stroke.color) {
+                        Some((_, group)) => group.push(poly),
+                        None => hl_groups.push((stroke.color, vec![poly])),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (pen_groups, hl_groups)
+}
+
+fn fill_ink_groups(groups: Vec<(u32, Vec<Vec<(f32, f32)>>)>) -> Vec<InkPath> {
+    groups
+        .into_iter()
+        .filter_map(|(color, group)| ink::fill(&group).map(|path| (color, path)))
+        .collect()
+}
+
 fn visible(points: &[(f32, f32)], x: f32, y: f32, w: f32, h: f32) -> bool {
     let mut min_x = f32::MAX;
     let mut min_y = f32::MAX;
@@ -4119,5 +5773,59 @@ fn visible(points: &[(f32, f32)], x: f32, y: f32, w: f32, h: f32) -> bool {
         max_y = max_y.max(p.1);
     }
     min_x <= x + w && max_x >= x && min_y <= y + h && max_y >= y
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paper_syntax_themes_parse_and_highlight() {
+        let light = highlight_line_spans("fn main() { let x = \"hi\"; // note", "rs", false, 0x30302fff);
+        let dark = highlight_line_spans("fn main() { let x = \"hi\"; // note", "rs", true, 0xd2d2ceff);
+        assert!(light.len() > 1);
+        assert!(dark.len() > 1);
+        // Keywords should pick up Paper Light (#5477b8) and Paper Dark (#7897ca).
+        assert!(light.iter().any(|&(c, _, _)| c == 0x5477b8ff));
+        assert!(dark.iter().any(|&(c, _, _)| c == 0x7897caff));
+        // Strings should pick up Paper Light (#b98922) and Paper Dark (#c5a35a).
+        assert!(light.iter().any(|&(c, _, _)| c == 0xb98922ff));
+        assert!(dark.iter().any(|&(c, _, _)| c == 0xc5a35aff));
+    }
+
+    #[test]
+    fn preview_geometry_reserves_gutter_width() {
+        let geo = preview_geometry(1000.0, 0.0, 0.0, false, LINE_NUMBER_GUTTER_WIDTH);
+        assert_eq!(geo.margin, LINE_NUMBER_GUTTER_WIDTH);
+        assert!(preview_text_left(&geo) - LINE_NUMBER_GUTTER_WIDTH >= 0.0);
+    }
+
+    #[test]
+    fn enter_continues_bulleted_numbered_and_task_lists() {
+        let mut ed = EditorState::new();
+        ed.set_text("- item one");
+        ed.line_end(false);
+        assert_eq!(list_enter_action(&ed), ListEnterAction::Insert("\n- ".into()));
+
+        ed.set_text("- ");
+        ed.line_end(false);
+        assert_eq!(list_enter_action(&ed), ListEnterAction::ClearLine { start: 0, end: 2 });
+
+        ed.set_text("  3. third");
+        ed.line_end(false);
+        assert_eq!(list_enter_action(&ed), ListEnterAction::Insert("\n  4. ".into()));
+
+        ed.set_text("  4. ");
+        ed.line_end(false);
+        assert_eq!(list_enter_action(&ed), ListEnterAction::ClearLine { start: 0, end: 5 });
+
+        ed.set_text("- [x] done");
+        ed.line_end(false);
+        assert_eq!(list_enter_action(&ed), ListEnterAction::Insert("\n- [ ] ".into()));
+
+        ed.set_text("plain paragraph");
+        ed.line_end(false);
+        assert_eq!(list_enter_action(&ed), ListEnterAction::Insert("\n".into()));
+    }
 }
 

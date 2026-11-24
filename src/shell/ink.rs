@@ -318,87 +318,193 @@ pub fn smooth(points: &[(f32, f32)]) -> Vec<(f32, f32)> {
 /// Build the silhouette of a stroke: a ribbon of the given half width that
 /// follows the polyline.
 ///
-/// Joins use the angle bisector (a miter), which for a smoothed curve is
-/// indistinguishable from a round join but costs a single point per sample.
-/// Caps are round, or square when `square_cap` is set (the chisel tip of a
-/// marker).
+/// When `square_cap` is false (pen), caps and outer joins are rounded with
+/// circular arcs. When `square_cap` is true (highlighter), caps are square
+/// and outer joins are flat bevels so sharp zig-zags keep a crisp, chiseled
+/// edge without miter spikes.
 pub fn ribbon(points: &[(f32, f32)], half: f32, square_cap: bool) -> Vec<(f32, f32)> {
-    let n = points.len();
-    if n < 2 || half <= 0.0 {
+    if points.len() < 2 || half <= 0.0 {
         return Vec::new();
     }
 
-    // Unit direction of every segment.
-    let mut dirs: Vec<(f32, f32)> = Vec::with_capacity(n - 1);
-    for i in 0..n - 1 {
-        let dx = points[i + 1].0 - points[i].0;
-        let dy = points[i + 1].1 - points[i].1;
-        let len = (dx * dx + dy * dy).sqrt();
-        if len < 1e-9 {
-            dirs.push(*dirs.last().unwrap_or(&(1.0, 0.0)));
-        } else {
-            dirs.push((dx / len, dy / len));
+    // Drop consecutive coincident points so every segment has a well-defined
+    // direction and length.
+    let mut pts: Vec<(f32, f32)> = Vec::with_capacity(points.len());
+    pts.push(points[0]);
+    for &p in &points[1..] {
+        let last = *pts.last().unwrap();
+        let dx = p.0 - last.0;
+        let dy = p.1 - last.1;
+        if dx * dx + dy * dy >= 1e-8 {
+            pts.push(p);
         }
     }
+    let n = pts.len();
+    if n < 2 {
+        return Vec::new();
+    }
 
-    // Left and right offsets of every sample.
-    let mut left: Vec<(f32, f32)> = Vec::with_capacity(n);
-    let mut right: Vec<(f32, f32)> = Vec::with_capacity(n);
-    for i in 0..n {
-        let (tx, ty, scale) = if i == 0 {
-            (dirs[0].0, dirs[0].1, 1.0)
-        } else if i == n - 1 {
-            (dirs[n - 2].0, dirs[n - 2].1, 1.0)
-        } else {
-            let (d0, d1) = (dirs[i - 1], dirs[i]);
+    // Unit direction and length of every segment.
+    let mut dirs: Vec<(f32, f32)> = Vec::with_capacity(n - 1);
+    let mut lens: Vec<f32> = Vec::with_capacity(n - 1);
+    for i in 0..n - 1 {
+        let dx = pts[i + 1].0 - pts[i].0;
+        let dy = pts[i + 1].1 - pts[i].1;
+        let len = (dx * dx + dy * dy).sqrt();
+        dirs.push((dx / len, dy / len));
+        lens.push(len);
+    }
+
+    // Left and right offsets of every sample, with round (pen) or flat bevel
+    // (highlighter) joins at corners.
+    let mut left: Vec<(f32, f32)> = Vec::with_capacity(n * 2);
+    let mut right: Vec<(f32, f32)> = Vec::with_capacity(n * 2);
+
+    // Start sample.
+    let d_start = dirs[0];
+    let nx0 = -d_start.1 * half;
+    let ny0 = d_start.0 * half;
+    left.push((pts[0].0 + nx0, pts[0].1 + ny0));
+    right.push((pts[0].0 - nx0, pts[0].1 - ny0));
+
+    // Interior joins.
+    const STRAIGHT_ANGLE: f32 = 0.05;
+    const ARC_STEP_ANGLE: f32 = std::f32::consts::PI / 10.0;
+    for i in 1..n - 1 {
+        let p = pts[i];
+        let d0 = dirs[i - 1];
+        let d1 = dirs[i];
+        let dot = (d0.0 * d1.0 + d0.1 * d1.1).clamp(-1.0, 1.0);
+        let angle = dot.acos();
+
+        if angle < STRAIGHT_ANGLE {
             let bx = d0.0 + d1.0;
             let by = d0.1 + d1.1;
             let bl = (bx * bx + by * by).sqrt();
-            if bl < 1e-6 {
+            let (tx, ty, scale) = if bl < 1e-6 {
                 (d1.0, d1.1, 1.0)
             } else {
                 let tx = bx / bl;
                 let ty = by / bl;
-                // Widen the offset so the two edges meet at the corner.
-                let cos_half = (tx * d1.0 + ty * d1.1).abs().max(0.2);
+                let cos_half = (tx * d1.0 + ty * d1.1).abs().max(0.5);
                 (tx, ty, 1.0 / cos_half)
+            };
+            let nx = -ty * half * scale;
+            let ny = tx * half * scale;
+            left.push((p.0 + nx, p.1 + ny));
+            right.push((p.0 - nx, p.1 - ny));
+            continue;
+        }
+
+        let n0 = (-d0.1, d0.0);
+        let n1 = (-d1.1, d1.0);
+        let l0 = (p.0 + n0.0 * half, p.1 + n0.1 * half);
+        let l1 = (p.0 + n1.0 * half, p.1 + n1.1 * half);
+        let r0 = (p.0 - n0.0 * half, p.1 - n0.1 * half);
+        let r1 = (p.0 - n1.0 * half, p.1 - n1.1 * half);
+
+        let cross = d0.0 * d1.1 - d0.1 * d1.0;
+
+        // On the inside of a gentle corner where both adjacent segments are
+        // long enough, the miter vertex is the exact clean intersection. On
+        // sharp turns or short segments, route through the corner center `p`
+        // so the inside never shoots out a spike or inverts winding.
+        let inner_miter_ok = angle < std::f32::consts::PI * 0.75
+            && half * (angle * 0.5).tan() < lens[i - 1].min(lens[i]);
+        let inner_miter = if inner_miter_ok {
+            let bx = d0.0 + d1.0;
+            let by = d0.1 + d1.1;
+            let bl = (bx * bx + by * by).sqrt();
+            if bl >= 1e-6 {
+                let tx = bx / bl;
+                let ty = by / bl;
+                let cos_half = (tx * d1.0 + ty * d1.1).abs().max(0.2);
+                let scale = 1.0 / cos_half;
+                Some((-ty * half * scale, tx * half * scale))
+            } else {
+                None
             }
+        } else {
+            None
         };
-        let nx = -ty * half * scale;
-        let ny = tx * half * scale;
-        left.push((points[i].0 + nx, points[i].1 + ny));
-        right.push((points[i].0 - nx, points[i].1 - ny));
+
+        if cross >= 0.0 {
+            // Left is the inside of the turn; right is the outside.
+            if let Some((nx, ny)) = inner_miter {
+                left.push((p.0 + nx, p.1 + ny));
+            } else {
+                left.push(l0);
+                left.push(p);
+                left.push(l1);
+            }
+            right.push(r0);
+            if !square_cap {
+                let steps = (angle / ARC_STEP_ANGLE).ceil().max(1.0) as usize;
+                let a0 = (-n0.1).atan2(-n0.0);
+                for k in 1..steps {
+                    let a = a0 + angle * (k as f32 / steps as f32);
+                    right.push((p.0 + half * a.cos(), p.1 + half * a.sin()));
+                }
+            }
+            right.push(r1);
+        } else {
+            // Left is the outside of the turn; right is the inside.
+            left.push(l0);
+            if !square_cap {
+                let steps = (angle / ARC_STEP_ANGLE).ceil().max(1.0) as usize;
+                let a0 = n0.1.atan2(n0.0);
+                for k in 1..steps {
+                    let a = a0 - angle * (k as f32 / steps as f32);
+                    left.push((p.0 + half * a.cos(), p.1 + half * a.sin()));
+                }
+            }
+            left.push(l1);
+            if let Some((nx, ny)) = inner_miter {
+                right.push((p.0 - nx, p.1 - ny));
+            } else {
+                right.push(r0);
+                right.push(p);
+                right.push(r1);
+            }
+        }
     }
 
-    let mut out: Vec<(f32, f32)> = Vec::with_capacity(n * 2 + 32);
+    // End sample.
+    let d_end = dirs[n - 2];
+    let nxe = -d_end.1 * half;
+    let nye = d_end.0 * half;
+    let end = pts[n - 1];
+    let left_end = (end.0 + nxe, end.1 + nye);
+    let right_end = (end.0 - nxe, end.1 - nye);
+    left.push(left_end);
+    right.push(right_end);
+
+    let mut out: Vec<(f32, f32)> = Vec::with_capacity(left.len() + right.len() + 32);
     out.extend_from_slice(&left);
 
     // End cap.
-    let end = points[n - 1];
     if square_cap {
-        let d = dirs[n - 2];
-        let ex = end.0 + d.0 * half;
-        let ey = end.1 + d.1 * half;
-        let ox = left[n - 1].0 - end.0;
-        let oy = left[n - 1].1 - end.1;
+        let ex = end.0 + d_end.0 * half;
+        let ey = end.1 + d_end.1 * half;
+        let ox = left_end.0 - end.0;
+        let oy = left_end.1 - end.1;
         out.push((ex + ox, ey + oy));
         out.push((ex - ox, ey - oy));
     } else {
-        let a0 = (left[n - 1].1 - end.1).atan2(left[n - 1].0 - end.0);
+        let a0 = (left_end.1 - end.1).atan2(left_end.0 - end.0);
         cap_arc(&mut out, end, half, a0, -std::f32::consts::PI);
     }
 
     // Right side, back to the start.
-    for i in (0..n).rev() {
-        out.push(right[i]);
+    for &p in right.iter().rev() {
+        out.push(p);
     }
 
     // Start cap.
-    let start = points[0];
+    let start = pts[0];
     if square_cap {
-        let d = dirs[0];
-        let sx = start.0 - d.0 * half;
-        let sy = start.1 - d.1 * half;
+        let sx = start.0 - d_start.0 * half;
+        let sy = start.1 - d_start.1 * half;
         let ox = right[0].0 - start.0;
         let oy = right[0].1 - start.1;
         // The outline arrives here along the right side, so the corner on that
@@ -412,55 +518,13 @@ pub fn ribbon(points: &[(f32, f32)], half: f32, square_cap: bool) -> Vec<(f32, f
         cap_arc(&mut out, start, half, a0, -std::f32::consts::PI);
     }
 
-    subdivide(&mut out);
     out
 }
 
-/// Split long edges into shorter pieces.
-///
-/// The tessellator that fills a path allocates per vertex, so the number of
-/// pieces is capped: past a few hundred the cost of the fill outweighs any
-/// gain in smoothness.
-fn subdivide(poly: &mut Vec<(f32, f32)>) {
-    /// Largest number of points a single stroke's outline may have.
-    const MAX_POINTS: usize = 220;
-    /// Shortest edge we bother splitting to.
-    const MIN_LEN: f32 = 1.0;
-
-    let n = poly.len();
-    if n < 3 {
-        return;
-    }
-    let mut total = 0.0f32;
-    for i in 0..n {
-        let a = poly[i];
-        let b = poly[(i + 1) % n];
-        total += ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
-    }
-    let max_len = (total / MAX_POINTS as f32).max(MIN_LEN);
-
-    let mut out: Vec<(f32, f32)> = Vec::with_capacity(n * 2);
-    for i in 0..n {
-        let a = poly[i];
-        let b = poly[(i + 1) % n];
-        out.push(a);
-        let dx = b.0 - a.0;
-        let dy = b.1 - a.1;
-        let len = (dx * dx + dy * dy).sqrt();
-        if len > max_len {
-            let parts = (len / max_len).ceil() as usize;
-            for k in 1..parts {
-                let t = k as f32 / parts as f32;
-                out.push((a.0 + dx * t, a.1 + dy * t));
-            }
-        }
-    }
-    *poly = out;
-}
-/// Append a semicircular cap.
+/// Append the interior points of a semicircular cap.
 fn cap_arc(out: &mut Vec<(f32, f32)>, center: (f32, f32), r: f32, a0: f32, sweep: f32) {
     const STEPS: usize = 10;
-    for i in 0..=STEPS {
+    for i in 1..STEPS {
         let a = a0 + sweep * (i as f32 / STEPS as f32);
         out.push((center.0 + r * a.cos(), center.1 + r * a.sin()));
     }
@@ -484,15 +548,22 @@ pub fn fill(polygons: &[Vec<(f32, f32)>]) -> Option<Path<Pixels>> {
         if poly.len() < 3 {
             continue;
         }
-        let mut pts = poly.clone();
-        if signed_area(&pts) < 0.0 {
-            pts.reverse();
+        if signed_area(poly) < 0.0 {
+            let mut it = poly.iter().rev();
+            if let Some(&first) = it.next() {
+                pb.move_to(point(px(first.0), px(first.1)));
+                for &p in it {
+                    pb.line_to(point(px(p.0), px(p.1)));
+                }
+                pb.close();
+            }
+        } else {
+            pb.move_to(point(px(poly[0].0), px(poly[0].1)));
+            for &p in &poly[1..] {
+                pb.line_to(point(px(p.0), px(p.1)));
+            }
+            pb.close();
         }
-        pb.move_to(point(px(pts[0].0), px(pts[0].1)));
-        for p in &pts[1..] {
-            pb.line_to(point(px(p.0), px(p.1)));
-        }
-        pb.close();
     }
 
     pb.build().ok()
@@ -559,4 +630,159 @@ fn dist_to_segment(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
     let cx = a.0 + dx * t;
     let cy = a.1 + dy * t;
     ((p.0 - cx).powi(2) + (p.1 - cy).powi(2)).sqrt()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dist_to_polyline(p: (f32, f32), line: &[(f32, f32)]) -> f32 {
+        line.windows(2)
+            .map(|w| dist_to_segment(p, w[0], w[1]))
+            .fold(f32::INFINITY, f32::min)
+    }
+
+    #[test]
+    fn sharp_zigzag_has_no_miter_spikes_round_cap() {
+        let half = 7.0;
+        let cases: &[&[(f32, f32)]] = &[
+            // 90-degree turns
+            &[(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (200.0, 100.0)],
+            // Sharp zig-zag (~165-degree turns)
+            &[
+                (0.0, 0.0),
+                (120.0, 0.0),
+                (10.0, 20.0),
+                (130.0, 40.0),
+                (20.0, 60.0),
+            ],
+            // Extreme hairpin (~178-degree turn)
+            &[(0.0, 0.0), (200.0, 0.0), (0.0, 4.0)],
+            // Exact 180-degree reversal
+            &[(0.0, 0.0), (100.0, 0.0), (0.0, 0.0)],
+            // Short segments around a sharp turn
+            &[(0.0, 0.0), (3.0, 0.0), (0.5, 1.0), (4.0, 2.0)],
+        ];
+
+        for &pts in cases {
+            let poly = ribbon(pts, half, false);
+            assert!(poly.len() >= 3);
+            for &v in &poly {
+                assert!(v.0.is_finite() && v.1.is_finite());
+                let d = dist_to_polyline(v, pts);
+                assert!(
+                    d <= half + 1e-2,
+                    "vertex {:?} spiked to distance {} (half={}) for {:?}",
+                    v,
+                    d,
+                    half,
+                    pts
+                );
+            }
+            assert!(fill(&[poly]).is_some());
+        }
+    }
+
+    #[test]
+    fn sharp_zigzag_has_no_miter_spikes_square_cap() {
+        let half = 10.0;
+        let pts = &[
+            (0.0, 0.0),
+            (150.0, 0.0),
+            (10.0, 15.0),
+            (160.0, 30.0),
+            (20.0, 45.0),
+        ];
+        let poly = ribbon(pts, half, true);
+        assert!(poly.len() >= 3);
+
+        // Square caps at the start/end extend up to half * sqrt(2) from the
+        // endpoints, while every interior turn must stay within `half`.
+        let max_cap_dist = half * std::f32::consts::SQRT_2 + 1e-2;
+        for &v in &poly {
+            assert!(v.0.is_finite() && v.1.is_finite());
+            let d = dist_to_polyline(v, pts);
+            assert!(
+                d <= max_cap_dist,
+                "vertex {:?} exceeded max cap distance {} (got {})",
+                v,
+                max_cap_dist,
+                d
+            );
+            // At the sharp interior apexes (x > 100), vertices must stay
+            // within the round-join radius `half`.
+            if v.0 > 100.0 {
+                assert!(
+                    d <= half + 1e-2,
+                    "interior turn vertex {:?} spiked to distance {} (half={})",
+                    v,
+                    d,
+                    half
+                );
+            }
+        }
+        assert!(fill(&[poly]).is_some());
+    }
+
+    #[test]
+    fn full_pipeline_fast_zigzag_stays_smooth() {
+        let raw = vec![
+            (0.0, 0.0),
+            (300.0, 10.0),
+            (10.0, 35.0),
+            (310.0, 50.0),
+            (20.0, 75.0),
+            (320.0, 90.0),
+        ];
+        let smoothed = smooth(&raw);
+
+        for &(tol, half, square_cap) in &[(0.4_f32, 2.5_f32, false), (1.0_f32, 14.0_f32, true)] {
+            let curve = spline(&smoothed, tol, 220);
+            let poly = ribbon(&curve, half, square_cap);
+            assert!(poly.len() >= 3);
+            let limit = if square_cap {
+                half * std::f32::consts::SQRT_2 + 1e-2
+            } else {
+                half + 1e-2
+            };
+            for &v in &poly {
+                assert!(v.0.is_finite() && v.1.is_finite());
+                let d = dist_to_polyline(v, &curve);
+                assert!(
+                    d <= limit,
+                    "pipeline vertex {:?} spiked to {} (limit={})",
+                    v,
+                    d,
+                    limit
+                );
+            }
+            assert!(fill(&[poly]).is_some());
+        }
+    }
+
+    #[test]
+    fn highlighter_uses_flat_bevel_joins() {
+        // 90-degree corner at (100, 0), turning down to (100, 100).
+        // Outside bevel connects (100, -10) straight to (110, 0) with no arc
+        // bulge past the bevel line x - y = 110.
+        let pts = &[(0.0, 0.0), (100.0, 0.0), (100.0, 100.0)];
+        let poly = ribbon(pts, 10.0, true);
+        for &v in &poly {
+            if v.0 > 100.0 && v.1 < 0.0 {
+                panic!("unexpected rounded arc vertex {:?} on beveled highlighter corner", v);
+            }
+        }
+        assert!(fill(&[poly]).is_some());
+    }
+
+    #[test]
+    fn ribbon_handles_duplicate_points() {
+        let pts = &[(10.0, 10.0), (10.0, 10.0), (50.0, 10.0), (50.0, 10.0), (10.0, 12.0)];
+        let poly = ribbon(pts, 5.0, false);
+        assert!(poly.len() >= 3);
+        for &v in &poly {
+            assert!(v.0.is_finite() && v.1.is_finite());
+        }
+        assert!(ribbon(&[(5.0, 5.0), (5.0, 5.0)], 5.0, false).is_empty());
+    }
 }

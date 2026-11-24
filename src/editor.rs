@@ -129,14 +129,20 @@ pub fn byte_for_x(text: &str, x: f32, width_of: &mut dyn FnMut(&str) -> f32) -> 
         return 0;
     }
     let mut best = 0;
+    let mut best_distance = x;
     for (b, _) in text.char_indices().skip(1) {
-        let w = width_of(&text[..b]);
-        if w > x {
-            break;
+        let distance = (width_of(&text[..b]) - x).abs();
+        if distance < best_distance {
+            best = b;
+            best_distance = distance;
         }
-        best = b;
     }
-    if width_of(text) <= x { text.len() } else { best }
+    let end_distance = (width_of(text) - x).abs();
+    if end_distance < best_distance {
+        text.len()
+    } else {
+        best
+    }
 }
 
 pub struct EditorState {
@@ -145,8 +151,8 @@ pub struct EditorState {
     cursor: usize,
     /// Selection anchor (char index), if any. Head is always `cursor`.
     sel_anchor: Option<usize>,
-    undo: Vec<String>,
-    redo: Vec<String>,
+    undo: Vec<Rope>,
+    redo: Vec<Rope>,
 }
 
 impl EditorState {
@@ -195,6 +201,49 @@ impl EditorState {
         self.cursor = self.len_chars();
     }
 
+    /// Select the word (or contiguous whitespace/punctuation run) under the
+    /// current cursor position, used for double-clicking.
+    pub fn select_word_at_cursor(&mut self) {
+        let (line, col) = self.cursor_line_col();
+        let line_start = self.text.line_to_char(line);
+        let text = Self::line_string(&self.text, line);
+        let chars: Vec<char> = text.chars().collect();
+        if chars.is_empty() {
+            self.sel_anchor = None;
+            return;
+        }
+        let idx = col.min(chars.len().saturating_sub(1));
+        let kind = |c: char| -> u8 {
+            if c.is_alphanumeric() || c == '_' {
+                0
+            } else if c.is_whitespace() {
+                1
+            } else {
+                2
+            }
+        };
+        let target = kind(chars[idx]);
+        let mut start = idx;
+        while start > 0 && kind(chars[start - 1]) == target {
+            start -= 1;
+        }
+        let mut end = idx + 1;
+        while end < chars.len() && kind(chars[end]) == target {
+            end += 1;
+        }
+        self.sel_anchor = Some(line_start + start);
+        self.cursor = line_start + end;
+    }
+
+    /// Select the entire buffer line under the cursor (used for triple-click).
+    pub fn select_line_at_cursor(&mut self) {
+        let (line, _) = self.cursor_line_col();
+        let line_start = self.text.line_to_char(line);
+        let len = Self::line_chars(&self.text, line);
+        self.sel_anchor = Some(line_start);
+        self.cursor = line_start + len;
+    }
+
     pub fn prepare_extend(&mut self) {
         if self.sel_anchor.is_none() {
             self.sel_anchor = Some(self.cursor);
@@ -223,7 +272,8 @@ impl EditorState {
     // ----- editing -----
 
     fn commit(&mut self) {
-        self.undo.push(self.text.to_string());
+        // Rope::clone is O(1) via structural sharing.
+        self.undo.push(self.text.clone());
         if self.undo.len() > UNDO_CAP {
             self.undo.remove(0);
         }
@@ -240,6 +290,37 @@ impl EditorState {
         }
         self.text.insert(self.cursor, s);
         self.cursor += s.chars().count();
+    }
+
+    /// Atomically replace char range `start..end` with `replacement` in one
+    /// undo step, placing the cursor at `new_cursor` (and optional selection
+    /// anchor at `new_anchor`).
+    pub fn replace_char_range(
+        &mut self,
+        start: usize,
+        end: usize,
+        replacement: &str,
+        new_cursor: usize,
+        new_anchor: Option<usize>,
+    ) {
+        let len = self.len_chars();
+        let start = start.min(len);
+        let end = end.min(len).max(start);
+        self.commit();
+        if start < end {
+            self.text.remove(start..end);
+        }
+        if !replacement.is_empty() {
+            self.text.insert(start, replacement);
+        }
+        let new_len = self.len_chars();
+        self.cursor = new_cursor.min(new_len);
+        self.sel_anchor = new_anchor.map(|a| a.min(new_len));
+    }
+
+    /// Return the buffer line index containing a given char index.
+    pub fn char_to_line(&self, char_idx: usize) -> usize {
+        self.text.char_to_line(char_idx.min(self.len_chars()))
     }
 
     pub fn backspace(&mut self) {
@@ -358,24 +439,22 @@ impl EditorState {
         !self.redo.is_empty()
     }
 
-    fn restore(&mut self, snapshot: String) {
-        let mut rope = Rope::new();
-        rope.insert(0, &snapshot);
-        self.text = rope;
+    fn restore(&mut self, snapshot: Rope) {
+        self.text = snapshot;
         self.cursor = self.cursor.min(self.len_chars());
         self.sel_anchor = None;
     }
 
     pub fn undo(&mut self) {
         if let Some(prev) = self.undo.pop() {
-            self.redo.push(self.text.to_string());
+            self.redo.push(self.text.clone());
             self.restore(prev);
         }
     }
 
     pub fn redo(&mut self) {
         if let Some(next) = self.redo.pop() {
-            self.undo.push(self.text.to_string());
+            self.undo.push(self.text.clone());
             self.restore(next);
         }
     }
@@ -384,13 +463,24 @@ impl EditorState {
 
     /// Number of characters on a buffer line, excluding line endings.
     fn line_chars(text: &Rope, line: usize) -> usize {
-        Self::line_string(text, line).chars().count()
+        let slice = text.line(line);
+        let mut len = slice.len_chars();
+        while len > 0 && matches!(slice.char(len - 1), '\n' | '\r') {
+            len -= 1;
+        }
+        len
     }
 
     fn line_string(text: &Rope, line: usize) -> String {
         let slice = text.line(line);
-        let s: String = slice.chars().collect();
-        s.trim_end_matches(['\r', '\n']).to_string()
+        let mut s = String::with_capacity(slice.len_bytes());
+        for chunk in slice.chunks() {
+            s.push_str(chunk);
+        }
+        while s.ends_with('\n') || s.ends_with('\r') {
+            s.pop();
+        }
+        s
     }
 
     /// Plain text of a buffer line, without line endings.

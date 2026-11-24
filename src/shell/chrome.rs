@@ -6,12 +6,13 @@ use std::rc::Rc;
 
 use gpui::{
     AnyElement, App, Bounds, MouseButton, Pixels, WeakEntity, Window, WindowControlArea, canvas,
-    deferred, div, prelude::*, px, rgba, svg,
+    deferred, div, point, prelude::*, px, rgba, size as gpui_size, svg,
 };
 
 use super::dropdown::{ENTRY_HEIGHT, PANEL_PADDING_X, PANEL_PADDING_Y};
+use super::ink;
 use super::panels::{ICON_PDF, PanelKind};
-use super::root::{INK_PALETTE, INK_SIZE_MIN, RootView, Tab};
+use super::root::{INK_PALETTE, INK_SIZE_MIN, MarkdownViewMode, RootView, Tab};
 use crate::theme::WEIGHT_MEDIUM;
 
 pub const TOP_BAR_HEIGHT: f32 = 36.0;
@@ -657,17 +658,26 @@ fn render_history_buttons(
 }
 
 fn render_window_controls(t: crate::theme::Theme, _cx: &App) -> AnyElement {
-    let control = |id: &'static str, area: WindowControlArea, content: AnyElement| -> AnyElement {
+    let control = |id: &'static str,
+                   content: AnyElement,
+                   on_press: Box<dyn Fn(&mut Window, &mut App)>|
+     -> AnyElement {
         div()
             .id(id)
             .w(px(46.))
             .h_full()
+            .occlude()
             .flex()
             .items_center()
             .justify_center()
             .cursor_pointer()
-            .window_control_area(area)
             .hover(|s| s.bg(rgba(t.menu_hover_bg)))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            .on_click(move |_, window, cx| {
+                on_press(window, cx);
+            })
             .child(content)
             .into_any_element()
     };
@@ -679,30 +689,30 @@ fn render_window_controls(t: crate::theme::Theme, _cx: &App) -> AnyElement {
         .h_full()
         .child(control(
             "window-minimize",
-            WindowControlArea::Min,
             div()
                 .w(px(10.))
                 .h(px(1.))
                 .bg(rgba(t.text_secondary))
                 .into_any_element(),
+            Box::new(|window, _| window.minimize_window()),
         ))
         .child(control(
             "window-maximize",
-            WindowControlArea::Max,
             div()
                 .size(px(9.))
                 .border_1()
                 .border_color(rgba(t.text_secondary))
                 .into_any_element(),
+            Box::new(|window, _| window.zoom_window()),
         ))
         .child(control(
             "window-close",
-            WindowControlArea::Close,
             div()
                 .text_sm()
                 .text_color(rgba(t.text_primary))
                 .child("✕")
                 .into_any_element(),
+            Box::new(|window, _| window.remove_window()),
         ))
         .into_any_element()
 }
@@ -1088,6 +1098,81 @@ const TOOLBAR_ICON_ARROW: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" wi
 	</g>
 </svg>"#;
 
+const TOOLBAR_ICON_MD_SPLIT: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
+	<path d="M0 0h24v24H0z" fill="none" />
+	<g fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.5">
+		<path stroke-linejoin="round" d="M11.992 21V3" />
+		<path d="M7.992 20c-1.3-.13-2.175-.423-2.828-1.084C3.992 17.729 3.992 15.819 3.992 12s0-5.73 1.172-6.916C5.817 4.422 6.692 4.13 7.992 4m8 16c1.3-.13 2.175-.422 2.829-1.084c1.171-1.187 1.171-3.096 1.171-6.916s0-5.73-1.171-6.916c-.629-.637-1.463-.932-2.684-1.068" />
+	</g>
+</svg>"#;
+
+const TOOLBAR_ICON_MD_STACKED: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
+	<path d="M0 0h24v24H0z" fill="none" />
+	<path fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.5" d="M11.992 2c2.8 0 4.2 0 5.27.545a5 5 0 0 1 2.185 2.185c.545 1.07.545 2.47.545 5.27v4c0 2.8 0 4.2-.545 5.27a5 5 0 0 1-2.185 2.185c-1.07.545-2.47.545-5.27.545s-4.2 0-5.27-.545a5 5 0 0 1-2.185-2.185c-.545-1.07-.545-2.47-.545-5.27v-4c0-2.8 0-4.2.545-5.27a5 5 0 0 1 2.185-2.185C7.792 2 9.192 2 11.992 2Z" />
+</svg>"#;
+
+const TOOLBAR_ICON_CHEVRON: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
+	<path d="M0 0h24v24H0z" fill="none" />
+	<path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.75" d="m6 9l6 6l6-6" />
+</svg>"#;
+
+const TOOLBAR_ICON_MD_PARAGRAPH: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
+	<path d="M0 0h24v24H0z" fill="none" />
+	<path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M15 3v18m0-18h-5m5 0h6m-11 9H7.5a4.5 4.5 0 0 1 0-9H10m0 9V3m0 9v9" />
+</svg>"#;
+
+const TOOLBAR_ICON_MD_BOLD: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
+	<path d="M0 0h24v24H0z" fill="none" />
+	<path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M13 4h-3c-1.886 0-2.828 0-3.414.586S6 6.114 6 8v4h7a4 4 0 0 0 0-8m1 8H6v4c0 1.886 0 2.828.586 3.414S8.114 20 10 20h4a4 4 0 0 0 0-8" />
+</svg>"#;
+
+const TOOLBAR_ICON_MD_ITALIC: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
+	<path d="M0 0h24v24H0z" fill="none" />
+	<path fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.5" d="M10.667 4H20M7.999 20l8-16m-12 16h9.333" />
+</svg>"#;
+
+const TOOLBAR_ICON_MD_STRIKE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
+	<path d="M0 0h24v24H0z" fill="none" />
+	<g fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.5">
+		<path stroke-linejoin="round" d="M3.992 12h16" />
+		<path d="M17.492 7.667c0-2.578-2.462-4.667-5.5-4.667s-5.5 2.09-5.5 4.667Q6.491 8.396 6.66 9m-.667 7.333c0 2.578 2.686 4.667 6 4.667s6-1.333 6-4.667c0-2.393-1.03-3.755-3.092-4.333" />
+	</g>
+</svg>"#;
+
+const TOOLBAR_ICON_MD_LINK: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
+	<path d="M0 0h24v24H0z" fill="none" />
+	<g fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.5">
+		<path d="M10 13.229q.213.349.504.654a3.56 3.56 0 0 0 4.454.59q.391-.24.73-.59l3.239-3.372c1.43-1.49 1.43-3.904 0-5.394a3.564 3.564 0 0 0-5.183 0l-.714.743" />
+		<path d="m10.97 18.14l-.713.743a3.564 3.564 0 0 1-5.184 0c-1.43-1.49-1.43-3.905 0-5.394l3.24-3.372a3.564 3.564 0 0 1 5.183 0q.291.305.504.654" />
+	</g>
+</svg>"#;
+
+const TOOLBAR_ICON_MD_BULLET_LIST: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
+	<path d="M0 0h24v24H0z" fill="none" />
+	<g fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.5">
+		<path d="M8 5.5h12m-12 7h12m-12 7h12" />
+		<path stroke-linejoin="round" d="M4.375 5.5H4.25m.25 0a.25.25 0 1 1-.5 0a.25.25 0 0 1 .5 0m-.125 7H4.25m.25 0a.25.25 0 1 1-.5 0a.25.25 0 0 1 .5 0m-.125 7H4.25m.25 0a.25.25 0 1 1-.5 0a.25.25 0 0 1 .5 0" />
+	</g>
+</svg>"#;
+
+const TOOLBAR_ICON_MD_NUMBERED_LIST: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
+	<path d="M0 0h24v24H0z" fill="none" />
+	<g fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.5">
+		<path d="M11 6h10m-10 6h10m-10 6h10" />
+		<path stroke-linejoin="round" d="M3 15h1.5c.279 0 .418 0 .534.023a1.2 1.2 0 0 1 .943.943C6 16.082 6 16.22 6 16.5s0 .418-.023.534a1.2 1.2 0 0 1-.943.943C4.918 18 4.78 18 4.5 18s-.418 0-.534.023a1.2 1.2 0 0 0-.943.943C3 19.082 3 19.22 3 19.5v.9c0 .283 0 .424.088.512s.23.088.512.088H6M3 3h1.2a.3.3 0 0 1 .3.3V9m0 0H3m1.5 0H6" />
+	</g>
+</svg>"#;
+
+const TOOLBAR_ICON_MD_QUOTE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
+	<path d="M0 0h24v24H0z" fill="none" />
+	<path fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.5" d="M17.992 5.75c2.21 0 4 1.885 4 4.211c0 3.065-1.414 5.782-3.592 7.469c-.783.606-1.175.909-1.441.797a.5.5 0 0 1-.208-.162c-.174-.232.053-.775.505-1.862c.245-.588.367-.881.321-1.167a.8.8 0 0 0-.084-.272c-.123-.262-.612-.579-1.591-1.212c-1.146-.74-1.91-2.072-1.91-3.591c0-1.49.735-2.8 1.845-3.548a3.84 3.84 0 0 1 2.155-.663Zm-12 0c2.21 0 4 1.885 4 4.211c0 3.065-1.414 5.782-3.592 7.469c-.783.606-1.175.909-1.441.797a.5.5 0 0 1-.208-.162c-.174-.232.053-.775.505-1.862c.245-.588.367-.881.321-1.167a.8.8 0 0 0-.084-.272c-.123-.262-.612-.579-1.591-1.212c-1.146-.74-1.91-2.072-1.91-3.591c0-1.49.735-2.8 1.845-3.548a3.84 3.84 0 0 1 2.155-.663Z" clip-rule="evenodd" />
+</svg>"#;
+
+const TOOLBAR_ICON_MD_CODE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
+	<path d="M0 0h24v24H0z" fill="none" />
+	<path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="m17 8l1.84 1.85c.773.778 1.16 1.167 1.16 1.65s-.387.872-1.16 1.65L17 15M7 8L5.16 9.85C4.387 10.628 4 11.017 4 11.5s.387.872 1.16 1.65L7 15m7.5-11l-5 16" />
+</svg>"#;
+
 #[derive(IntoElement)]
 pub struct Toolbar {
     pub root: WeakEntity<RootView>,
@@ -1098,12 +1183,20 @@ impl gpui::RenderOnce for Toolbar {
         let t = *crate::theme::active(cx);
         let root_upgrade = self.root.upgrade();
         let is_image = root_upgrade.as_ref().map(|r| r.read(cx).active_is_image()).unwrap_or(false);
+        let is_markdown = root_upgrade.as_ref().map(|r| r.read(cx).active_is_markdown()).unwrap_or(false);
+        let md_mode = root_upgrade
+            .as_ref()
+            .map(|r| r.read(cx).markdown_mode)
+            .unwrap_or(MarkdownViewMode::Plain);
         let active_tool = root_upgrade.as_ref().map(|r| r.read(cx).image_toolbar_tool).unwrap_or(0);
         let shapes_open = root_upgrade.as_ref().map(|r| r.read(cx).image_shapes_dropdown_open).unwrap_or(false);
-        let ink_popup = root_upgrade
+        let (ink_popup_display, ink_popup_progress) = root_upgrade
             .as_ref()
-            .map(|r| r.read(cx).ink_popup)
-            .flatten();
+            .map(|r| {
+                let state = r.read(cx);
+                (state.ink_popup_display, state.ink_popup_progress)
+            })
+            .unwrap_or((None, 0.0));
         let left_occ = root_upgrade.as_ref().map(|r| r.read(cx).left_occupancy()).unwrap_or(0.0);
         let right_occ = root_upgrade.as_ref().map(|r| r.read(cx).right_occupancy()).unwrap_or(0.0);
         let content_w = (window.viewport_size().width.as_f32() - left_occ - right_occ).max(0.0);
@@ -1130,14 +1223,15 @@ impl gpui::RenderOnce for Toolbar {
                         // colour and size settings.
                         if root.image_toolbar_tool == index && matches!(index, 1 | 2) {
                             let tool = index as u8;
-                            root.ink_popup = if root.ink_popup == Some(tool) {
+                            let next = if root.ink_popup == Some(tool) {
                                 None
                             } else {
                                 Some(tool)
                             };
+                            root.set_ink_popup(next, cx);
                         } else {
                             root.image_toolbar_tool = index;
-                            root.ink_popup = None;
+                            root.set_ink_popup(None, cx);
                         }
                         root.image_shapes_dropdown_open = false;
                         cx.notify();
@@ -1155,6 +1249,7 @@ impl gpui::RenderOnce for Toolbar {
 
         let mut bar = div()
             .id("toolbar")
+            .relative()
             .ml(px(left_occ))
             .w(px(content_w))
             .h(px(TOOLBAR_HEIGHT))
@@ -1179,7 +1274,7 @@ impl gpui::RenderOnce for Toolbar {
                 let mut wrap = div()
                     .relative()
                     .child(tool_button(root.clone(), index, icon, if index == 1 { "Pen" } else { "Highlighter" }, active_tool == index));
-                if ink_popup == Some(index as u8) {
+                if ink_popup_display == Some(index as u8) && ink_popup_progress > 0.005 {
                     let colour = root_upgrade
                         .as_ref()
                         .map(|r| r.read(cx).ink_color(index as u8))
@@ -1192,13 +1287,16 @@ impl gpui::RenderOnce for Toolbar {
                         .as_ref()
                         .map(|r| r.read(cx).ink_handle)
                         .unwrap_or(0.0);
+                    let is_dark = crate::theme::mode(cx) == crate::theme::ThemeMode::Dark;
                     wrap = wrap.child(ink_settings_popup(
                         &t,
+                        is_dark,
                         root_for_popup.clone(),
                         index as u8,
                         colour,
                         size,
                         handle,
+                        ink_popup_progress,
                     ));
                 }
                 bar = bar.child(wrap);
@@ -1318,6 +1416,280 @@ impl gpui::RenderOnce for Toolbar {
             bar = bar.child(tool_button(root.clone(), 5, TOOLBAR_ICON_CROP, "Crop", active_tool == 5));
         }
 
+        if is_markdown {
+            let md_heading_open = root_upgrade
+                .as_ref()
+                .map(|r| r.read(cx).md_heading_dropdown_open)
+                .unwrap_or(false);
+            let active_heading = root_upgrade
+                .as_ref()
+                .map(|r| r.read(cx).active_markdown_heading_level())
+                .unwrap_or(0);
+
+            let heading_indicator = if active_heading > 0 {
+                div()
+                    .w(px(18.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_xs()
+                    .font_weight(WEIGHT_MEDIUM)
+                    .text_color(rgba(t.text_secondary))
+                    .child(format!("H{active_heading}"))
+                    .into_any_element()
+            } else {
+                div()
+                    .w(px(18.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        svg()
+                            .data(TOOLBAR_ICON_MD_PARAGRAPH)
+                            .w(px(15.))
+                            .h(px(15.))
+                            .text_color(rgba(t.text_secondary)),
+                    )
+                    .into_any_element()
+            };
+            let root_heading = root.clone();
+            let mut heading_wrap = div().relative().child(
+                div()
+                    .id("toolbar-md-heading")
+                    .w(px(56.))
+                    .h(px(28.))
+                    .px(px(10.))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .rounded(px(8.))
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(rgba(t.border_color))
+                    .bg(rgba(if md_heading_open {
+                        t.bg_darker
+                    } else {
+                        t.bg_primary
+                    }))
+                    .hover(|s| s.bg(rgba(t.bg_darker)))
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        let _ = root_heading.update(cx, |root, cx| {
+                            root.md_heading_dropdown_open = !root.md_heading_dropdown_open;
+                            cx.notify();
+                        });
+                        cx.stop_propagation();
+                    })
+                    .child(heading_indicator)
+                    .child(
+                        svg()
+                            .data(TOOLBAR_ICON_CHEVRON)
+                            .w(px(12.))
+                            .h(px(12.))
+                            .text_color(rgba(t.text_secondary)),
+                    ),
+            );
+            if md_heading_open {
+                let mut menu = div()
+                    .absolute()
+                    .top(px(30.))
+                    .left(px(0.))
+                    .w(px(128.))
+                    .occlude()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .px(px(PANEL_PADDING_X))
+                    .py(px(PANEL_PADDING_Y))
+                    .bg(rgba(t.bg_primary))
+                    .border_1()
+                    .border_color(rgba(t.component_border_color))
+                    .rounded(px(10.))
+                    .shadow(vec![t.shadow_lg()])
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+                let items: [(usize, &'static str, f32); 7] = [
+                    (0, "Paragraph", 13.0),
+                    (1, "Heading 1", 16.0),
+                    (2, "Heading 2", 15.0),
+                    (3, "Heading 3", 14.0),
+                    (4, "Heading 4", 13.5),
+                    (5, "Heading 5", 13.0),
+                    (6, "Heading 6", 12.5),
+                ];
+                for (level, label, size) in items {
+                    let selected = active_heading == level;
+                    let root_item = root.clone();
+                    menu = menu.child(
+                        div()
+                            .id(format!("toolbar-md-h-{level}"))
+                            .w_full()
+                            .h(px(ENTRY_HEIGHT))
+                            .px(px(8.))
+                            .rounded(px(6.))
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .bg(rgba(if selected { t.bg_darker } else { 0x00000000 }))
+                            .hover(|s| s.bg(rgba(t.menu_hover_bg)))
+                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                let _ = root_item.update(cx, |root, cx| {
+                                    root.md_set_heading(level, cx);
+                                });
+                                cx.stop_propagation();
+                            })
+                            .child(
+                                div()
+                                    .text_size(px(size))
+                                    .font_weight(if level > 0 {
+                                        WEIGHT_MEDIUM
+                                    } else {
+                                        gpui::FontWeight::NORMAL
+                                    })
+                                    .text_color(rgba(if selected {
+                                        t.text_primary
+                                    } else {
+                                        t.text_secondary
+                                    }))
+                                    .child(label),
+                            ),
+                    );
+                }
+                heading_wrap = heading_wrap.child(deferred(menu).with_priority(1000));
+            }
+
+            let md_action = |id: &'static str,
+                             icon: &'static [u8],
+                             action: Box<dyn Fn(&mut RootView, &mut gpui::Context<RootView>)>| {
+                let root_click = root.clone();
+                div()
+                    .id(id)
+                    .w(px(28.))
+                    .h(px(28.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(8.))
+                    .cursor_pointer()
+                    .bg(rgba(t.bg_primary))
+                    .hover(|s| s.bg(rgba(t.bg_darker)))
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        let _ = root_click.update(cx, |root, cx| {
+                            action(root, cx);
+                        });
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        svg()
+                            .data(icon)
+                            .w(px(16.))
+                            .h(px(16.))
+                            .text_color(rgba(t.text_secondary)),
+                    )
+            };
+
+            bar = bar
+                .child(heading_wrap)
+                .child(
+                    div()
+                        .w(px(1.))
+                        .h(px(16.))
+                        .mx(px(4.))
+                        .bg(rgba(t.chrome_border_color)),
+                )
+                .child(md_action(
+                    "toolbar-md-bold",
+                    TOOLBAR_ICON_MD_BOLD,
+                    Box::new(|r, cx| r.md_wrap_inline("**", "**", cx)),
+                ))
+                .child(md_action(
+                    "toolbar-md-italic",
+                    TOOLBAR_ICON_MD_ITALIC,
+                    Box::new(|r, cx| r.md_wrap_inline("*", "*", cx)),
+                ))
+                .child(md_action(
+                    "toolbar-md-strike",
+                    TOOLBAR_ICON_MD_STRIKE,
+                    Box::new(|r, cx| r.md_wrap_inline("~~", "~~", cx)),
+                ))
+                .child(md_action(
+                    "toolbar-md-link",
+                    TOOLBAR_ICON_MD_LINK,
+                    Box::new(|r, cx| r.md_insert_link(cx)),
+                ))
+                .child(
+                    div()
+                        .w(px(1.))
+                        .h(px(16.))
+                        .mx(px(4.))
+                        .bg(rgba(t.chrome_border_color)),
+                )
+                .child(md_action(
+                    "toolbar-md-quote",
+                    TOOLBAR_ICON_MD_QUOTE,
+                    Box::new(|r, cx| r.md_toggle_line_prefix("> ", false, cx)),
+                ))
+                .child(md_action(
+                    "toolbar-md-code",
+                    TOOLBAR_ICON_MD_CODE,
+                    Box::new(|r, cx| r.md_toggle_code(cx)),
+                ))
+                .child(md_action(
+                    "toolbar-md-bullet",
+                    TOOLBAR_ICON_MD_BULLET_LIST,
+                    Box::new(|r, cx| r.md_toggle_line_prefix("- ", false, cx)),
+                ))
+                .child(md_action(
+                    "toolbar-md-numbered",
+                    TOOLBAR_ICON_MD_NUMBERED_LIST,
+                    Box::new(|r, cx| r.md_toggle_line_prefix("1. ", true, cx)),
+                ));
+
+            let md_toggle = |id: &'static str, icon: &'static [u8], mode: MarkdownViewMode| {
+                let is_active = md_mode == mode;
+                let root_click = root.clone();
+                div()
+                    .id(id)
+                    .w(px(28.))
+                    .h(px(28.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(8.))
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(rgba(if is_active { t.border_color } else { 0x00000000 }))
+                    .bg(rgba(if is_active { t.bg_darker } else { t.bg_primary }))
+                    .hover(|s| s.bg(rgba(t.bg_darker)))
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        let _ = root_click.update(cx, |root, cx| {
+                            root.toggle_markdown_mode(mode, cx);
+                        });
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        svg()
+                            .data(icon)
+                            .w(px(17.))
+                            .h(px(17.))
+                            .text_color(rgba(if is_active { t.text_primary } else { t.text_secondary })),
+                    )
+            };
+
+            bar = bar.child(
+                div()
+                    .absolute()
+                    .right(px(8.))
+                    .top_0()
+                    .bottom_0()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(md_toggle("toolbar-md-split", TOOLBAR_ICON_MD_SPLIT, MarkdownViewMode::Split))
+                    .child(md_toggle("toolbar-md-stacked", TOOLBAR_ICON_MD_STACKED, MarkdownViewMode::Stacked)),
+            );
+        }
+
         // (shapes dropdown is now anchored to the shapes button above)
 
         bar.into_any_element()
@@ -1329,44 +1701,97 @@ impl gpui::RenderOnce for Toolbar {
 const INK_PEN_STEPS: usize = 10;
 const INK_HIGHLIGHTER_STEPS: usize = 20;
 
-/// Width of the ink settings popup.
-const INK_POPUP_WIDTH: f32 = 300.0;
+/// Colour chip geometry: 18px coloured chip (with 1px coloured border) inside
+/// a 2px outer ring (1px transparent gap + 1px active/invisible border) = 22px.
+const INK_CHIP_INNER: f32 = 18.0;
+const INK_CHIP_OUTER: f32 = INK_CHIP_INNER + 4.0;
+const INK_CHIP_GAP: f32 = 4.0;
+const INK_POPUP_PADDING: f32 = 10.0;
+/// Content width matches 8 colour chips + 7 gaps exactly (204px).
+const INK_CONTENT_WIDTH: f32 = INK_CHIP_OUTER * 8.0 + INK_CHIP_GAP * 7.0;
+/// Right controls column width (palette + slider + symmetric padding = 224px).
+const INK_CONTROLS_WIDTH: f32 = INK_CONTENT_WIDTH + INK_POPUP_PADDING * 2.0;
+/// Left wavy stroke preview panel (~40% of the controls width).
+const INK_PREVIEW_PANEL_WIDTH: f32 = 90.0;
+/// Dotted divider width between the left preview panel and the controls.
+const INK_DIVIDER_WIDTH: f32 = 1.0;
+/// Total popup width: left preview + 1px divider + right controls + 2px modal border.
+const INK_POPUP_WIDTH: f32 =
+    INK_PREVIEW_PANEL_WIDTH + INK_DIVIDER_WIDTH + INK_CONTROLS_WIDTH + 2.0;
 /// Height of the slider.
 const INK_SLIDER_HEIGHT: f32 = 26.0;
 /// Space between the slider's outline and the fill inside it.
 const INK_SLIDER_PADDING: f32 = 3.0;
-/// Width of the thickness number.
-const INK_VALUE_WIDTH: f32 = 30.0;
+/// Width reserved for the thickness value + "px" suffix.
+const INK_VALUE_WIDTH: f32 = 38.0;
 /// Width of the slider handle.
 const INK_TOGGLE_WIDTH: f32 = 4.0;
 /// Extra room around the handle so it is easy to grab.
 const INK_TOGGLE_GRAB: f32 = 5.0;
 
+/// Compute the 1px border colour for a colour chip: darker in light mode,
+/// lighter in dark mode.
+fn chip_border_color(rgb: u32, is_dark: bool) -> u32 {
+    let r = ((rgb >> 16) & 0xff) as f32;
+    let g = ((rgb >> 8) & 0xff) as f32;
+    let b = (rgb & 0xff) as f32;
+    let (nr, ng, nb) = if is_dark {
+        const LIGHTEN: f32 = 0.25;
+        (
+            (r + (255.0 - r) * LIGHTEN).round() as u32,
+            (g + (255.0 - g) * LIGHTEN).round() as u32,
+            (b + (255.0 - b) * LIGHTEN).round() as u32,
+        )
+    } else {
+        const DARKEN: f32 = 0.22;
+        (
+            (r * (1.0 - DARKEN)).round() as u32,
+            (g * (1.0 - DARKEN)).round() as u32,
+            (b * (1.0 - DARKEN)).round() as u32,
+        )
+    };
+    (nr.min(255) << 24) | (ng.min(255) << 16) | (nb.min(255) << 8) | 0xff
+}
+
+/// Apply smooth magnetic tension around each integer pixel tick while dragging.
+/// Strictly monotonic and C∞ smooth: slows near integer ticks and glides over
+/// midpoints with no abrupt stepping.
+fn apply_tick_magnet(raw: f32, max_step: f32) -> f32 {
+    let clamped = raw.clamp(1.0, max_step);
+    let d = clamped - clamped.round();
+    const STRENGTH: f32 = 0.45;
+    let pull = (d * std::f32::consts::TAU).sin() / std::f32::consts::TAU;
+    (clamped - STRENGTH * pull).clamp(1.0, max_step)
+}
+
 /// The colour and size settings of the pen or the highlighter.
+#[allow(clippy::too_many_arguments)]
 fn ink_settings_popup(
     t: &crate::theme::Theme,
+    is_dark: bool,
     root: WeakEntity<RootView>,
     tool: u8,
     color: u32,
     size: f32,
     handle: f32,
+    progress: f32,
 ) -> impl IntoElement {
     let steps = if tool == 2 {
         INK_HIGHLIGHTER_STEPS
     } else {
         INK_PEN_STEPS
     };
-    let thickness = size.round().clamp(1.0, steps as f32);
-    // The handle glides to the thickness instead of jumping to it.
+    let max_step = steps as f32;
+    let thickness = size.round().clamp(1.0, max_step);
+    // The handle tracks magnetic dragging and eases smoothly on release.
     let handle = if handle > 0.0 {
-        handle.clamp(1.0, steps as f32)
+        handle.clamp(1.0, max_step)
     } else {
         thickness
     };
 
-    // The geometry of the slider, laid out like the reference: an outlined
-    // box with the fill inset from the outline.
-    let slider_width = INK_POPUP_WIDTH - PANEL_PADDING_X * 2.0;
+    // The geometry of the slider, matched to the exact width of the palette.
+    let slider_width = INK_CONTENT_WIDTH;
     let track_left = 1.0 + INK_SLIDER_PADDING;
     let value_left = slider_width - 8.0 - INK_VALUE_WIDTH;
     // The handle stops before the number, so the two never collide.
@@ -1394,22 +1819,6 @@ fn ink_settings_popup(
     .w(px(1.))
     .h(px(1.));
 
-    // A mark for every pixel of thickness.
-    let mut ticks = div().absolute().left(px(track_left)).top(px(0.)).bottom(px(0.));
-    for step in 0..steps {
-        let x = track_left + (step as f32 / (steps - 1).max(1) as f32) * travel;
-        ticks = ticks.child(
-            div()
-                .absolute()
-                .left(px(x - track_left))
-                .top(px(INK_SLIDER_HEIGHT / 2.0 - 1.))
-                .w(px(2.))
-                .h(px(2.))
-                .rounded(px(1.))
-                .bg(rgba(t.text_secondary)),
-        );
-    }
-
     let root_down = root.clone();
     let origin_down = track_origin.clone();
     let origin_move = track_origin.clone();
@@ -1422,15 +1831,16 @@ fn ink_settings_popup(
         .w(px(slider_width))
         .h(px(INK_SLIDER_HEIGHT))
         .border_1()
-        .border_color(rgba(t.menu_border_color))
+        .border_color(rgba(t.component_border_color))
         .rounded(px(8.))
         .on_mouse_down(MouseButton::Left, move |ev, _window, cx| {
-            let value = INK_SIZE_MIN
+            let raw = INK_SIZE_MIN
                 + ((ev.position.x.as_f32() - origin_down.get() - track_left) / travel).clamp(0.0, 1.0)
-                    * (steps as f32 - 1.0);
+                    * (max_step - 1.0);
+            let value = apply_tick_magnet(raw, max_step);
             let _ = root_down.update(cx, |root, cx| {
                 root.ink_slider_dragging = true;
-                root.set_ink_size(tool, value, cx);
+                root.drag_ink_size(tool, value);
                 cx.notify();
             });
             cx.stop_propagation();
@@ -1443,17 +1853,18 @@ fn ink_settings_popup(
             if !dragging {
                 return;
             }
-            let value = INK_SIZE_MIN
+            let raw = INK_SIZE_MIN
                 + ((ev.position.x.as_f32() - origin_move.get() - track_left) / travel).clamp(0.0, 1.0)
-                    * (steps as f32 - 1.0);
+                    * (max_step - 1.0);
+            let value = apply_tick_magnet(raw, max_step);
             let _ = root_move.update(cx, |root, cx| {
-                root.set_ink_size(tool, value, cx);
+                root.drag_ink_size(tool, value);
                 cx.notify();
             });
         })
         .on_mouse_up(MouseButton::Left, move |_ev, _window, cx| {
-            let _ = root_up.update(cx, |root, _cx| {
-                root.ink_slider_dragging = false;
+            let _ = root_up.update(cx, |root, cx| {
+                root.release_ink_slider(cx);
             });
         })
         // The filled part of the track, up to the handle.
@@ -1465,9 +1876,8 @@ fn ink_settings_popup(
                 .bottom(px(1.0 + INK_SLIDER_PADDING))
                 .w(px((toggle_x - 2.0 - track_left).max(0.0)))
                 .rounded(px(5.))
-                .bg(rgba(t.bg_secondary)),
+                .bg(rgba(t.border_color)),
         )
-        .child(ticks)
         // The handle, with a wider area around it to grab.
         .child(
             div()
@@ -1493,7 +1903,7 @@ fn ink_settings_popup(
                         .bg(rgba(t.text_secondary)),
                 ),
         )
-        // The thickness, always at the right of the slider.
+        // The thickness with "px" suffix, always at the right of the slider.
         .child(
             div()
                 .absolute()
@@ -1504,21 +1914,24 @@ fn ink_settings_popup(
                 .flex()
                 .items_center()
                 .justify_end()
+                .whitespace_nowrap()
                 .text_sm()
                 .font_weight(WEIGHT_MEDIUM)
                 .text_color(rgba(t.empty_text_primary))
-                .child(format!("{}", thickness as i32)),
+                .child(format!("{}px", thickness as i32)),
         )
         .child(probe);
 
     let swatch = |root: WeakEntity<RootView>, tool: u8, value: u32, selected: bool| {
+        let chip_border = chip_border_color(value, is_dark);
         div()
             .id(format!("ink-swatch-{tool}-{value}"))
-            .w(px(20.))
-            .h(px(20.))
-            .rounded(px(5.))
-            .border_2()
-            .border_color(rgba(if selected { t.text_primary } else { 0x00000000 }))
+            .w(px(INK_CHIP_OUTER))
+            .h(px(INK_CHIP_OUTER))
+            .p(px(1.))
+            .rounded(px(6.))
+            .border_1()
+            .border_color(rgba(if selected { t.text_secondary } else { 0x00000000 }))
             .flex()
             .items_center()
             .justify_center()
@@ -1532,65 +1945,145 @@ fn ink_settings_popup(
             })
             .child(
                 div()
-                    .w(px(12.))
-                    .h(px(12.))
-                    .rounded(px(3.))
+                    .w(px(INK_CHIP_INNER))
+                    .h(px(INK_CHIP_INNER))
+                    .rounded(px(5.))
+                    .border_1()
+                    .border_color(rgba(chip_border))
                     .bg(rgba((value << 8) | 0xff)),
             )
     };
 
-    let mut palette = div().flex().flex_col().gap(px(5.));
+    let mut palette = div().flex().flex_col().gap(px(INK_CHIP_GAP));
     for row in INK_PALETTE.chunks(8) {
-        let mut line = div().flex().flex_row().gap(px(5.));
+        let mut line = div().flex().flex_row().gap(px(INK_CHIP_GAP));
         for value in row {
             line = line.child(swatch(root.clone(), tool, *value, *value == color));
         }
         palette = palette.child(line);
     }
 
-    // A preview of a stroke in the colour and thickness that will be used.
-    let preview = div()
-        .w_full()
-        .h(px(thickness))
-        .rounded(px((thickness / 2.0).min(4.0)))
-        .border_1()
-        .border_color(rgba(t.chrome_border_color))
-        .bg(rgba((color << 8) | if tool == 2 { 0x78 } else { 0xff }));
+    // Wavy vector stroke preview on the left panel, rendered with the exact
+    // same `ink::ribbon` + `ink::fill` pipeline used on the image canvas.
+    let preview_alpha = {
+        let base = if tool == 2 { 0x78u32 } else { 0xffu32 };
+        ((base as f32) * progress).round().clamp(0.0, 255.0) as u32
+    };
+    let preview_rgba = (color << 8) | preview_alpha;
+    let square_cap = tool == 2;
+    let preview_canvas = canvas(
+        |_bounds: Bounds<Pixels>, _window, _app| {},
+        move |bounds: Bounds<Pixels>, _unit, window, _app| {
+            let ox = bounds.origin.x.as_f32();
+            let oy = bounds.origin.y.as_f32();
+            let w = bounds.size.width.as_f32();
+            let h = bounds.size.height.as_f32();
+            let pad_y = 14.0;
+            let span_y = (h - pad_y * 2.0).max(8.0);
+            let cx = ox + w * 0.5;
+            let amp = (w * 0.22).min(18.0);
+            const SAMPLES: usize = 32;
+            let mut wave: Vec<(f32, f32)> = Vec::with_capacity(SAMPLES + 1);
+            for i in 0..=SAMPLES {
+                let u = i as f32 / SAMPLES as f32;
+                let x = cx + (u * std::f32::consts::TAU).sin() * amp;
+                let y = oy + pad_y + u * span_y;
+                wave.push((x, y));
+            }
+            let poly = ink::ribbon(&wave, handle * 0.5, square_cap);
+            if let Some(path) = ink::fill(&[poly]) {
+                window.paint_path(path, rgba(preview_rgba));
+            }
+        },
+    )
+    .w_full()
+    .h_full();
+
+    let preview_panel = div()
+        .w(px(INK_PREVIEW_PANEL_WIDTH))
+        .flex_shrink_0()
+        .overflow_hidden()
+        .child(preview_canvas);
+
+    // Subtle vertical dotted divider aligned right at the original modal left
+    // edge (x = 0 relative to the tool button).
+    let dot_alpha = (((t.component_border_color & 0xff) as f32) * progress)
+        .round()
+        .clamp(0.0, 255.0) as u32;
+    let dot_rgba = (t.component_border_color & 0xffffff00) | dot_alpha;
+    let dotted_divider = div()
+        .w(px(INK_DIVIDER_WIDTH))
+        .flex_shrink_0()
+        .child(
+            canvas(
+                |_bounds: Bounds<Pixels>, _window, _app| {},
+                move |bounds: Bounds<Pixels>, _unit, window, _app| {
+                    let x = bounds.origin.x.as_f32();
+                    let top = bounds.origin.y.as_f32() + 8.0;
+                    let bottom = bounds.origin.y.as_f32() + bounds.size.height.as_f32() - 8.0;
+                    let mut y = top;
+                    while y + 1.5 <= bottom {
+                        window.paint_quad(
+                            gpui::fill(
+                                Bounds::new(point(px(x), px(y)), gpui_size(px(1.0), px(2.0))),
+                                rgba(dot_rgba),
+                            )
+                            .corner_radii(px(0.5)),
+                        );
+                        y += 5.0;
+                    }
+                },
+            )
+            .w_full()
+            .h_full(),
+        );
+
+    let controls_panel = div()
+        .w(px(INK_CONTROLS_WIDTH))
+        .flex_shrink_0()
+        .flex()
+        .flex_col()
+        .gap(px(8.))
+        .p(px(INK_POPUP_PADDING))
+        .child(palette)
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .child(
+                    div()
+                        .ml(px(INK_SLIDER_PADDING))
+                        .text_xs()
+                        .text_color(rgba(t.empty_text_primary))
+                        .child("Thickness"),
+                )
+                .child(slider),
+        );
+
+    let popup_top = 30.0;
+    let popup_left = -(INK_PREVIEW_PANEL_WIDTH + 1.0);
 
     deferred(
         div()
             .absolute()
-            .top(px(32.))
-            .left(px(0.))
+            .top(px(popup_top))
+            .left(px(popup_left))
             .w(px(INK_POPUP_WIDTH))
+            .opacity(progress)
             .occlude()
             .flex()
-            .flex_col()
-            .gap(px(8.))
-            .px(px(PANEL_PADDING_X))
-            .py(px(PANEL_PADDING_Y))
+            .flex_row()
+            .items_stretch()
             .bg(rgba(t.bg_primary))
             .border_1()
-            .border_color(rgba(t.menu_border_color))
+            .border_color(rgba(t.component_border_color))
             .rounded(px(10.))
             .shadow(vec![t.shadow_lg()])
             .on_mouse_down(MouseButton::Left, |_ev, _window, cx| cx.stop_propagation())
-            .child(palette)
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.))
-                    .child(
-                        div()
-                            .ml(px(INK_SLIDER_PADDING))
-                            .text_xs()
-                            .text_color(rgba(t.empty_text_primary))
-                            .child("Thickness"),
-                    )
-                    .child(slider),
-            )
-            .child(preview),
+            .child(preview_panel)
+            .child(dotted_divider)
+            .child(controls_panel),
     )
     .with_priority(1000)
 }
