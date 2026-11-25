@@ -37,8 +37,8 @@ pub const DARK_BUTTON_TEXT: u32 = 0x20201eff; // Same brightness as BG_PRIMARY
 pub const DARK_BUTTON_BORDER_COLOR: u32 = 0x777772ff; // Darker than button background, lighter than secondary text
 
 // Accents
-pub const DARK_ACCENT: u32 = 0x7897caff; // Darker than ACCENT_BORDER
-pub const DARK_ACCENT_BORDER: u32 = 0x89a7d8ff; // Brighter than ACCENT
+pub const DARK_ACCENT: u32 = 0x8ab0f5ff; // Darker than ACCENT_BORDER
+pub const DARK_ACCENT_BORDER: u32 = 0x9ec0faff; // Brighter than ACCENT
 
 // Status tones (success / warning / error / info + tints for backgrounds)
 pub const DARK_SUCCESS: u32 = 0x819b76ff; // Medium brightness — green
@@ -47,7 +47,7 @@ pub const DARK_WARNING: u32 = 0xb99958ff; // Medium brightness — gold
 pub const DARK_WARNING_BG: u32 = 0xb9995814; // Same hue as WARNING, very transparent
 pub const DARK_ERROR: u32 = 0xc17b75ff; // Medium brightness — red
 pub const DARK_ERROR_BG: u32 = 0xc17b7514; // Same hue as ERROR, very transparent
-pub const DARK_INFO: u32 = 0x7897caff; // Same brightness as ACCENT
+pub const DARK_INFO: u32 = 0x8ab0f5ff; // Same brightness as ACCENT
 pub const DARK_INFO_BG: u32 = 0x7897ca14; // Same hue as INFO, very transparent
 
 // Version-control / history accents
@@ -63,8 +63,8 @@ pub const DARK_DIFF_PLUS: u32 = 0x819b76ff; // Same brightness as SUCCESS
 pub const DARK_DIFF_MINUS: u32 = 0xc17b75ff; // Same brightness as ERROR
 
 // Editor chrome
-pub const DARK_CURSOR: u32 = 0x7897caff; // Same brightness as ACCENT
-pub const DARK_SELECTION: u32 = 0x7897ca2e; // Transparent — subtle accent overlay
+pub const DARK_CURSOR: u32 = 0x8ab0f5ff; // Same brightness as ACCENT
+pub const DARK_SELECTION: u32 = 0x8ab0f52e; // Transparent — subtle accent overlay
 pub const DARK_ACTIVE_LINE: u32 = 0x29292780; // Dark — semi-transparent background overlay
 pub const DARK_LINE_NUMBER: u32 = 0x686864ff; // Same brightness as EMPTY_TEXT_PRIMARY
 pub const DARK_INVISIBLE: u32 = 0x484844ff; // Darker than LINE_NUMBER
@@ -119,8 +119,8 @@ pub const LIGHT_BUTTON_TEXT: u32 = 0xf6f6f3ff; // Bright — same brightness as 
 pub const LIGHT_BUTTON_BORDER_COLOR: u32 = 0x555553ff; // Brighter than button background
 
 // Accents
-pub const LIGHT_ACCENT: u32 = 0x5477b8ff; // Darker than ACCENT_BORDER
-pub const LIGHT_ACCENT_BORDER: u32 = 0x456ab0ff; // Darker than ACCENT
+pub const LIGHT_ACCENT: u32 = 0x4a7fe6ff; // Brighter than ACCENT_BORDER
+pub const LIGHT_ACCENT_BORDER: u32 = 0x3a6fd6ff; // Darker than ACCENT
 
 // Status tones
 pub const LIGHT_SUCCESS: u32 = 0x718d67ff; // Medium brightness — green
@@ -129,7 +129,7 @@ pub const LIGHT_WARNING: u32 = 0xb28a43ff; // Medium brightness — gold
 pub const LIGHT_WARNING_BG: u32 = 0xb28a4314; // Same hue as WARNING, very transparent
 pub const LIGHT_ERROR: u32 = 0xb96f69ff; // Medium brightness — red
 pub const LIGHT_ERROR_BG: u32 = 0xb96f6914; // Same hue as ERROR, very transparent
-pub const LIGHT_INFO: u32 = 0x5477b8ff; // Same brightness as ACCENT
+pub const LIGHT_INFO: u32 = 0x4a7fe6ff; // Same brightness as ACCENT
 pub const LIGHT_INFO_BG: u32 = 0x5477b814; // Same hue as INFO, very transparent
 
 // Version-control / history accents
@@ -145,8 +145,8 @@ pub const LIGHT_DIFF_PLUS: u32 = 0x718d67ff; // Same brightness as SUCCESS
 pub const LIGHT_DIFF_MINUS: u32 = 0xb96f69ff; // Same brightness as ERROR
 
 // Editor chrome
-pub const LIGHT_CURSOR: u32 = 0x5477b8ff; // Same brightness as ACCENT
-pub const LIGHT_SELECTION: u32 = 0x5477b82e; // Transparent — subtle accent overlay
+pub const LIGHT_CURSOR: u32 = 0x4a7fe6ff; // Same brightness as ACCENT
+pub const LIGHT_SELECTION: u32 = 0x4a7fe62e; // Transparent — subtle accent overlay
 pub const LIGHT_ACTIVE_LINE: u32 = 0xf1f1ee80; // Same color as BG_DARKER, semi-transparent
 pub const LIGHT_LINE_NUMBER: u32 = 0xa2a2a0ff; // Darker than EMPTY_TEXT_PRIMARY
 pub const LIGHT_INVISIBLE: u32 = 0xc6c6c3ff; // Brighter than LINE_NUMBER

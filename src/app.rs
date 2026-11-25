@@ -11,12 +11,46 @@ use crate::shell::panels::PanelKind;
 use crate::theme::{self, ThemeMode};
 
 pub fn run() {
-    // `peeklet <path>` opens a file straight away, which is handy for
-    // scripting and for opening images from the shell.
-    let initial_file = std::env::args_os().nth(1).map(std::path::PathBuf::from);
+    // Support explicit `--register` / `--unregister` CLI commands.
+    let raw_args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if raw_args.iter().any(|a| a == "--register") {
+        let _ = crate::win_register::register_windows_open_with();
+        return;
+    }
+    if raw_args.iter().any(|a| a == "--unregister") {
+        let _ = crate::win_register::unregister_windows_open_with();
+        return;
+    }
+
+    // `peeklet <path> [<path2> ...]` opens one or more files straight away
+    // (used by Windows Explorer "Open with" and CLI invocations).
+    let initial_files: Vec<std::path::PathBuf> = raw_args
+        .into_iter()
+        .filter(|a| !a.to_string_lossy().starts_with('-'))
+        .map(std::path::PathBuf::from)
+        .map(|p| {
+            if p.is_relative() {
+                std::env::current_dir()
+                    .map(|cwd| cwd.join(&p))
+                    .unwrap_or(p)
+            } else {
+                p
+            }
+        })
+        .collect();
+
     application().run(|cx: &mut App| {
         load_fonts(cx);
         let store = Store::open_default();
+        // Auto-register Peeklet in Windows "Open with" & Default Apps on
+        // startup unless the user explicitly turned it off in Settings.
+        if store.get("windows.open_with").as_deref() != Some("disabled")
+            && !crate::win_register::is_registered()
+        {
+            std::thread::spawn(|| {
+                let _ = crate::win_register::register_windows_open_with();
+            });
+        }
         let saved_mode = store.get("theme.mode").map(|v| match v.as_str() {
             "light" => ThemeMode::Light,
             _ => ThemeMode::Dark,
@@ -45,7 +79,7 @@ pub fn run() {
                 let focus = view.read(cx).focus.clone();
                 window.focus(&focus, cx);
                 cx.set_global(RootHandle(view.downgrade()));
-                if let Some(path) = initial_file {
+                for path in initial_files {
                     let path = path.to_string_lossy().into_owned();
                     view.update(cx, |view, cx| view.open_file_path(path, cx));
                 }

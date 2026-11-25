@@ -683,37 +683,51 @@ fn render_window_controls(t: crate::theme::Theme, _cx: &App) -> AnyElement {
     };
 
     div()
-        .flex()
-        .flex_row()
-        .items_stretch()
+        .relative()
+        .flex_shrink_0()
+        .w(px(46.0 * 3.0))
         .h_full()
-        .child(control(
-            "window-minimize",
-            div()
-                .w(px(10.))
-                .h(px(1.))
-                .bg(rgba(t.text_secondary))
-                .into_any_element(),
-            Box::new(|window, _| window.minimize_window()),
-        ))
-        .child(control(
-            "window-maximize",
-            div()
-                .size(px(9.))
-                .border_1()
-                .border_color(rgba(t.text_secondary))
-                .into_any_element(),
-            Box::new(|window, _| window.zoom_window()),
-        ))
-        .child(control(
-            "window-close",
-            div()
-                .text_sm()
-                .text_color(rgba(t.text_primary))
-                .child("✕")
-                .into_any_element(),
-            Box::new(|window, _| window.remove_window()),
-        ))
+        .child(
+            deferred(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .flex_row()
+                    .items_stretch()
+                    .bg(rgba(t.bg_secondary))
+                    .border_b_1()
+                    .border_color(rgba(t.chrome_border_color))
+                    .child(control(
+                        "window-minimize",
+                        div()
+                            .w(px(10.))
+                            .h(px(1.))
+                            .bg(rgba(t.text_secondary))
+                            .into_any_element(),
+                        Box::new(|window, _| window.minimize_window()),
+                    ))
+                    .child(control(
+                        "window-maximize",
+                        div()
+                            .size(px(9.))
+                            .border_1()
+                            .border_color(rgba(t.text_secondary))
+                            .into_any_element(),
+                        Box::new(|window, _| window.zoom_window()),
+                    ))
+                    .child(control(
+                        "window-close",
+                        div()
+                            .text_sm()
+                            .text_color(rgba(t.text_primary))
+                            .child("✕")
+                            .into_any_element(),
+                        Box::new(|window, _| window.remove_window()),
+                    )),
+            )
+            .with_priority(25000),
+        )
         .into_any_element()
 }
 
@@ -741,19 +755,18 @@ impl gpui::RenderOnce for TabBar {
         let root_for_up = self.root.clone();
         div()
             .id("tab-bar")
-            .flex_grow(2.0)
-            .flex_shrink_1()
-            .flex_basis(px(0.))
+            .flex_1()
             .min_w(px(0.))
             .h_full()
-            .flex_shrink_0()
             .flex()
             .flex_row()
             .items_stretch()
+            .overflow_hidden()
             .bg(rgba(0x00000000))
             .child(
                 div()
                     .id("tab-viewport")
+                    .relative()
                     .flex_1()
                     .min_w(px(0.))
                     .h_full()
@@ -1032,6 +1045,56 @@ impl gpui::RenderOnce for TabBar {
                                             .with_priority(2000),
                                     )
                             }))
+                    )
+                    // Smooth right-edge gradient fade over overflowing tabs:
+                    // background fades gently over 48px while the 1px bottom
+                    // border fades in much tighter (16px) right before the
+                    // window controls.
+                    .child(
+                        deferred(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .bottom_0()
+                                .right_0()
+                                .w(px(48.))
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .top_0()
+                                        .bottom(px(1.))
+                                        .left_0()
+                                        .right_0()
+                                        .bg(gpui::linear_gradient(
+                                            90.0,
+                                            gpui::linear_color_stop(
+                                                rgba(t.bg_secondary & 0xffffff00),
+                                                0.0,
+                                            ),
+                                            gpui::linear_color_stop(rgba(t.bg_secondary), 1.0),
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .right_0()
+                                        .bottom_0()
+                                        .w(px(28.))
+                                        .h(px(1.))
+                                        .bg(gpui::linear_gradient(
+                                            90.0,
+                                            gpui::linear_color_stop(
+                                                rgba(t.chrome_border_color & 0xffffff00),
+                                                0.0,
+                                            ),
+                                            gpui::linear_color_stop(
+                                                rgba(t.chrome_border_color),
+                                                1.0,
+                                            ),
+                                        )),
+                                ),
+                        )
+                        .with_priority(20000),
                     ),
             )
     }
@@ -1163,6 +1226,14 @@ const TOOLBAR_ICON_MD_NUMBERED_LIST: &[u8] = br#"<svg xmlns="http://www.w3.org/2
 	</g>
 </svg>"#;
 
+const TOOLBAR_ICON_MD_TODO_LIST: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
+	<path d="M0 0h24v24H0z" fill="none" />
+	<g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5">
+		<path d="M11 6h10m-10 6h10m-10 6h10" />
+		<path d="M3 7.393S4 8.045 4.5 9C4.5 9 6 5.25 8 4M3 18.393S4 19.045 4.5 20c0 0 1.5-3.75 3.5-5" />
+	</g>
+</svg>"#;
+
 const TOOLBAR_ICON_MD_QUOTE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
 	<path d="M0 0h24v24H0z" fill="none" />
 	<path fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="1.5" d="M17.992 5.75c2.21 0 4 1.885 4 4.211c0 3.065-1.414 5.782-3.592 7.469c-.783.606-1.175.909-1.441.797a.5.5 0 0 1-.208-.162c-.174-.232.053-.775.505-1.862c.245-.588.367-.881.321-1.167a.8.8 0 0 0-.084-.272c-.123-.262-.612-.579-1.591-1.212c-1.146-.74-1.91-2.072-1.91-3.591c0-1.49.735-2.8 1.845-3.548a3.84 3.84 0 0 1 2.155-.663Zm-12 0c2.21 0 4 1.885 4 4.211c0 3.065-1.414 5.782-3.592 7.469c-.783.606-1.175.909-1.441.797a.5.5 0 0 1-.208-.162c-.174-.232.053-.775.505-1.862c.245-.588.367-.881.321-1.167a.8.8 0 0 0-.084-.272c-.123-.262-.612-.579-1.591-1.212c-1.146-.74-1.91-2.072-1.91-3.591c0-1.49.735-2.8 1.845-3.548a3.84 3.84 0 0 1 2.155-.663Z" clip-rule="evenodd" />
@@ -1184,6 +1255,8 @@ impl gpui::RenderOnce for Toolbar {
         let root_upgrade = self.root.upgrade();
         let is_image = root_upgrade.as_ref().map(|r| r.read(cx).active_is_image()).unwrap_or(false);
         let is_markdown = root_upgrade.as_ref().map(|r| r.read(cx).active_is_markdown()).unwrap_or(false);
+        let is_svg = root_upgrade.as_ref().map(|r| r.read(cx).active_is_svg()).unwrap_or(false);
+        let svg_split = root_upgrade.as_ref().map(|r| r.read(cx).svg_split_view).unwrap_or(true);
         let md_mode = root_upgrade
             .as_ref()
             .map(|r| r.read(cx).markdown_mode)
@@ -1221,7 +1294,13 @@ impl gpui::RenderOnce for Toolbar {
                     let _ = root.update(cx, |root, cx| {
                         // Clicking the tool that is already active opens its
                         // colour and size settings.
-                        if root.image_toolbar_tool == index && matches!(index, 1 | 2) {
+                        if index == 5 {
+                            if root.image_toolbar_tool == 5 {
+                                root.cancel_image_crop(cx);
+                            } else {
+                                root.begin_image_crop(cx);
+                            }
+                        } else if root.image_toolbar_tool == index && matches!(index, 1 | 2) {
                             let tool = index as u8;
                             let next = if root.ink_popup == Some(tool) {
                                 None
@@ -1230,6 +1309,9 @@ impl gpui::RenderOnce for Toolbar {
                             };
                             root.set_ink_popup(next, cx);
                         } else {
+                            if root.image_toolbar_tool == 5 {
+                                root.cancel_image_crop(cx);
+                            }
                             root.image_toolbar_tool = index;
                             root.set_ink_popup(None, cx);
                         }
@@ -1414,6 +1496,73 @@ impl gpui::RenderOnce for Toolbar {
             );
             // Crop (5)
             bar = bar.child(tool_button(root.clone(), 5, TOOLBAR_ICON_CROP, "Crop", active_tool == 5));
+
+            // Far-right Cancel / Save buttons when Crop is active.
+            if active_tool == 5 {
+                let root_cancel = root.clone();
+                let root_save = root.clone();
+                bar = bar.child(
+                    div()
+                        .absolute()
+                        .right(px(8.))
+                        .top_0()
+                        .bottom_0()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(
+                            div()
+                                .id("toolbar-crop-cancel")
+                                .h(px(24.))
+                                .px(px(10.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(7.))
+                                .border_1()
+                                .border_color(rgba(t.border_color))
+                                .bg(rgba(t.bg_primary))
+                                .text_xs()
+                                .font_weight(WEIGHT_MEDIUM)
+                                .text_color(rgba(t.text_secondary))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgba(t.bg_darker)).text_color(rgba(t.text_primary)))
+                                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                    let _ = root_cancel.update(cx, |root, cx| {
+                                        root.cancel_image_crop(cx);
+                                    });
+                                    cx.stop_propagation();
+                                })
+                                .child("Cancel"),
+                        )
+                        .child(
+                            div()
+                                .id("toolbar-crop-save")
+                                .h(px(24.))
+                                .px(px(10.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(7.))
+                                .border_1()
+                                .border_color(rgba(t.accent))
+                                .bg(rgba(t.accent))
+                                .text_xs()
+                                .font_weight(WEIGHT_MEDIUM)
+                                .text_color(rgba(0xffffffff))
+                                .cursor_pointer()
+                                .hover(|s| s.opacity(0.9))
+                                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                    let _ = root_save.update(cx, |root, cx| {
+                                        root.save_image_crop(cx);
+                                    });
+                                    cx.stop_propagation();
+                                })
+                                .child("Save"),
+                        ),
+                );
+            }
         }
 
         if is_markdown {
@@ -1642,6 +1791,11 @@ impl gpui::RenderOnce for Toolbar {
                     "toolbar-md-numbered",
                     TOOLBAR_ICON_MD_NUMBERED_LIST,
                     Box::new(|r, cx| r.md_toggle_line_prefix("1. ", true, cx)),
+                ))
+                .child(md_action(
+                    "toolbar-md-todo",
+                    TOOLBAR_ICON_MD_TODO_LIST,
+                    Box::new(|r, cx| r.md_toggle_task_list(cx)),
                 ));
 
             let md_toggle = |id: &'static str, icon: &'static [u8], mode: MarkdownViewMode| {
@@ -1687,6 +1841,55 @@ impl gpui::RenderOnce for Toolbar {
                     .gap(px(4.))
                     .child(md_toggle("toolbar-md-split", TOOLBAR_ICON_MD_SPLIT, MarkdownViewMode::Split))
                     .child(md_toggle("toolbar-md-stacked", TOOLBAR_ICON_MD_STACKED, MarkdownViewMode::Stacked)),
+            );
+        } else if is_svg {
+            let root_click = root.clone();
+            bar = bar.child(
+                div()
+                    .absolute()
+                    .right(px(8.))
+                    .top_0()
+                    .bottom_0()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .id("toolbar-svg-split")
+                            .w(px(28.))
+                            .h(px(28.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(8.))
+                            .cursor_pointer()
+                            .border_1()
+                            .border_color(rgba(if svg_split {
+                                t.border_color
+                            } else {
+                                0x00000000
+                            }))
+                            .bg(rgba(if svg_split { t.bg_darker } else { t.bg_primary }))
+                            .hover(|s| s.bg(rgba(t.bg_darker)))
+                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                let _ = root_click.update(cx, |root, cx| {
+                                    root.toggle_svg_split_view(cx);
+                                });
+                                cx.stop_propagation();
+                            })
+                            .child(
+                                svg()
+                                    .data(TOOLBAR_ICON_MD_SPLIT)
+                                    .w(px(17.))
+                                    .h(px(17.))
+                                    .text_color(rgba(if svg_split {
+                                        t.text_primary
+                                    } else {
+                                        t.text_secondary
+                                    })),
+                            ),
+                    ),
             );
         }
 

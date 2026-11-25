@@ -1,41 +1,43 @@
-//! Root view: top bar, middle row (left dock + tab bar/preview +
+﻿//! Root view: top bar, middle row (left dock + tab bar/preview +
 //! right dock), bottom bar, menu overlay. Owns tabs, dock layout, menus,
 //! hover tweens, and drag-resize state.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::io::Cursor;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use image::{ImageDecoder, ImageEncoder};
 use chrono::Datelike;
+use image::ImageDecoder;
 use std::time::{Duration, Instant};
 
 use gpui::{
     App, ClipboardItem, Context, FocusHandle, Font, FontFeatures, FontStyle, FontWeight,
-    HighlightStyle, Hsla, ImageSource, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseExitEvent, ObjectFit, Path, Point, Render, ScrollDelta, ScrollWheelEvent, ShapedLine,
-    StyledText, TextRun, WeakEntity, Window, deferred, div, img, prelude::*, px, rgba, svg,
+    HighlightStyle, Hsla, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, Point, Render,
+    ScrollDelta, ScrollWheelEvent, ShapedLine, StyledText, TextRun, WeakEntity, Window, deferred,
+    div, prelude::*, px, rgba,
 };
 
-use super::chrome::{BOTTOM_BAR_HEIGHT, BottomBar, SidebarBottomBar, TOOLBAR_HEIGHT, Toolbar, TOP_BAR_HEIGHT, TopBar};
+use super::chrome::{
+    BOTTOM_BAR_HEIGHT, BottomBar, SidebarBottomBar, TOOLBAR_HEIGHT, Toolbar, TOP_BAR_HEIGHT, TopBar,
+};
 use super::dock::{DOCK_DEFAULT_WIDTH, DockView};
 use super::dropdown::AppMenu;
 use super::ink::{self, InkHistory, InkStroke};
 use super::markdown;
+use super::md_actions::{
+    ListEnterAction, list_enter_action, quote_pos_for_row, smart_backspace_pair, smart_type_char,
+    table_row_kind,
+};
+use super::media_io::{InkRenderCache, LoadedImage, bake_annotated_image, file_name_of};
+use super::media_view::CropHandle;
+use super::modals::{modal_button, settings_tab_button, settings_toggle};
 use super::panels::{DockSide, PanelKind};
+use super::svg_view;
+use super::syntax::{highlight_line_spans, is_code_path};
 use crate::editor::EditorState;
 use crate::persist::{Store, TabRecord};
 use crate::theme::{ThemeMode, WEIGHT_MEDIUM};
-
-/// Folder icon for Open File.
-const ICON_OPEN_FILE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
-	<path d="M0 0h24v24H0z" fill="none" />
-	<g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5">
-		<path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
-	</g>
-</svg>"#;
 
 #[derive(Clone)]
 pub struct Tab {
@@ -136,114 +138,6 @@ fn viewer_kind(path: Option<&str>) -> ViewerKind {
     }
 }
 
-struct LoadedImage {
-    image: Arc<gpui::Image>,
-    width: u32,
-    height: u32,
-}
-
-struct LoadedPdf {
-    pages: Vec<LoadedImage>,
-}
-
-fn load_pdf_assets(path: &str) -> Option<LoadedPdf> {
-    let root = std::env::temp_dir().join(format!("peeklet-pdf-{}-{}", std::process::id(),
-        path.bytes().fold(0u64, |hash, byte| hash.wrapping_mul(31).wrapping_add(byte as u64))));
-    let _ = std::fs::create_dir_all(&root);
-    let prefix = root.join("page");
-    let status = std::process::Command::new("pdftoppm")
-        .args(["-png", "-r", "120", "-f", "1", "-l", "64"])
-        .arg(path)
-        .arg(&prefix)
-        .status()
-        .ok()?;
-    if !status.success() {
-        let _ = std::fs::remove_dir_all(&root);
-        return None;
-    }
-    let mut pages = Vec::new();
-    for page_number in 1..=64 {
-        let page_path = root.join(format!("page-{page_number}.png"));
-        let Ok(bytes) = std::fs::read(&page_path) else { break };
-        let reader = image::ImageReader::new(Cursor::new(&bytes)).with_guessed_format().ok()?;
-        let (width, height) = reader.into_dimensions().ok()?;
-        pages.push(LoadedImage {
-            image: Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes)),
-            width,
-            height,
-        });
-    }
-    let _ = std::fs::remove_dir_all(&root);
-    (!pages.is_empty()).then_some(LoadedPdf { pages })
-}
-
-/// Read image bytes and dimensions away from the UI thread. Keep normal-sized
-/// source bytes intact so JPEG/WebP/PNG files are not needlessly decoded and
-/// re-encoded before GPUI gets them. Very large images are reduced once, in
-/// the background, to keep the GPU/cache footprint bounded.
-fn load_image_asset(path: &str) -> Option<LoadedImage> {
-    const MAX_IMAGE_EDGE: u32 = 8192;
-
-    let bytes = std::fs::read(path).ok()?;
-    let reader = image::ImageReader::new(Cursor::new(&bytes))
-        .with_guessed_format()
-        .ok()?;
-    let source_format = reader.format()?;
-    let mut decoder = reader.into_decoder().ok()?;
-    let (width, height) = decoder.dimensions();
-    // The preview shows the picture upright, so the layout has to use the
-    // dimensions the viewer will actually have.
-    let orientation = decoder.orientation().ok();
-    let (width, height) = match orientation {
-        Some(o) if orientation_swaps_axes(o) => (height, width),
-        _ => (width, height),
-    };
-    let gpui_format = match source_format {
-        image::ImageFormat::Png => gpui::ImageFormat::Png,
-        image::ImageFormat::Jpeg => gpui::ImageFormat::Jpeg,
-        image::ImageFormat::WebP => gpui::ImageFormat::Webp,
-        image::ImageFormat::Gif => gpui::ImageFormat::Gif,
-        image::ImageFormat::Bmp => gpui::ImageFormat::Bmp,
-        image::ImageFormat::Tiff => gpui::ImageFormat::Tiff,
-        image::ImageFormat::Ico => gpui::ImageFormat::Ico,
-        image::ImageFormat::Pnm => gpui::ImageFormat::Pnm,
-        _ => return None,
-    };
-
-    if width.max(height) <= MAX_IMAGE_EDGE {
-        drop(decoder);
-        return Some(LoadedImage {
-            image: Arc::new(gpui::Image::from_bytes(gpui_format, bytes)),
-            width,
-            height,
-        });
-    }
-
-    let orientation = decoder.orientation().ok()?;
-    let mut decoded = image::DynamicImage::from_decoder(decoder).ok()?;
-    decoded.apply_orientation(orientation);
-    let scale = MAX_IMAGE_EDGE as f32 / decoded.width().max(decoded.height()) as f32;
-    let resized = decoded.resize(
-        (decoded.width() as f32 * scale).round() as u32,
-        (decoded.height() as f32 * scale).round() as u32,
-        image::imageops::FilterType::Lanczos3,
-    );
-    let width = resized.width();
-    let height = resized.height();
-    let mut encoded = Cursor::new(Vec::new());
-    resized
-        .write_to(&mut encoded, image::ImageFormat::Png)
-        .ok()?;
-    Some(LoadedImage {
-        image: Arc::new(gpui::Image::from_bytes(
-            gpui::ImageFormat::Png,
-            encoded.into_inner(),
-        )),
-        width,
-        height,
-    })
-}
-
 fn format_file_size(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
     let mut value = bytes as f64;
@@ -294,16 +188,6 @@ struct PreviewGeometry {
     wrap: bool,
 }
 
-type InkPath = (u32, Path<gpui::Pixels>);
-const MAX_CACHED_INK_VERTICES: usize = 50_000;
-
-struct InkRenderCache {
-    path: String,
-    key: (u64, u32, u32, u32, u32, u32, u32),
-    pen: Vec<InkPath>,
-    highlighter: Vec<InkPath>,
-}
-
 const LINE_NUMBER_GUTTER_WIDTH: f32 = 76.0;
 
 fn preview_geometry(
@@ -334,7 +218,7 @@ fn preview_text_left(geo: &PreviewGeometry) -> f32 {
 /// Only built when wrapping is enabled (`measure != f32::MAX`). When wrapping
 /// is off, visual row `i` is always buffer line `i` so no wrap map is needed.
 /// Moving the cursor or dragging a selection never invalidates this cache.
-struct EditorWrapCache {
+pub(super) struct EditorWrapCache {
     /// Visual rows: `(buffer_line, start_byte, end_byte)`.
     rows: Vec<(usize, usize, usize)>,
 }
@@ -429,8 +313,8 @@ fn row_highlights(
 }
 
 pub struct RootView {
-    tabs: Vec<Tab>,
-    active_tab: usize,
+    pub(super) tabs: Vec<Tab>,
+    pub(super) active_tab: usize,
     next_tab_id: usize,
     visible_left: Option<PanelKind>,
     visible_right: Option<PanelKind>,
@@ -442,46 +326,64 @@ pub struct RootView {
     /// Active dock drag: (side being resized, last cursor x, window width).
     /// Widths are unclamped; the only rule is the docks never overlap.
     drag: Option<(DockSide, f32, f32)>,
-    recent_files: Vec<String>,
+    pub(super) recent_files: Vec<String>,
     project_root: Option<std::path::PathBuf>,
     project_expanded: HashSet<std::path::PathBuf>,
     hovered_tab: Option<usize>,
     pub(crate) tab_scroll_offset: f32,
     tab_scroll_drag: Option<(f32, f32)>,
     pub(crate) hovered_close_tab: Option<usize>,
-    store: Store,
-    image_assets: HashMap<String, (Arc<gpui::Image>, u32, u32)>,
-    image_loading: HashSet<String>,
-    image_load_errors: HashSet<String>,
-    pdf_assets: HashMap<String, Vec<LoadedImage>>,
-    pdf_loading: HashSet<String>,
-    pdf_load_errors: HashSet<String>,
-    image_zoom: f32,
-    image_zoom_target: f32,
-    image_pan: (f32, f32),
-    image_pan_target: (f32, f32),
+    pub(super) store: Store,
+    pub(super) image_assets: HashMap<String, (Arc<gpui::Image>, u32, u32)>,
+    pub(super) image_loading: HashSet<String>,
+    pub(super) image_load_errors: HashSet<String>,
+    pub(super) pdf_assets: HashMap<String, Vec<LoadedImage>>,
+    pub(super) pdf_loading: HashSet<String>,
+    pub(super) pdf_load_errors: HashSet<String>,
+    pub(super) image_zoom: f32,
+    pub(super) image_zoom_target: f32,
+    pub(super) image_pan: (f32, f32),
+    pub(super) image_pan_target: (f32, f32),
     image_zoom_tween_active: bool,
-    image_drag: Option<(MouseButton, f32, f32, f32, f32)>,
+    pub(super) image_drag: Option<(MouseButton, f32, f32, f32, f32)>,
+    /// Right-click start position on image preview to distinguish click vs pan drag.
+    pub(super) image_right_down_pos: Option<(f32, f32)>,
+    /// Active image right-click context menu: `(image_path, window_x, window_y)`.
+    pub(super) image_context_menu: Option<(String, f32, f32)>,
+    /// Pop-in animation progress (`0.0..=1.0`) for `image_context_menu`.
+    pub(super) image_context_menu_progress: f32,
+    /// Active crop rectangle in source-image pixel space `(x0, y0, x1, y1)`.
+    pub(super) image_crop_rect: Option<(f32, f32, f32, f32)>,
+    /// Active crop handle drag: `(handle, start_win_x, start_win_y, start_rect, max_bounds, scale_x, scale_y)`.
+    pub(super) image_crop_drag: Option<(
+        CropHandle,
+        f32,
+        f32,
+        (f32, f32, f32, f32),
+        (f32, f32, f32, f32),
+        f32,
+        f32,
+    )>,
     /// Annotation strokes per image path, in source-image pixel space.
-    image_strokes: HashMap<String, Rc<Vec<InkStroke>>>,
+    pub(super) image_strokes: HashMap<String, Rc<Vec<InkStroke>>>,
     /// Undo/redo history for the annotations of each image.
-    image_history: HashMap<String, InkHistory>,
+    pub(super) image_history: HashMap<String, InkHistory>,
     /// Strokes removed by the eraser during the current drag, so the whole
     /// drag counts as one undo step.
     image_erased: Vec<InkStroke>,
     /// The stroke currently being drawn, if any.
-    image_current_stroke: Option<InkStroke>,
+    pub(super) image_current_stroke: Option<InkStroke>,
     /// True while the mouse button is held down on the canvas.
     image_drawing: bool,
     /// Scale of the image at the fit-to-window zoom level, used to keep the
     /// sampling density of new strokes constant.
-    image_fit: f32,
+    pub(super) image_fit: f32,
     /// Path of the image that is currently being annotated.
     image_ink_path: String,
     /// Last time an in-progress annotation caused a view repaint.
-    image_last_ink_notify: Instant,
-    image_ink_revision: u64,
-    image_ink_cache: Rc<RefCell<Option<InkRenderCache>>>,
+    pub(super) image_last_ink_notify: Instant,
+    pub(super) image_ink_revision: u64,
+    pub(super) image_ink_cache: Rc<RefCell<Option<InkRenderCache>>>,
     /// A transient message shown in the status bar.
     status_message: Option<(String, Instant)>,
     /// Colour of the pen strokes, as 0xRRGGBB.
@@ -514,13 +416,16 @@ pub struct RootView {
     /// Currently selected shape in the shapes dropdown (0 = rectangle).
     pub image_shapes_selected: usize,
     /// Buffers keyed by tab id, created lazily.
-    editors: HashMap<usize, EditorState>,
+    pub(super) editors: HashMap<usize, EditorState>,
     /// Tab ids with unsaved edits (dirty).
-    dirty_tabs: HashSet<usize>,
+    pub(super) dirty_tabs: HashSet<usize>,
+    /// `(len_bytes, hash)` of each text/code/markdown/svg tab as last loaded
+    /// from or saved to disk, so undoing or reverting edits clears the dot.
+    saved_text_hash: HashMap<usize, (usize, u64)>,
     /// Bumped only when text buffer content changes (never on cursor/selection
     /// moves) so the wrap cache stays valid across clicks, drags, and arrows.
-    editor_version: u64,
-    cached_wrap: Option<Rc<EditorWrapCache>>,
+    pub(super) editor_version: u64,
+    pub(super) cached_wrap: Option<Rc<EditorWrapCache>>,
     cached_wrap_key: (usize, u64, u32),
     /// Preview focus follows the active tab.
     pub focus: FocusHandle,
@@ -537,7 +442,7 @@ pub struct RootView {
     scroll_content_rows: usize,
     scrollbar_hovered: bool,
     /// Horizontal scroll offset (px) for unwrapped text/code files.
-    scroll_x: f32,
+    pub(super) scroll_x: f32,
     /// Horizontal scrollbar drag: (pointer start x, scroll_x at start, track_w, thumb_w, max_x).
     scroll_x_drag: Option<(f32, f32, f32, f32, f32)>,
     /// Cached max pixel width across all lines when unwrapped.
@@ -556,9 +461,14 @@ pub struct RootView {
     pub wrap_code_files: bool,
     pub line_numbers: bool,
     pub syntax_highlighting: bool,
+    pub windows_open_with: bool,
     /// Active view mode for Markdown files (Plain, Split, or Stacked).
     pub markdown_mode: MarkdownViewMode,
-    /// Horizontal split ratio (0.2..=0.8) for Markdown Split view; snaps to 0.5.
+    /// Whether SVG Split View (code + live SVG preview) is enabled.
+    pub svg_split_view: bool,
+    /// Cached prepared SVG preview keyed by `(tab_id, editor_version, text_primary)`.
+    pub(super) svg_preview_cache: Option<((usize, u64, u32), Arc<gpui::Image>, Option<(f32, f32)>)>,
+    /// Horizontal split ratio (0.2..=0.8) for Split view; snaps to 0.5.
     md_split_ratio: f32,
     /// True while dragging the Markdown Split view divider.
     md_split_dragging: bool,
@@ -593,6 +503,7 @@ impl RootView {
         let mut tabs: Vec<Tab> = Vec::new();
         let mut next_tab_id = 0;
         let mut preloaded: HashMap<usize, String> = HashMap::new();
+        let mut saved_hashes: HashMap<usize, (usize, u64)> = HashMap::new();
         let mut dirty_restored: HashSet<usize> = HashSet::new();
         for record in store.tabs() {
             if let Some(path) = record.path.as_ref() {
@@ -602,11 +513,22 @@ impl RootView {
                     .unwrap_or_else(|| path.to_string());
                 let dirty_key = format!("dirty:{}", path);
                 let buffer_key = format!("buffer:{}", path);
+                let disk_content = match viewer_kind(Some(path)) {
+                    ViewerKind::Text | ViewerKind::Csv | ViewerKind::Svg => {
+                        std::fs::read_to_string(path).unwrap_or_default()
+                    }
+                    _ => String::new(),
+                };
+                let disk_fp = crate::editor::fingerprint_str(&disk_content);
+                saved_hashes.insert(next_tab_id, disk_fp);
                 let content = if store.get(&dirty_key).as_deref() == Some("1") {
-                    dirty_restored.insert(next_tab_id);
-                    store.get(&buffer_key).unwrap_or_default()
+                    let restored = store.get(&buffer_key).unwrap_or_default();
+                    if crate::editor::fingerprint_str(&restored) != disk_fp {
+                        dirty_restored.insert(next_tab_id);
+                    }
+                    restored
                 } else {
-                    std::fs::read_to_string(path).unwrap_or_default()
+                    disk_content
                 };
                 preloaded.insert(next_tab_id, content);
                 tabs.push(Tab { id: next_tab_id, title, path: Some(path.clone()) });
@@ -640,6 +562,7 @@ impl RootView {
         let wrap_code_files = store.get("editor.wrap_code_files").map(|v| v == "true").unwrap_or(false);
         let line_numbers = store.get("editor.line_numbers").map(|v| v == "true").unwrap_or(true);
         let syntax_highlighting = store.get("editor.syntax_highlighting").map(|v| v == "true").unwrap_or(true);
+        let windows_open_with = store.get("windows.open_with").as_deref() != Some("disabled");
         let project_root = None;
         let project_expanded = HashSet::new();
 
@@ -675,6 +598,11 @@ impl RootView {
             image_pan_target: (0.0, 0.0),
             image_zoom_tween_active: false,
             image_drag: None,
+            image_right_down_pos: None,
+            image_context_menu: None,
+            image_context_menu_progress: 0.0,
+            image_crop_rect: None,
+            image_crop_drag: None,
             image_strokes: HashMap::new(),
             image_history: HashMap::new(),
             image_erased: Vec::new(),
@@ -703,6 +631,7 @@ impl RootView {
             image_shapes_selected: 0,
             editors: HashMap::new(),
             dirty_tabs: HashSet::new(),
+            saved_text_hash: saved_hashes,
             editor_version: 0,
             cached_wrap: None,
             cached_wrap_key: (usize::MAX, 0, 0),
@@ -729,7 +658,10 @@ impl RootView {
             wrap_code_files,
             line_numbers,
             syntax_highlighting,
+            windows_open_with,
             markdown_mode: MarkdownViewMode::Plain,
+            svg_split_view: true,
+            svg_preview_cache: None,
             md_split_ratio: 0.5,
             md_split_dragging: false,
             md_heading_dropdown_open: false,
@@ -808,7 +740,7 @@ impl RootView {
                 let month = date.format("%B");
                 let clock = date.format("%I:%M %p").to_string();
                 format!(
-                    "{} {}, {} · {}",
+                    "{} {}, {} Â· {}",
                     month,
                     date.day(),
                     date.year(),
@@ -858,6 +790,12 @@ impl RootView {
             self.image_pan = (0.0, 0.0);
             self.image_pan_target = (0.0, 0.0);
             self.image_drag = None;
+            self.image_context_menu = None;
+            self.image_crop_rect = None;
+            self.image_crop_drag = None;
+            if self.image_toolbar_tool == 5 {
+                self.image_toolbar_tool = 0;
+            }
             self.save_layout();
             cx.notify();
         }
@@ -896,6 +834,7 @@ impl RootView {
             }
         }
         self.dirty_tabs.remove(&id);
+        self.saved_text_hash.remove(&id);
         self.editors.remove(&id);
         if let Some(i) = self.tabs.iter().position(|t| t.id == id) {
             self.tabs.remove(i);
@@ -950,7 +889,7 @@ impl RootView {
         }
     }
 
-    fn dock_occupancy(&self) -> (f32, f32) {
+    pub(super) fn dock_occupancy(&self) -> (f32, f32) {
         let left = if self.visible_left.is_some() {
             self.left_width * self.left_sidebar_progress
         } else {
@@ -973,13 +912,19 @@ impl RootView {
             .as_deref()
             .map(markdown::is_markdown_path)
             .unwrap_or(false);
+        let is_svg = active_path
+            .as_deref()
+            .map(svg_view::is_svg_path)
+            .unwrap_or(false);
         let wrap = if is_code { self.wrap_code_files } else { self.wrap_text_files };
         let gutter = if is_code && self.line_numbers {
             LINE_NUMBER_GUTTER_WIDTH
         } else {
             0.0
         };
-        let effective_right_occ = if is_markdown && self.markdown_mode == MarkdownViewMode::Split {
+        let is_split = (is_markdown && self.markdown_mode == MarkdownViewMode::Split)
+            || (is_svg && self.svg_split_view);
+        let effective_right_occ = if is_split {
             let full_col = (view_w - left_occ - right_occ).max(0.0);
             right_occ + full_col * (1.0 - self.md_split_ratio)
         } else {
@@ -990,7 +935,7 @@ impl RootView {
 
     // ----- undo / redo (active tab's buffer) -----
 
-    fn active_editor_mut(&mut self) -> Option<&mut EditorState> {
+    pub(super) fn active_editor_mut(&mut self) -> Option<&mut EditorState> {
         let tab = self.tabs.get(self.active_tab)?;
         if tab.title == "Welcome" {
             return None;
@@ -1024,7 +969,7 @@ impl RootView {
                     }
                     return;
                 }
-                "x" => {
+                "x" if !mods.shift => {
                     if let Some(ed) = self.active_editor_mut() {
                         if let Some(text) = ed.selected_text() {
                             cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -1064,9 +1009,42 @@ impl RootView {
                     }
                     return;
                 }
+                // Markdown formatting & todo shortcuts.
+                "b" if self.active_is_markdown() && !mods.shift => {
+                    self.md_wrap_inline("**", "**", cx);
+                    return;
+                }
+                "i" if self.active_is_markdown() && !mods.shift => {
+                    self.md_wrap_inline("*", "*", cx);
+                    return;
+                }
+                "k" if self.active_is_markdown() && !mods.shift => {
+                    self.md_insert_link(cx);
+                    return;
+                }
+                "e" if self.active_is_markdown() && !mods.shift => {
+                    self.md_toggle_code(cx);
+                    return;
+                }
+                "x" if self.active_is_markdown() && mods.shift => {
+                    self.md_wrap_inline("~~", "~~", cx);
+                    return;
+                }
+                "l" if self.active_is_markdown() && !mods.shift => {
+                    self.md_toggle_task_list(cx);
+                    return;
+                }
+                "enter" if self.active_is_markdown() && !mods.shift => {
+                    if let Some(line_no) = self.active_editor_mut().map(|ed| ed.cursor_line_col().0)
+                    {
+                        self.md_toggle_task_at_line(line_no, cx);
+                    }
+                    return;
+                }
                 _ => return,
             }
         }
+        let is_markdown = self.active_is_markdown();
         let Some(ed) = self.active_editor_mut() else {
             return;
         };
@@ -1082,7 +1060,9 @@ impl RootView {
             "up" if clean => self.move_visual(-1, extend, window, cx),
             "down" if clean => self.move_visual(1, extend, window, cx),
             "backspace" if clean => {
-                ed.backspace();
+                if !smart_backspace_pair(ed) {
+                    ed.backspace();
+                }
                 mutated_text = true;
             }
             "delete" if clean => {
@@ -1109,8 +1089,18 @@ impl RootView {
                         if filtered.is_empty() {
                             return;
                         }
-                        ed.insert_str(&filtered);
-                        mutated_text = true;
+                        let mut chars = filtered.chars();
+                        if let (Some(ch), None) = (chars.next(), chars.next()) {
+                            if let Some(did_mutate) = smart_type_char(ed, ch, is_markdown) {
+                                mutated_text = did_mutate;
+                            } else {
+                                ed.insert_str(&filtered);
+                                mutated_text = true;
+                            }
+                        } else {
+                            ed.insert_str(&filtered);
+                            mutated_text = true;
+                        }
                     }
                     None => return,
                 }
@@ -1388,7 +1378,11 @@ impl RootView {
             ed.undo();
         }
         self.reset_caret_blink();
-        self.editor_version = self.editor_version.wrapping_add(1);
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            self.mark_tab_dirty(tab.id);
+        } else {
+            self.editor_version = self.editor_version.wrapping_add(1);
+        }
         cx.notify();
     }
 
@@ -1401,7 +1395,11 @@ impl RootView {
             ed.redo();
         }
         self.reset_caret_blink();
-        self.editor_version = self.editor_version.wrapping_add(1);
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            self.mark_tab_dirty(tab.id);
+        } else {
+            self.editor_version = self.editor_version.wrapping_add(1);
+        }
         cx.notify();
     }
 
@@ -1439,25 +1437,26 @@ impl RootView {
         true
     }
 
-    fn invalidate_image_ink_cache(&mut self) {
+    pub(super) fn invalidate_image_ink_cache(&mut self) {
         self.image_ink_revision = self.image_ink_revision.wrapping_add(1);
         *self.image_ink_cache.borrow_mut() = None;
     }
 
     /// The path of the image in the active tab, if there is one.
-    fn active_image_path(&self) -> Option<String> {
+    pub(super) fn active_image_path(&self) -> Option<String> {
         let tab = self.tabs.get(self.active_tab)?;
         let path = tab.path.clone()?;
         (viewer_kind(Some(&path)) == ViewerKind::Image).then_some(path)
     }
 
-    /// Update the dirty mark of an image's tab from its history.
-    fn sync_image_dirty(&mut self, path: &str) {
+    /// Update the dirty mark of an image's tab from whether any unbaked
+    /// annotation strokes remain. Drawing and then erasing (or undoing) every
+    /// stroke clears the dot immediately.
+    pub(super) fn sync_image_dirty(&mut self, path: &str) {
         let dirty = self
-            .image_history
+            .image_strokes
             .get(path)
-            .map(|h| h.is_dirty())
-            .unwrap_or(false);
+            .is_some_and(|strokes| !strokes.is_empty());
         let Some(tab) = self.tabs.iter().find(|t| t.path.as_deref() == Some(path)) else {
             return;
         };
@@ -1538,6 +1537,25 @@ impl RootView {
         cx.notify();
     }
 
+    pub fn set_windows_open_with(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.windows_open_with = enabled;
+        self.store.set("windows.open_with", if enabled { "enabled" } else { "disabled" });
+        let result = if enabled {
+            crate::win_register::register_windows_open_with()
+        } else {
+            crate::win_register::unregister_windows_open_with()
+        };
+        match result {
+            Ok(()) => self.set_status_message(if enabled {
+                "Registered Peeklet in Windows \"Open with\""
+            } else {
+                "Removed Peeklet from Windows \"Open with\""
+            }),
+            Err(err) => self.set_status_message(err),
+        }
+        cx.notify();
+    }
+
     /// Clear submenu, hover tracking, and hover tweens.
     fn reset_menu_state(&mut self) {
         self.active_menu = None;
@@ -1570,7 +1588,7 @@ impl RootView {
         .detach();
     }
 
-    fn start_image_zoom_animation(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn start_image_zoom_animation(&mut self, cx: &mut Context<Self>) {
         if self.image_zoom_tween_active {
             return;
         }
@@ -1844,191 +1862,13 @@ impl RootView {
         }
     }
 
-    fn finish_md_edit(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn finish_md_edit(&mut self, cx: &mut Context<Self>) {
         self.reset_caret_blink();
         self.editor_version = self.editor_version.wrapping_add(1);
         if let Some(tab) = self.tabs.get(self.active_tab) {
             self.mark_tab_dirty(tab.id);
         }
         cx.notify();
-    }
-
-    /// Wrap or unwrap the current selection (or insert empty delimiters at the
-    /// cursor) with inline Markdown markers like `**`, `*`, `~~`, or `` ` ``.
-    pub fn md_wrap_inline(&mut self, prefix: &str, suffix: &str, cx: &mut Context<Self>) {
-        self.md_heading_dropdown_open = false;
-        let Some(ed) = self.active_editor_mut() else {
-            return;
-        };
-        let p_chars = prefix.chars().count();
-        let s_chars = suffix.chars().count();
-        if let Some((a, b)) = ed.selection_range() {
-            let selected = ed.selected_text().unwrap_or_default();
-            if selected.starts_with(prefix)
-                && selected.ends_with(suffix)
-                && selected.len() >= prefix.len() + suffix.len()
-            {
-                let inner = &selected[prefix.len()..selected.len() - suffix.len()];
-                let inner_chars = inner.chars().count();
-                ed.replace_char_range(a, b, inner, a + inner_chars, Some(a));
-            } else {
-                let wrapped = format!("{prefix}{selected}{suffix}");
-                let sel_chars = selected.chars().count();
-                ed.replace_char_range(
-                    a,
-                    b,
-                    &wrapped,
-                    a + p_chars + sel_chars,
-                    Some(a + p_chars),
-                );
-            }
-        } else {
-            let pos = ed.cursor();
-            let empty = format!("{prefix}{suffix}");
-            ed.replace_char_range(pos, pos, &empty, pos + p_chars, None);
-            let _ = s_chars;
-        }
-        self.finish_md_edit(cx);
-    }
-
-    /// Insert or wrap a Markdown link `[label](url)`.
-    pub fn md_insert_link(&mut self, cx: &mut Context<Self>) {
-        self.md_heading_dropdown_open = false;
-        let Some(ed) = self.active_editor_mut() else {
-            return;
-        };
-        if let Some((a, b)) = ed.selection_range() {
-            let selected = ed.selected_text().unwrap_or_default();
-            let sel_chars = selected.chars().count();
-            let replacement = format!("[{selected}](url)");
-            let url_start = a + 1 + sel_chars + 2;
-            ed.replace_char_range(a, b, &replacement, url_start + 3, Some(url_start));
-        } else {
-            let pos = ed.cursor();
-            ed.replace_char_range(pos, pos, "[](url)", pos + 1, None);
-        }
-        self.finish_md_edit(cx);
-    }
-
-    /// Toggle inline code (single line) or a fenced code block (multi-line
-    /// selection or empty line).
-    pub fn md_toggle_code(&mut self, cx: &mut Context<Self>) {
-        self.md_heading_dropdown_open = false;
-        let is_multiline = self
-            .active_editor_mut()
-            .and_then(|ed| ed.selected_text())
-            .is_some_and(|s| s.contains('\n'));
-        if is_multiline {
-            self.md_wrap_inline("```\n", "\n```", cx);
-        } else {
-            self.md_wrap_inline("`", "`", cx);
-        }
-    }
-
-    /// Set the current line's heading level (`0` = paragraph, `1..=6` = H1..H6).
-    pub fn md_set_heading(&mut self, level: usize, cx: &mut Context<Self>) {
-        self.md_heading_dropdown_open = false;
-        let Some(ed) = self.active_editor_mut() else {
-            return;
-        };
-        let (line_no, col) = ed.cursor_line_col();
-        if line_no >= ed.len_lines() {
-            return;
-        }
-        let line_start = ed.line_start_char(line_no);
-        let line = ed.line_text(line_no);
-        let leading_ws = line.len() - line.trim_start().len();
-        let trimmed = &line[leading_ws..];
-        let existing_hashes = trimmed.bytes().take_while(|&b| b == b'#').count();
-        let existing_prefix_bytes = if (1..=6).contains(&existing_hashes)
-            && (existing_hashes == trimmed.len() || trimmed.as_bytes()[existing_hashes] == b' ')
-        {
-            let space = usize::from(
-                existing_hashes < trimmed.len() && trimmed.as_bytes()[existing_hashes] == b' ',
-            );
-            leading_ws + existing_hashes + space
-        } else {
-            leading_ws
-        };
-        let existing_prefix_chars = line[..existing_prefix_bytes].chars().count();
-        let new_prefix = if level == 0 {
-            String::new()
-        } else {
-            format!("{} ", "#".repeat(level.min(6)))
-        };
-        let new_prefix_chars = new_prefix.chars().count();
-        let new_col = col
-            .saturating_sub(existing_prefix_chars)
-            .saturating_add(new_prefix_chars);
-        ed.replace_char_range(
-            line_start,
-            line_start + existing_prefix_chars,
-            &new_prefix,
-            line_start + new_col,
-            None,
-        );
-        self.finish_md_edit(cx);
-    }
-
-    /// Toggle a line-start prefix (`> `, `- `, or `1. `) on the current line
-    /// or all lines covered by the selection.
-    pub fn md_toggle_line_prefix(&mut self, prefix: &str, numbered: bool, cx: &mut Context<Self>) {
-        self.md_heading_dropdown_open = false;
-        let Some(ed) = self.active_editor_mut() else {
-            return;
-        };
-        let (start_line, end_line) = if let Some((a, b)) = ed.selection_range() {
-            (ed.char_to_line(a), ed.char_to_line(b.saturating_sub(1).max(a)))
-        } else {
-            let (l, _) = ed.cursor_line_col();
-            (l, l)
-        };
-        if start_line >= ed.len_lines() {
-            return;
-        }
-        let end_line = end_line.min(ed.len_lines() - 1);
-        let range_start = ed.line_start_char(start_line);
-        let range_end = ed.line_start_char(end_line) + ed.line_char_len(end_line);
-
-        let lines: Vec<String> = (start_line..=end_line).map(|l| ed.line_text(l)).collect();
-        let strip_prefix = |s: &str| -> Option<String> {
-            let trimmed = s.trim_start();
-            let ws = &s[..s.len() - trimmed.len()];
-            if numbered {
-                let d = trimmed.bytes().take_while(|b| b.is_ascii_digit()).count();
-                if d > 0 && d + 1 < trimmed.len() && trimmed.as_bytes()[d] == b'.' && trimmed.as_bytes()[d + 1] == b' ' {
-                    return Some(format!("{ws}{}", &trimmed[d + 2..]));
-                }
-                None
-            } else {
-                trimmed.strip_prefix(prefix).map(|rest| format!("{ws}{rest}"))
-            }
-        };
-        let all_prefixed = lines.iter().all(|l| strip_prefix(l).is_some());
-        let rebuilt: Vec<String> = lines
-            .iter()
-            .enumerate()
-            .map(|(i, l)| {
-                if all_prefixed {
-                    strip_prefix(l).unwrap_or_else(|| l.clone())
-                } else if numbered {
-                    format!("{}. {l}", i + 1)
-                } else {
-                    format!("{prefix}{l}")
-                }
-            })
-            .collect();
-        let replacement = rebuilt.join("\n");
-        let rep_chars = replacement.chars().count();
-        let new_anchor = (start_line != end_line).then_some(range_start);
-        ed.replace_char_range(
-            range_start,
-            range_end,
-            &replacement,
-            range_start + rep_chars,
-            new_anchor,
-        );
-        self.finish_md_edit(cx);
     }
 
     /// Remove strokes (or parts of them) near the given image-space point.
@@ -2043,7 +1883,7 @@ impl RootView {
         // The whole drag is one undo step, so hold on to what it removed.
         self.image_erased.extend(removed);
         self.invalidate_image_ink_cache();
-        self.mark_path_dirty(path);
+        self.sync_image_dirty(path);
     }
 
     /// Start an annotation stroke (or an eraser pass) at an image-space point.
@@ -2148,6 +1988,7 @@ impl RootView {
             .entry(path.to_string())
             .or_default()
             .push_removed(removed);
+        self.sync_image_dirty(path);
     }
 
     /// Mark the tab that shows the file at `path` as having unsaved changes.
@@ -2237,8 +2078,26 @@ impl RootView {
 
     // ----- files -----
 
-    /// Open a path in a new tab, loading its content into the buffer.
+    /// Open a path in a tab (or activate its existing tab if already open).
     pub fn open_file_path(&mut self, path: String, cx: &mut Context<Self>) {
+        // Deduplicate: if this path is already open in a tab, activate it.
+        if let Some(existing) = self.tabs.iter().find(|t| {
+            t.path.as_deref().is_some_and(|p| {
+                if cfg!(target_os = "windows") {
+                    p.eq_ignore_ascii_case(&path)
+                } else {
+                    p == path
+                }
+            })
+        }) {
+            let id = existing.id;
+            self.activate_tab(id, cx);
+            return;
+        }
+        // Replace a lone Welcome placeholder tab cleanly.
+        if self.tabs.len() == 1 && self.tabs[0].title == "Welcome" && self.tabs[0].path.is_none() {
+            self.tabs.clear();
+        }
         let title = std::path::Path::new(&path)
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -2265,6 +2124,8 @@ impl RootView {
             .entry(id)
             .or_insert_with(EditorState::new)
             .set_text(&content);
+        self.saved_text_hash
+            .insert(id, crate::editor::fingerprint_str(&content));
         self.scroll_offset = 0.0;
         self.save_layout();
         cx.notify();
@@ -2272,11 +2133,21 @@ impl RootView {
 
     fn mark_tab_dirty(&mut self, tab_id: usize) {
         self.editor_version = self.editor_version.wrapping_add(1);
-        let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else { return; };
-        let Some(path) = tab.path.clone() else { return; };
-        self.dirty_tabs.insert(tab_id);
-        // Persist lazily (on close/exit) to avoid per-keystroke SQLite writes.
-        let _ = (path, tab_id);
+        let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else {
+            return;
+        };
+        if tab.path.is_none() {
+            return;
+        }
+        let is_dirty = match (self.editors.get(&tab_id), self.saved_text_hash.get(&tab_id)) {
+            (Some(ed), Some(&saved)) => ed.content_fingerprint() != saved,
+            _ => true,
+        };
+        if is_dirty {
+            self.dirty_tabs.insert(tab_id);
+        } else {
+            self.dirty_tabs.remove(&tab_id);
+        }
     }
 
     /// The colour an ink tool draws with.
@@ -2499,12 +2370,18 @@ impl RootView {
             .as_ref()
             .and_then(|p| std::path::Path::new(p).extension().and_then(|e| e.to_str()).map(|s| s.to_string()))
             .unwrap_or_else(|| "Text".to_string());
-        Some(vec![
+        let mut parts = vec![
             format!("Ln {}, Col {}", line + 1, col),
             format!("{}", chars),
-            file_type,
-            size_str,
-        ])
+        ];
+        if path.is_some_and(svg_view::is_svg_path) {
+            if let Some(dims) = self.svg_dimensions_label(id) {
+                parts.push(dims);
+            }
+        }
+        parts.push(file_type);
+        parts.push(size_str);
+        Some(parts)
     }
 
     /// Write the active tab's buffer to its file. No-op without a path.
@@ -2615,9 +2492,12 @@ impl RootView {
             }
         }
         self.save_active(cx);
-        // Mark clean: remove dirty state and persisted buffer.
+        // Mark clean: update saved fingerprint, remove dirty state and persisted buffer.
         if let Some(tab) = self.tabs.get(self.active_tab) {
             let id = tab.id;
+            if let Some(ed) = self.editors.get(&id) {
+                self.saved_text_hash.insert(id, ed.content_fingerprint());
+            }
             self.dirty_tabs.remove(&id);
             if let Some(path) = tab.path.clone() {
                 self.store.set(&format!("dirty:{}", path), "0");
@@ -2692,7 +2572,7 @@ impl RootView {
     }
 
     /// Viewport height: window minus top and bottom bars and the toolbar.
-    fn viewport_h(window: &mut Window) -> f32 {
+    pub(super) fn viewport_h(window: &mut Window) -> f32 {
         (window.viewport_size().height.as_f32()
             - TOP_BAR_HEIGHT
             - BOTTOM_BAR_HEIGHT
@@ -2737,6 +2617,22 @@ impl RootView {
             let Some(path) = image_path.as_deref() else { unreachable!("pdf viewer requires a file path"); };
             return self.render_pdf_preview(path, root, window, cx);
         }
+        let is_svg_split =
+            image_path.as_deref().is_some_and(svg_view::is_svg_path) && self.svg_split_view;
+        let svg_split_pane: Option<gpui::AnyElement> = if is_svg_split {
+            if let Some(id) = tab_id {
+                let raw_svg = self
+                    .editors
+                    .get(&id)
+                    .map(|e| e.text_string())
+                    .unwrap_or_default();
+                Some(self.render_svg_preview_pane(id, &raw_svg, cx))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let t = *crate::theme::active(cx);
         let is_dark = crate::theme::mode(cx) == ThemeMode::Dark;
         let active_path = image_path.unwrap_or_default();
@@ -3071,6 +2967,18 @@ impl RootView {
                         )
                     })
                     .unwrap_or_default();
+                let task_cb: Option<Box<dyn Fn(&mut Window, &mut App)>> =
+                    if row.is_first_wrap_row && markdown::parse_task_line(&full_line).is_some() {
+                        let root_weak = cx.entity().downgrade();
+                        let target_line = row.buffer_line;
+                        Some(Box::new(move |_, cx| {
+                            let _ = root_weak.update(cx, |root, cx| {
+                                root.md_toggle_task_at_line(target_line, cx);
+                            });
+                        }))
+                    } else {
+                        None
+                    };
                 elements.push(markdown::render_markdown_wrapped_row(
                     &row.text,
                     &full_line,
@@ -3080,6 +2988,7 @@ impl RootView {
                     PREVIEW_LINE_HEIGHT,
                     PREVIEW_FONT_SIZE,
                     &t,
+                    task_cb,
                 ));
                 idx += 1;
             }
@@ -3247,6 +3156,24 @@ impl RootView {
                                                     )
                                                 })
                                                 .unwrap_or_default();
+                                            let task_cb: Option<Box<dyn Fn(&mut Window, &mut App)>> =
+                                                if row.is_first_wrap_row
+                                                    && markdown::parse_task_line(&full_line)
+                                                        .is_some()
+                                                {
+                                                    let root_weak = cx.entity().downgrade();
+                                                    let target_line = row.buffer_line;
+                                                    Some(Box::new(move |_, cx| {
+                                                        let _ = root_weak.update(cx, |root, cx| {
+                                                            root.md_toggle_task_at_line(
+                                                                target_line,
+                                                                cx,
+                                                            );
+                                                        });
+                                                    }))
+                                                } else {
+                                                    None
+                                                };
                                             return markdown::render_markdown_wrapped_row(
                                                 &row.text,
                                                 &full_line,
@@ -3256,6 +3183,7 @@ impl RootView {
                                                 PREVIEW_LINE_HEIGHT,
                                                 PREVIEW_FONT_SIZE,
                                                 &t,
+                                                task_cb,
                                             );
                                         }
 
@@ -3417,15 +3345,20 @@ impl RootView {
                     )
                 })
                 .when(show_scroll, |v| {
+                    let mut sb = div()
+                        .id("manuscript-scrollbar")
+                        .absolute()
+                        .top(px(0.))
+                        .bottom(px(0.))
+                        .w(px(8.))
+                        .cursor_pointer();
+                    if is_svg_split {
+                        sb = sb.left(px((geo.left_occ + geo.col_w - 8.0).max(0.0)));
+                    } else {
+                        sb = sb.right(px(0.));
+                    }
                     v.child(
-                        div()
-                            .id("manuscript-scrollbar")
-                            .absolute()
-                            .right(px(0.))
-                            .top(px(0.))
-                            .bottom(px(0.))
-                            .w(px(8.))
-                            .cursor_pointer()
+                        sb
                             .on_hover({
                                 let root = root.clone();
                                 move |hovered, _, cx| {
@@ -3476,675 +3409,57 @@ impl RootView {
                             ),
                     )
                 })
-            )
-            .into_any_element()
-    }
-
-    fn start_pdf_load(&mut self, path: &str, cx: &mut Context<Self>) {
-        if self.pdf_loading.contains(path) || self.pdf_assets.contains_key(path) { return; }
-        let key = path.to_string();
-        self.pdf_loading.insert(key.clone());
-        cx.spawn(async move |this, cx| {
-            let load_key = key.clone();
-            let loaded = cx.background_executor().spawn(async move { load_pdf_assets(&load_key) }).await;
-            let _ = this.update(cx, |root, cx| {
-                root.pdf_loading.remove(&key);
-                if let Some(loaded) = loaded {
-                    root.pdf_assets.insert(key.clone(), loaded.pages);
-                } else {
-                    root.pdf_load_errors.insert(key.clone());
-                }
-                cx.notify();
-            });
-        }).detach();
-    }
-
-    fn render_pdf_preview(
-        &mut self,
-        path: &str,
-        _root: WeakEntity<RootView>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let t = *crate::theme::active(cx);
-        if !self.pdf_loading.contains(path)
-            && !self.pdf_assets.contains_key(path)
-            && !self.pdf_load_errors.contains(path)
-        {
-            self.start_pdf_load(path, cx);
-        }
-        let Some(pages) = self.pdf_assets.get(path) else {
-            return div()
-                .id("pdf-preview")
-                .w_full()
-                .flex_1()
-                .min_h(px(0.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(rgba(t.bg_primary))
-                .child(div().text_sm().text_color(rgba(t.text_secondary)).child(
-                    if self.pdf_load_errors.contains(path) { "Unable to preview this PDF" } else { "Loading PDF…" },
-                ))
-                .into_any_element();
-        };
-        let view_w = window.viewport_size().width.as_f32().max(1.0);
-        let max_w = (view_w - self.dock_occupancy().0 - 48.0).max(120.0);
-        let children = pages.iter().enumerate().map(|(index, page)| {
-            let scale = (max_w / page.width as f32).min(1.0);
-            div()
-                .id(format!("pdf-page-{index}"))
-                .w(px(page.width as f32 * scale))
-                .h(px(page.height as f32 * scale))
-                .bg(rgba(0xffffffff))
-                .child(img(ImageSource::from(page.image.clone())).size_full().object_fit(ObjectFit::Fill))
-        });
-        div()
-            .id("pdf-preview")
-            .w_full()
-            .flex_1()
-            .min_h(px(0.))
-            .flex()
-            .flex_col()
-            .items_center()
-            .gap(px(16.))
-            .py(px(16.))
-            .overflow_y_scroll()
-            .bg(rgba(t.bg_primary))
-            .children(children)
-            .into_any_element()
-    }
-
-    fn start_image_load(&mut self, path: &str, cx: &mut Context<Self>) {
-        if self.image_loading.contains(path) || self.image_assets.contains_key(path) {
-            return;
-        }
-
-        let key = path.to_string();
-        self.image_loading.insert(key.clone());
-        cx.spawn(async move |this, cx| {
-            let load_key = key.clone();
-            let loaded = cx
-                .background_executor()
-                .spawn(async move { load_image_asset(&load_key) })
-                .await;
-            let _ = this.update(cx, |root, cx| {
-                root.image_loading.remove(&key);
-                if let Some(loaded) = loaded {
-                    root.image_assets.insert(
-                        key.clone(),
-                        (
-                            loaded.image,
-                            loaded.width,
-                            loaded.height,
-                        ),
-                    );
-                    root.prune_image_cache(&key);
-                } else {
-                    root.image_load_errors.insert(key.clone());
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn prune_image_cache(&mut self, keep: &str) {
-        const IMAGE_CACHE_BUDGET: usize = 256 * 1024 * 1024;
-        let total_bytes: usize = self
-            .image_assets
-            .values()
-            .map(|(image, _, _)| image.bytes.len())
-            .sum();
-        if total_bytes <= IMAGE_CACHE_BUDGET {
-            return;
-        }
-
-        // Keep the image currently being displayed and release retained source
-        // buffers for older tabs. GPUI may still hold its own render asset, but
-        // this prevents the application cache from growing without bound.
-        let current = self.image_assets.remove(keep);
-        self.image_assets.clear();
-        if let Some(current) = current {
-            self.image_assets.insert(keep.to_string(), current);
-        }
-    }
-
-    fn render_image_preview(
-        &mut self,
-        path: &str,
-        root: WeakEntity<RootView>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let t = *crate::theme::active(cx);
-        let image = self.image_assets.get(path).cloned();
-
-        let Some((image, image_w, image_h)) = image else {
-            if !self.image_loading.contains(path) && !self.image_load_errors.contains(path) {
-                self.start_image_load(path, cx);
-            }
-            return div()
-                .id("image-preview")
-                .w_full()
-                .flex_1()
-                .min_h(px(0.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(rgba(t.bg_primary))
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(rgba(t.text_secondary))
-                        .child(if self.image_load_errors.contains(path) {
-                            "Unable to preview this image"
-                        } else {
-                            "Loading image…"
-                        }),
-                )
-                .into_any_element();
-        };
-
-        let viewport = window.viewport_size();
-        let (left_occ, right_occ) = self.dock_occupancy();
-        let view_w = (viewport.width.as_f32() - left_occ - right_occ).max(1.0);
-        let view_h = Self::viewport_h(window).max(1.0);
-        let image_w = image_w as f32;
-        let image_h = image_h as f32;
-        const CANVAS_MARGIN: f32 = 16.0;
-        let fit_w = (view_w - CANVAS_MARGIN * 2.0).max(1.0);
-        let fit_h = (view_h - CANVAS_MARGIN * 2.0).max(1.0);
-        let fit = (fit_w / image_w).min(fit_h / image_h);
-        let draw_w = image_w * fit * self.image_zoom;
-        let draw_h = image_h * fit * self.image_zoom;
-        // The inset is only used to establish the fully-fitted image size.
-        // Once zooming starts, pan against the actual canvas edges instead of
-        // carrying that fit inset into the zoomed layout.
-        let max_pan_x = if self.image_zoom <= 1.0 {
-            0.0
-        } else {
-            (draw_w - view_w).abs() / 2.0
-        };
-        let max_pan_y = if self.image_zoom <= 1.0 {
-            0.0
-        } else {
-            (draw_h - view_h).abs() / 2.0
-        };
-        let left = left_occ + (view_w - draw_w) / 2.0 + self.image_pan.0;
-        let top = (view_h - draw_h) / 2.0 + self.image_pan.1;
-
-        // Scale from source-image pixels to preview pixels.
-        let scale_x = if image_w > 0.0 { draw_w / image_w } else { 1.0 };
-        let scale_y = if image_h > 0.0 { draw_h / image_h } else { 1.0 };
-
-        // Tool widths are given on screen at the fit-to-window zoom level and
-        // stored in image pixels, so they grow as you zoom in.
-        self.image_fit = fit;
-        let pen_width = (self.ink_pen_size / fit).max(0.5);
-        let hl_width = (self.ink_highlighter_size / fit).max(1.0);
-        let eraser_radius = ink::ERASER_SCREEN_RADIUS / scale_x;
-
-        // The image rect's origin in window coordinates. Only the ink layer's
-        // prepaint knows where the preview column actually sits, so it
-        // publishes the measured origin here for the mouse handlers.
-        let ink_origin: Rc<Cell<(f32, f32)>> = Rc::new(Cell::new((left, top)));
-
-        let mut preview = div()
-            .id("image-preview")
-            .w_full()
-            .flex_1()
-            .min_h(px(0.))
-            .relative()
-            .overflow_hidden()
-            .bg(rgba(t.bg_primary))
-            .on_mouse_down(MouseButton::Right, {
-                let root = root.clone();
-                move |event: &MouseDownEvent, _, cx| {
-                    let _ = root.update(cx, |root, _| {
-                        root.image_zoom_target = root.image_zoom;
-                        root.image_pan_target = root.image_pan;
-                        root.image_drag = Some((
-                            MouseButton::Right,
-                            event.position.x.as_f32(),
-                            event.position.y.as_f32(),
-                            root.image_pan.0,
-                            root.image_pan.1,
-                        ));
-                    });
-                    cx.stop_propagation();
-                }
-            })
-            .on_mouse_down(MouseButton::Middle, {
-                let root = root.clone();
-                move |event: &MouseDownEvent, _, cx| {
-                    let _ = root.update(cx, |root, _| {
-                        root.image_zoom_target = root.image_zoom;
-                        root.image_pan_target = root.image_pan;
-                        root.image_drag = Some((
-                            MouseButton::Middle,
-                            event.position.x.as_f32(),
-                            event.position.y.as_f32(),
-                            root.image_pan.0,
-                            root.image_pan.1,
-                        ));
-                    });
-                    cx.stop_propagation();
-                }
-            })
-            .on_mouse_move({
-                let root = root.clone();
-                move |event: &gpui::MouseMoveEvent, _, cx| {
-                    let _ = root.update(cx, |root, cx| {
-                        if let Some((_, start_x, start_y, pan_x, pan_y)) = root.image_drag {
-                            root.image_pan = (
-                                (pan_x + event.position.x.as_f32() - start_x)
-                                    .clamp(-max_pan_x, max_pan_x),
-                                (pan_y + event.position.y.as_f32() - start_y)
-                                    .clamp(-max_pan_y, max_pan_y),
-                            );
-                            root.image_pan_target = root.image_pan;
-                            cx.notify();
-                        }
-                    });
-                }
-            })
-            .on_mouse_exit({
-                let root = root.clone();
-                move |_event: &MouseExitEvent, _, cx| {
-                    let _ = root.update(cx, |root, _| root.image_drag = None);
-                }
-            })
-            .on_mouse_up(MouseButton::Right, {
-                let root = root.clone();
-                move |_, _, cx| {
-                    let _ = root.update(cx, |root, _| root.image_drag = None);
-                }
-            })
-            .on_mouse_up(MouseButton::Middle, {
-                let root = root.clone();
-                move |_, _, cx| {
-                    let _ = root.update(cx, |root, _| root.image_drag = None);
-                }
-            })
-            .on_scroll_wheel({
-                let root = root.clone();
-                move |event: &ScrollWheelEvent, _, cx| {
-                    let delta = event.delta.pixel_delta(px(20.)).y.as_f32();
-                    if delta == 0.0 {
-                        return;
-                    }
-                    let _ = root.update(cx, |root, cx| {
-                        let old_zoom = root.image_zoom;
-                        let step = (delta.abs() * 0.005).clamp(0.08, 0.5);
-                        let factor = if delta >= 0.0 { 1.0 + step } else { 1.0 / (1.0 + step) };
-                        let new_zoom = (root.image_zoom_target * factor).clamp(1.0, 16.0);
-                        let cursor_x = event.position.x.as_f32() - left_occ - view_w / 2.0;
-                        let cursor_y = event.position.y.as_f32()
-                            - TOP_BAR_HEIGHT
-                            - TOOLBAR_HEIGHT
-                            - view_h / 2.0;
-                        root.image_zoom_target = new_zoom;
-                        if new_zoom <= 1.0 {
-                            root.image_pan_target = (0.0, 0.0);
-                        } else if new_zoom != old_zoom {
-                            let scale = new_zoom / root.image_zoom;
-                            root.image_pan_target.0 =
-                                cursor_x - (cursor_x - root.image_pan.0) * scale;
-                            root.image_pan_target.1 =
-                                cursor_y - (cursor_y - root.image_pan.1) * scale;
-                        }
-                        root.start_image_zoom_animation(cx);
-                        cx.notify();
-                    });
-                }
-            })
-            .child(
-                div()
-                    .id("image-preview-content")
-                    .absolute()
-                    .left(px(left))
-                    .top(px(top))
-                    .w(px(draw_w))
-                    .h(px(draw_h))
-                    .child(
-                        img(ImageSource::from(image))
-                            .size_full()
-                            .object_fit(ObjectFit::Fill),
-                    ),
-            );
-
-        // The drawing tools claim the left mouse button.
-        let tool = self.image_toolbar_tool as u8;
-        if matches!(
-            tool,
-            ink::TOOL_PEN | ink::TOOL_HIGHLIGHTER | ink::TOOL_ERASER
-        ) {
-            let root_down = root.clone();
-            let path_down = path.to_string();
-            let origin_down = ink_origin.clone();
-            preview = preview.on_mouse_down(
-                MouseButton::Left,
-                move |ev: &MouseDownEvent, _w, cx| {
-                    let (ox, oy) = origin_down.get();
-                    let ix = (ev.position.x.as_f32() - ox) / scale_x;
-                    let iy = (ev.position.y.as_f32() - oy) / scale_y;
-                    let _ = root_down.update(cx, |root, cx| {
-                        root.begin_ink_stroke(
-                            &path_down,
-                            ix,
-                            iy,
-                            pen_width,
-                            hl_width,
-                            eraser_radius,
-                        );
-                        // Drawing closes the colour and size popup.
-                        root.set_ink_popup(None, cx);
-                        cx.notify();
-                    });
-                    cx.stop_propagation();
-                },
-            );
-
-            let root_move = root.clone();
-            let origin_move = ink_origin.clone();
-            preview = preview.on_mouse_move(
-                move |ev: &gpui::MouseMoveEvent, _w, cx| {
-                    let (ox, oy) = origin_move.get();
-                    let ix = (ev.position.x.as_f32() - ox) / scale_x;
-                    let iy = (ev.position.y.as_f32() - oy) / scale_y;
-                    let _ = root_move.update(cx, |root, cx| {
-                        if root.extend_ink_stroke(ix, iy, eraser_radius)
-                            && root.image_last_ink_notify.elapsed() >= Duration::from_millis(8)
-                        {
-                            root.image_last_ink_notify = Instant::now();
-                            cx.notify();
-                        }
-                    });
-                },
-            );
-
-            let root_up = root.clone();
-            preview = preview.on_mouse_up(MouseButton::Left, move |_ev, _w, cx| {
-                let _ = root_up.update(cx, |root, cx| {
-                    root.end_ink_stroke();
-                    cx.notify();
-                });
-            });
-        }
-
-        preview
-            .child(self.render_image_ink_layer(
-                path,
-                left,
-                top,
-                window.viewport_size().width.as_f32(),
-                view_h,
-                scale_x,
-                scale_y,
-                ink_origin.clone(),
-                cx,
-            ))
-            .into_any_element()
-    }
-
-    /// Draw the annotation strokes over the image.
-    ///
-    /// Strokes live in the source image's pixel space, so they stay anchored to
-    /// the image and scale with zoom. Rendering goes through GPUI's path
-    /// pipeline (CPU tessellation, GPU rasterization), which keeps the edges
-    /// smooth at any zoom and costs no per-frame image encoding.
-    #[allow(clippy::too_many_arguments)]
-    fn render_image_ink_layer(
-        &self,
-        path: &str,
-        left: f32,
-        top: f32,
-        view_w: f32,
-        view_h: f32,
-        scale_x: f32,
-        scale_y: f32,
-        origin: Rc<Cell<(f32, f32)>>,
-        _cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let committed: Rc<Vec<InkStroke>> = self
-            .image_strokes
-            .get(path)
-            .cloned()
-            .unwrap_or_default();
-        let current_stroke = self.image_current_stroke.clone();
-        let cache = self.image_ink_cache.clone();
-        let revision = self.image_ink_revision;
-        let cache_path = path.to_string();
-
-        let origin_prepaint = origin.clone();
-        let canvas = gpui::canvas(
-            move |bounds: gpui::Bounds<gpui::Pixels>, _window, _app| {
-                // The canvas covers the whole preview area, so its origin is
-                // the preview area's origin in window coordinates. The image
-                // sits at left/	op inside it.
-                origin_prepaint.set((
-                    bounds.origin.x.as_f32() + left,
-                    bounds.origin.y.as_f32() + top,
-                ));
-            },
-            move |bounds: gpui::Bounds<gpui::Pixels>, _unit, window, _app| {
-                let ox = bounds.origin.x.as_f32();
-                let oy = bounds.origin.y.as_f32();
-                let vw = bounds.size.width.as_f32();
-                let vh = bounds.size.height.as_f32();
-                // The image's origin in window coordinates.
-                let ix0 = ox + left;
-                let iy0 = oy + top;
-
-                let key = (revision, scale_x.to_bits(), scale_y.to_bits(), ix0.to_bits(), iy0.to_bits(), vw.to_bits(), vh.to_bits());
-                let cached = cache
-                    .borrow()
-                    .as_ref()
-                    .filter(|c| c.path == cache_path && c.key == key)
-                    .map(|c| (c.pen.clone(), c.highlighter.clone()));
-                let (pen_paths, hl_paths) = if let Some(paths) = cached {
-                    paths
-                } else {
-                    // Drop the previous zoom/viewport cache before allocating
-                    // the replacement, keeping peak memory bounded.
-                    *cache.borrow_mut() = None;
-                    let (pen_groups, hl_groups) = build_ink_groups(
-                        &committed, ix0, iy0, ox, oy, vw, vh, scale_x, scale_y,
-                    );
-                    let pen = fill_ink_groups(pen_groups);
-                    let highlighter = fill_ink_groups(hl_groups);
-                    let vertices = pen
-                        .iter()
-                        .chain(highlighter.iter())
-                        .map(|(_, path)| path.vertices.len())
-                        .sum::<usize>();
-                    if vertices <= MAX_CACHED_INK_VERTICES {
-                        *cache.borrow_mut() = Some(InkRenderCache {
-                            path: cache_path.clone(),
-                            key,
-                            pen: pen.clone(),
-                            highlighter: highlighter.clone(),
-                        });
-                    }
-                    (pen, highlighter)
-                };
-
-                // Every stroke keeps the colour it was drawn in, so changing
-                // the colour later leaves the earlier strokes alone.
-                for (color, path) in pen_paths {
-                    window.paint_path(path, rgba((color << 8) | 0xff));
-                }
-                for (color, path) in hl_paths {
-                    window.paint_path(path, rgba((color << 8) | 0x78));
-                }
-                if let Some(current) = &current_stroke {
-                    let (pen_groups, hl_groups) = build_ink_groups(
-                        std::slice::from_ref(current), ix0, iy0, ox, oy, vw, vh, scale_x, scale_y,
-                    );
-                    for (color, group) in pen_groups {
-                        if let Some(p) = ink::fill(&group) {
-                            window.paint_path(p, rgba((color << 8) | 0xff));
-                        }
-                    }
-                    for (color, group) in hl_groups {
-                        if let Some(p) = ink::fill(&group) {
-                            window.paint_path(p, rgba((color << 8) | 0x78));
-                        }
-                    }
-                }
-            },
-        )
-        .absolute()
-        .left(px(0.))
-        .top(px(0.))
-        .w(px(view_w))
-        .h(px(view_h));
-
-        canvas.into_any_element()
-    }
-
-    /// Zed-style welcome tab: big centered greeting, then a narrow
-    /// left-aligned column of Get Started actions and recent files.
-    fn render_welcome(&self, root: WeakEntity<RootView>, cx: &mut App) -> gpui::AnyElement {
-        let t = *crate::theme::active(cx);
-
-        // Uppercase section label in mono, with a 1px rule taking the
-        // remaining width, vertically centered with the text.
-        let section = |label: &'static str| {
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(12.))
-                .mb(px(8.))
-                .child(
-                    div()
-                        .text_xs()
-                        .font_family(crate::theme::FONT_MONO)
-                        .text_color(rgba(t.text_secondary))
-                        .child(label),
-                )
-                .child(div().flex_1().h(px(1.)).bg(rgba(t.chrome_border_color)))
-        };
-
-        let action_button = |id: &'static str, icon: &'static [u8], label: &'static str| {
-            let root = root.clone();
-            div()
-                .id(id)
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(10.))
-                .h(px(30.))
-                .px(px(6.))
-                .rounded(px(6.))
-                .cursor_pointer()
-                .hover(|s| s.bg(rgba(t.menu_hover_bg)))
-                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                    let root = root.clone();
-                    cx.spawn(async move |cx| {
-                        let path = cx
-                            .background_executor()
-                            .spawn(async {
-                                rfd::FileDialog::new()
-                                    .add_filter("Supported files", ACCEPTED_FILE_EXTENSIONS)
-                                    .pick_file()
+                .when_some(svg_split_pane, |v, svg_pane| {
+                    let (left_occ, right_occ) = self.dock_occupancy();
+                    let full_col =
+                        (window.viewport_size().width.as_f32() - left_occ - right_occ).max(0.0);
+                    let split_x = geo.left_occ + geo.col_w;
+                    let right_w = (full_col - geo.col_w - 1.0).max(0.0);
+                    let root_split = root.clone();
+                    v.child(
+                        div()
+                            .absolute()
+                            .left(px(split_x + 1.0))
+                            .top(px(0.))
+                            .w(px(right_w))
+                            .h(px(view_h))
+                            .flex()
+                            .cursor_default()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
                             })
-                            .await;
-                        if let Some(path) = path {
-                            let _ = root.update(cx, |root, cx| {
-                                root.open_file_path(path.to_string_lossy().into_owned(), cx);
-                            });
-                        }
-                    })
-                    .detach();
-                })
-                .child(
-                    svg()
-                        .data(icon)
-                        .w(px(14.))
-                        .h(px(14.))
-                        .text_color(rgba(t.text_secondary)),
-                )
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(WEIGHT_MEDIUM)
-                        .text_color(rgba(t.text_primary))
-                        .child(label),
-                )
-        };
-
-        div()
-            .flex_1()
-            .min_w(px(0.))
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .overflow_hidden()
-            .bg(rgba(t.bg_primary))
-            .child(
-                div()
-                    .w_full()
-                    .max_w(px(560.))
-                    .px(px(48.))
-                    .flex()
-                    .flex_col()
+                            .child(svg_pane),
+                    )
                     .child(
                         div()
-                            .w_full()
-                            .text_center()
-                            .text_2xl()
-                            .font_weight(FontWeight(500.0))
-                            .text_color(rgba(t.text_primary))
-                            .mb(px(28.))
-                            .child("Welcome to Peeklet"),
-                    )
-                    .child(section("OPEN A FILE"))
-                    .child(action_button("welcome-open", ICON_OPEN_FILE, "Open File…"))
-                    .child(div().h(px(20.)))
-                    .when(!self.recent_files.is_empty(), |col| {
-                        col.child(section("RECENT FILES")).children(
-                            self.recent_files.iter().map(|path| {
-                                let root = root.clone();
-                                let path = path.clone();
-                                let name = std::path::Path::new(&path)
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().into_owned())
-                                    .unwrap_or_else(|| path.clone());
+                            .id("svg-split-divider")
+                            .absolute()
+                            .left(px(split_x - 3.0))
+                            .top(px(0.))
+                            .w(px(7.))
+                            .h(px(view_h))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_col_resize()
+                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                let _ = root_split.update(cx, |root, cx| {
+                                    root.begin_md_split_drag(cx);
+                                });
+                                cx.stop_propagation();
+                            })
+                            .child(
                                 div()
-                                    .id(format!("recent-{path}"))
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .h(px(28.))
-                                    .px(px(6.))
-                                    .rounded(px(6.))
-                                    .cursor_pointer()
-                                    .overflow_hidden()
-                                    .hover(|s| s.bg(rgba(t.menu_hover_bg)))
-                                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                                        let _ = root.update(cx, |root, cx| {
-                                            root.open_file_path(path.clone(), cx);
-                                        });
-                                    })
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_weight(WEIGHT_MEDIUM)
-                                            .text_color(rgba(t.text_primary))
-                                            .whitespace_nowrap()
-                                            .overflow_hidden()
-                                            .child(name),
-                                    )
-                            }),
-                        )
-                    }),
+                                    .w(px(1.))
+                                    .h_full()
+                                    .bg(rgba(t.chrome_border_color)),
+                            ),
+                    )
+                })
             )
             .into_any_element()
     }
+
 }
 
 impl Render for RootView {
@@ -4166,7 +3481,10 @@ impl Render for RootView {
                         .update(cx, |root, cx| {
                             let is_text_tab = root.tabs.get(root.active_tab).is_some_and(|tab| {
                                 tab.title != "Welcome"
-                                    && viewer_kind(tab.path.as_deref()) == ViewerKind::Text
+                                    && matches!(
+                                        viewer_kind(tab.path.as_deref()),
+                                        ViewerKind::Text | ViewerKind::Svg | ViewerKind::Csv
+                                    )
                             });
                             if !is_text_tab {
                                 return;
@@ -4204,7 +3522,11 @@ impl Render for RootView {
             .tabs
             .get(self.active_tab)
             .filter(|tab| {
-                tab.title != "Welcome" && viewer_kind(tab.path.as_deref()) == ViewerKind::Text
+                tab.title != "Welcome"
+                    && matches!(
+                        viewer_kind(tab.path.as_deref()),
+                        ViewerKind::Text | ViewerKind::Svg | ViewerKind::Csv
+                    )
             })
             .map(|tab| tab.id);
         let measure_bits = geo.measure.to_bits();
@@ -4230,14 +3552,15 @@ impl Render for RootView {
             self.ascii_max_width = max_w.max(1.0);
         }
 
-        let wrap_cache: Option<Rc<EditorWrapCache>> = if geo.measure == f32::MAX {
-            None
-        } else if self.cached_wrap_key == wrap_key {
-            self.cached_wrap.clone()
-        } else {
-            let color = Hsla::from(rgba(t.text_primary));
-            let lut = self.ascii_char_widths.unwrap();
-            let max_w = self.ascii_max_width;
+        let wrap_cache: Option<Rc<EditorWrapCache>> =
+            if active_text_tab_id.is_none() || geo.measure == f32::MAX {
+                None
+            } else if self.cached_wrap_key == wrap_key {
+                self.cached_wrap.clone()
+            } else {
+                let color = Hsla::from(rgba(t.text_primary));
+                let lut = self.ascii_char_widths.unwrap_or([8.0; 128]);
+                let max_w = self.ascii_max_width;
 
             let built = active_text_tab_id.map(|id| {
                 let ed = self.editors.entry(id).or_insert_with(EditorState::new);
@@ -4348,12 +3671,14 @@ impl Render for RootView {
                     window.viewport_size().width.as_f32(),
                     cx,
                 );
+                this.drag_image_crop_to(ev.position.x.as_f32(), ev.position.y.as_f32(), cx);
                 this.scroll_x_drag_to(ev.position.x.as_f32(), cx);
                 let thumb_h = this.scrollbar_thumb_height(window);
                 let view_h = Self::viewport_h(window);
                 this.scroll_drag_to(ev.position.y.as_f32(), view_h, view_h, thumb_h, cx);
             }))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| {
+                this.image_crop_drag = None;
                 this.end_drag(cx);
             }))
             .on_mouse_up(MouseButton::Right, cx.listener(|this, _, _, cx| {
@@ -4454,6 +3779,9 @@ impl Render for RootView {
                     active: self.active_menu,
                     animation: self.menu_animation,
                 })
+            })
+            .when_some(self.render_image_context_menu(root.clone(), window, cx), |d, menu| {
+                d.child(deferred(menu).with_priority(5))
             })
             .when(self.close_confirm.is_some(), |d| {
                 let shell = root.clone();
@@ -4617,7 +3945,7 @@ impl Render for RootView {
                                                                     cx.notify();
                                                                 });
                                                             })
-                                                            .child("✕"),
+                                                            .child("âœ•"),
                                                     ),
                                             )
                                             .child(
@@ -4630,7 +3958,9 @@ impl Render for RootView {
                                                     .when(tab == 0, |c| {
                                                         c.child(
                                                             div()
-                                                                .py(px(10.))
+                                                                .py(px(12.))
+                                                                .border_b_1()
+                                                                .border_color(rgba(t.border_color))
                                                                 .flex()
                                                                 .flex_row()
                                                                 .items_center()
@@ -4679,7 +4009,7 @@ impl Render for RootView {
                                                                                 .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                                                                                     crate::theme::state::set_mode(ThemeMode::Light, cx);
                                                                                     let _ = shell_light.update(cx, |root, cx| {
-                                                                                        root.store.set("theme", "light");
+                                                                                        root.store.set("theme.mode", "light");
                                                                                         cx.notify();
                                                                                     });
                                                                                 })
@@ -4699,7 +4029,7 @@ impl Render for RootView {
                                                                                 .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                                                                                     crate::theme::state::set_mode(ThemeMode::Dark, cx);
                                                                                     let _ = shell_dark.update(cx, |root, cx| {
-                                                                                        root.store.set("theme", "dark");
+                                                                                        root.store.set("theme.mode", "dark");
                                                                                         cx.notify();
                                                                                     });
                                                                                 })
@@ -4707,6 +4037,15 @@ impl Render for RootView {
                                                                         ),
                                                                 ),
                                                         )
+                                                        .child(settings_toggle(
+                                                            t,
+                                                            shell.clone(),
+                                                            "Windows \"Open with\"",
+                                                            "Register Peeklet for supported files in Explorer and Default Apps.",
+                                                            self.windows_open_with,
+                                                            "windows_open_with",
+                                                            false,
+                                                        ))
                                                     })
                                                     .when(tab == 1, |c| {
                                                         c.child(settings_toggle(
@@ -4756,288 +4095,6 @@ impl Render for RootView {
     }
 }
 
-fn settings_tab_button(
-    t: crate::theme::Theme,
-    shell: gpui::WeakEntity<crate::shell::root::RootView>,
-    index: usize,
-    label: &'static str,
-    active: bool,
-) -> gpui::AnyElement {
-    use gpui::prelude::*;
-    div()
-        .id(format!("settings-tab-{}", index))
-        .w_full()
-        .px(gpui::px(10.))
-        .py(gpui::px(6.))
-        .rounded(gpui::px(7.))
-        .cursor_pointer()
-        .text_sm()
-        .font_weight(if active { WEIGHT_MEDIUM } else { FontWeight::NORMAL })
-        .text_color(gpui::rgba(if active { t.text_primary } else { t.text_secondary }))
-        .border_1()
-        .border_color(gpui::rgba(if active { t.border_color } else { 0x00000000 }))
-        .bg(gpui::rgba(if active { t.bg_darker } else { 0x00000000 }))
-        .hover(|s| s.bg(gpui::rgba(t.menu_hover_bg)))
-        .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
-            let _ = shell.update(cx, |root, cx| {
-                root.settings_tab = index;
-                cx.notify();
-            });
-        })
-        .child(label)
-        .into_any_element()
-}
-
-fn settings_toggle(
-    t: crate::theme::Theme,
-    shell: gpui::WeakEntity<crate::shell::root::RootView>,
-    label: &'static str,
-    description: &'static str,
-    value: bool,
-    kind: &'static str,
-    divider: bool,
-) -> gpui::AnyElement {
-    use gpui::prelude::*;
-    let shell2 = shell.clone();
-    let mut row = div()
-        .w_full()
-        .py(gpui::px(12.))
-        .flex()
-        .flex_row()
-        .items_center()
-        .justify_between()
-        .gap(gpui::px(16.));
-    if divider {
-        row = row.border_b_1().border_color(gpui::rgba(t.border_color));
-    }
-    row.child(
-        div()
-            .flex()
-            .flex_col()
-            .gap(gpui::px(2.))
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(WEIGHT_MEDIUM)
-                    .text_color(gpui::rgba(t.text_primary))
-                    .child(label),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(gpui::rgba(t.text_secondary))
-                    .child(description),
-            ),
-    )
-    .child(
-        div()
-            .id(format!("settings-toggle-{}", label))
-            .relative()
-            .flex_shrink_0()
-            .w(gpui::px(36.))
-            .h(gpui::px(20.))
-            .rounded(gpui::px(10.))
-            .cursor_pointer()
-            .border_1()
-            .border_color(gpui::rgba(if value {
-                t.accent
-            } else {
-                t.component_border_color
-            }))
-            .bg(gpui::rgba(if value { t.accent } else { t.bg_darker }))
-            .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
-                let _ = shell2.update(cx, |root, cx| match kind {
-                    "wrap_text" => root.set_wrap_text_files(!value, cx),
-                    "wrap_code" => root.set_wrap_code_files(!value, cx),
-                    "line_numbers" => root.set_line_numbers(!value, cx),
-                    "syntax_highlighting" => root.set_syntax_highlighting(!value, cx),
-                    _ => {}
-                });
-            })
-            .child(
-                div()
-                    .absolute()
-                    .top(gpui::px(2.))
-                    .left(gpui::px(if value { 18.0 } else { 2.0 }))
-                    .w(gpui::px(14.))
-                    .h(gpui::px(14.))
-                    .rounded(gpui::px(7.))
-                    .bg(gpui::rgba(if value { 0xffffffff } else { t.text_secondary })),
-            ),
-    )
-    .into_any_element()
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum ListEnterAction {
-    Insert(String),
-    ClearLine { start: usize, end: usize },
-}
-
-/// Compute what Enter should do on a list line:
-/// - If the line has text after the bullet/number/checkbox, continue the list.
-/// - If the line has only the bullet/number/checkbox with no text, clear it.
-fn list_enter_action(ed: &EditorState) -> ListEnterAction {
-    let (line_no, col) = ed.cursor_line_col();
-    if line_no >= ed.len_lines() {
-        return ListEnterAction::Insert("\n".to_string());
-    }
-    let line = ed.line_text(line_no);
-    let leading_ws = line.len() - line.trim_start().len();
-    let ws = &line[..leading_ws];
-    let trimmed = &line[leading_ws..];
-    let ws_chars = ws.chars().count();
-
-    // Unordered / task list (`- `, `* `, `+ `).
-    if trimmed.len() >= 2
-        && matches!(trimmed.as_bytes()[0], b'-' | b'*' | b'+')
-        && trimmed.as_bytes()[1] == b' '
-    {
-        let marker = trimmed.as_bytes()[0] as char;
-        let after = &trimmed[2..];
-        let is_task = after.starts_with("[ ] ")
-            || after.starts_with("[x] ")
-            || after.starts_with("[X] ");
-        let prefix_bytes = if is_task { 6 } else { 2 };
-        let prefix_chars = ws_chars + prefix_bytes;
-        if col >= prefix_chars {
-            if trimmed[prefix_bytes..].trim().is_empty() {
-                let start = ed.line_start_char(line_no);
-                let end = start + ed.line_char_len(line_no);
-                return ListEnterAction::ClearLine { start, end };
-            }
-            return ListEnterAction::Insert(if is_task {
-                format!("\n{ws}{marker} [ ] ")
-            } else {
-                format!("\n{ws}{marker} ")
-            });
-        }
-    }
-
-    // Ordered list (`1. ` or `1) `).
-    let digits = trimmed.bytes().take_while(|b| b.is_ascii_digit()).count();
-    if digits > 0
-        && digits + 1 < trimmed.len()
-        && matches!(trimmed.as_bytes()[digits], b'.' | b')')
-        && trimmed.as_bytes()[digits + 1] == b' '
-    {
-        let prefix_bytes = digits + 2;
-        let prefix_chars = ws_chars + prefix_bytes;
-        if col >= prefix_chars {
-            if trimmed[prefix_bytes..].trim().is_empty() {
-                let start = ed.line_start_char(line_no);
-                let end = start + ed.line_char_len(line_no);
-                return ListEnterAction::ClearLine { start, end };
-            }
-            if let Ok(num) = trimmed[..digits].parse::<usize>() {
-                let delim = trimmed.as_bytes()[digits] as char;
-                return ListEnterAction::Insert(format!("\n{ws}{}{delim} ", num + 1));
-            }
-        }
-    }
-
-    ListEnterAction::Insert("\n".to_string())
-}
-
-/// Compute whether a visual row is the first/last row of a contiguous
-/// multi-line blockquote so its left bar renders as one continuous line.
-fn quote_pos_for_row(
-    ed: &EditorState,
-    line_no: usize,
-    is_first_wrap_row: bool,
-    is_last_wrap_row: bool,
-) -> markdown::QuotePos {
-    let prev_is_quote = line_no > 0 && markdown::is_quote_line(&ed.line_text(line_no - 1));
-    let next_is_quote =
-        line_no + 1 < ed.len_lines() && markdown::is_quote_line(&ed.line_text(line_no + 1));
-    markdown::QuotePos {
-        is_first: is_first_wrap_row && !prev_is_quote,
-        is_last: is_last_wrap_row && !next_is_quote,
-    }
-}
-
-/// Determine whether `line_no` is part of a Markdown table (header, separator,
-/// or body row).
-fn table_row_kind(ed: &EditorState, line_no: usize) -> markdown::TableRowKind {
-    let total = ed.len_lines();
-    if line_no >= total {
-        return markdown::TableRowKind::None;
-    }
-    let line = ed.line_text(line_no);
-    if markdown::is_table_separator(&line) {
-        if line_no > 0 && markdown::parse_table_cells(&ed.line_text(line_no - 1)).is_some() {
-            return markdown::TableRowKind::Separator;
-        }
-        return markdown::TableRowKind::None;
-    }
-    if markdown::parse_table_cells(&line).is_none() {
-        return markdown::TableRowKind::None;
-    }
-    if line_no + 1 < total && markdown::is_table_separator(&ed.line_text(line_no + 1)) {
-        return markdown::TableRowKind::Header;
-    }
-    // Walk up over contiguous table rows to confirm a separator + header above.
-    let mut up = line_no;
-    while up > 0 {
-        up -= 1;
-        let prev = ed.line_text(up);
-        if markdown::is_table_separator(&prev) {
-            if up > 0 && markdown::parse_table_cells(&ed.line_text(up - 1)).is_some() {
-                let next_is_body = line_no + 1 < total && {
-                    let next = ed.line_text(line_no + 1);
-                    markdown::parse_table_cells(&next).is_some()
-                        && !markdown::is_table_separator(&next)
-                };
-                return markdown::TableRowKind::Body {
-                    is_last: !next_is_body,
-                };
-            }
-            return markdown::TableRowKind::None;
-        }
-        if markdown::parse_table_cells(&prev).is_none() {
-            return markdown::TableRowKind::None;
-        }
-    }
-    markdown::TableRowKind::None
-}
-
-fn is_code_path(path: &str) -> bool {
-    let ext = std::path::Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    matches!(ext.as_str(),
-        "rs" | "js" | "ts" | "jsx" | "tsx" | "py" | "c" | "cpp" | "cc" | "h" | "hpp" |
-        "java" | "go" | "toml" | "json" | "yaml" | "yml" | "css" | "scss" | "html" |
-        "sh" | "bash" | "sql" | "kt" | "swift" | "rb" | "php" | "cs" | "xml" | "ini"
-    )
-}
-
-fn modal_button(t: crate::theme::Theme, label: &'static str, _primary: bool, on_click: impl Fn(&mut gpui::App) + 'static + Clone) -> gpui::AnyElement {
-    use gpui::prelude::*;
-    let cb = on_click.clone();
-    div()
-        .id(format!("modal-{}", label))
-        .flex_1()
-        .flex()
-        .items_center()
-        .justify_center()
-        .px(gpui::px(12.))
-        .py(gpui::px(4.))
-        .rounded(gpui::px(10.))
-        .cursor_pointer()
-        .border_1()
-        .border_color(gpui::rgba(t.chrome_border_color))
-        .bg(gpui::rgba(t.menu_hover_bg))
-        .hover(|s| s.bg(gpui::rgba(t.bg_secondary)))
-        .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
-            cb(cx);
-        })
-        .child(label)
-        .into_any_element()
-}
-
 impl Drop for RootView {
     fn drop(&mut self) {
         for id in self.dirty_tabs.clone() {
@@ -5059,739 +4116,9 @@ impl Drop for RootView {
     }
 }
 
-use std::sync::OnceLock;
-
-static SYNTAX_SET: OnceLock<syntect::parsing::SyntaxSet> = OnceLock::new();
-static PAPER_LIGHT_THEME: OnceLock<syntect::highlighting::Theme> = OnceLock::new();
-static PAPER_DARK_THEME: OnceLock<syntect::highlighting::Theme> = OnceLock::new();
-
-fn syntect_rgb(hex: u32) -> syntect::highlighting::Color {
-    syntect::highlighting::Color {
-        r: ((hex >> 16) & 0xff) as u8,
-        g: ((hex >> 8) & 0xff) as u8,
-        b: (hex & 0xff) as u8,
-        a: 0xff,
-    }
-}
-
-fn paper_scope(selector: &str, hex: u32) -> syntect::highlighting::ThemeItem {
-    use std::str::FromStr;
-    syntect::highlighting::ThemeItem {
-        scope: syntect::highlighting::ScopeSelectors::from_str(selector)
-            .expect("valid syntect scope selector"),
-        style: syntect::highlighting::StyleModifier {
-            foreground: Some(syntect_rgb(hex)),
-            background: None,
-            font_style: None,
-        },
-    }
-}
-
-/// Build the Paper Light or Paper Dark syntax theme matching the Zed "Paper"
-/// theme palette.
-fn build_paper_syntax_theme(is_dark: bool) -> syntect::highlighting::Theme {
-    let (
-        fg,
-        comment,
-        comment_doc,
-        keyword,
-        operator,
-        function,
-        type_color,
-        string_color,
-        string_escape,
-        number,
-        boolean,
-        constant,
-        property,
-        variable,
-        param,
-        var_special,
-        punctuation,
-        bracket,
-        delimiter,
-        selector,
-        title,
-        diff_plus,
-        diff_minus,
-    ) = if is_dark {
-        (
-            0xd2d2ce, // primary / variable
-            0x777772, // comment
-            0x858580, // comment.doc
-            0x7897ca, // keyword / attribute / tag / label / constructor
-            0x92928c, // operator
-            0xa487bd, // function / preproc
-            0x89a7d8, // type / enum
-            0xc5a35a, // string / string.regex / string.special
-            0xad9b78, // string.escape
-            0xc09a52, // number
-            0xb99958, // boolean
-            0xc1a15a, // constant
-            0xa08da9, // property
-            0xd2d2ce, // variable
-            0xb8b8b2, // variable.parameter
-            0xc09a52, // variable.special
-            0x9a9a94, // punctuation
-            0xaaa9a3, // punctuation.bracket
-            0x858580, // punctuation.delimiter
-            0x819b76, // selector / text.literal
-            0xa08da9, // title
-            0x819b76, // diff.plus
-            0xc17b75, // diff.minus
-        )
-    } else {
-        (
-            0x30302f, // primary / variable
-            0xa1a19e, // comment
-            0x969693, // comment.doc
-            0x5477b8, // keyword / attribute / tag / label / constructor
-            0x6d6d6a, // operator
-            0x845cad, // function / preproc
-            0x5f83bd, // type / enum
-            0xb98922, // string / string.regex / string.special
-            0x9a8760, // string.escape
-            0xa77b2c, // number
-            0xb28a43, // boolean
-            0xb98a32, // constant
-            0x7d6b89, // property
-            0x30302f, // variable
-            0x4d4d4a, // variable.parameter
-            0xa77b2c, // variable.special
-            0x5f5f5c, // punctuation
-            0x777774, // punctuation.bracket
-            0x858582, // punctuation.delimiter
-            0x718d67, // selector / text.literal
-            0x7d6b89, // title
-            0x718d67, // diff.plus
-            0xb96f69, // diff.minus
-        )
-    };
-
-    syntect::highlighting::Theme {
-        name: Some(if is_dark { "Paper Dark" } else { "Paper Light" }.to_string()),
-        author: Some("Declan".to_string()),
-        settings: syntect::highlighting::ThemeSettings {
-            foreground: Some(syntect_rgb(fg)),
-            ..Default::default()
-        },
-        scopes: vec![
-            paper_scope("comment", comment),
-            paper_scope("comment.block.documentation, comment.line.documentation", comment_doc),
-            paper_scope("keyword, storage.type, storage.modifier", keyword),
-            paper_scope("keyword.operator", operator),
-            paper_scope("entity.name.function, support.function, meta.function-call, variable.function", function),
-            paper_scope("meta.preprocessor, support.macro, entity.name.function.macro", function),
-            paper_scope("entity.name.type, entity.name.class, entity.name.struct, entity.name.enum, entity.name.trait, entity.name.interface, support.type, support.class", type_color),
-            paper_scope("entity.name.tag, entity.other.attribute-name, meta.annotation, entity.name.label", keyword),
-            paper_scope("string", string_color),
-            paper_scope("constant.character.escape", string_escape),
-            paper_scope("constant.numeric", number),
-            paper_scope("constant.language.boolean", boolean),
-            paper_scope("constant.language, constant.other, variable.other.constant", constant),
-            paper_scope("variable.other.member, variable.other.property, meta.property-name, support.type.property-name", property),
-            paper_scope("variable", variable),
-            paper_scope("variable.parameter", param),
-            paper_scope("variable.language", var_special),
-            paper_scope("punctuation", punctuation),
-            paper_scope("punctuation.section, punctuation.definition.block, punctuation.definition.parameters, punctuation.definition.group, meta.brace", bracket),
-            paper_scope("punctuation.separator, punctuation.terminator, punctuation.accessor", delimiter),
-            paper_scope("entity.other.attribute-name.class.css, entity.other.attribute-name.id.css, markup.inline.raw", selector),
-            paper_scope("markup.heading, entity.name.section", title),
-            paper_scope("markup.inserted", diff_plus),
-            paper_scope("markup.deleted", diff_minus),
-        ],
-    }
-}
-
-fn highlight_line_spans(
-    text: &str,
-    ext: &str,
-    is_dark: bool,
-    default_color: u32,
-) -> Vec<(u32, usize, usize)> {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    use std::sync::Mutex;
-    const MAX_ENTRIES: usize = 8192;
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<u64, Vec<(u32, usize, usize)>>>> = OnceLock::new();
-    let mut hasher = DefaultHasher::new();
-    text.hash(&mut hasher);
-    ext.hash(&mut hasher);
-    is_dark.hash(&mut hasher);
-    default_color.hash(&mut hasher);
-    let key = hasher.finish();
-    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-    if let Ok(guard) = cache.lock() {
-        if let Some(cached) = guard.get(&key) {
-            return cached.clone();
-        }
-    }
-    let ss = SYNTAX_SET.get_or_init(syntect::parsing::SyntaxSet::load_defaults_newlines);
-    let theme = if is_dark {
-        PAPER_DARK_THEME.get_or_init(|| build_paper_syntax_theme(true))
-    } else {
-        PAPER_LIGHT_THEME.get_or_init(|| build_paper_syntax_theme(false))
-    };
-    let syntax = ss
-        .find_syntax_by_extension(ext)
-        .unwrap_or_else(|| ss.find_syntax_plain_text());
-    let theme_default = theme.settings.foreground;
-    let mut h = syntect::easy::HighlightLines::new(syntax, theme);
-    let Ok(ranges) = h.highlight_line(text, ss) else {
-        return vec![(default_color, 0, text.len())];
-    };
-    let mut out = Vec::new();
-    let mut pos = 0;
-    for (style, s) in ranges {
-        let len = s.len();
-        let c = style.foreground;
-        let color = if theme_default == Some(c) {
-            default_color
-        } else {
-            ((c.r as u32) << 24)
-                | ((c.g as u32) << 16)
-                | ((c.b as u32) << 8)
-                | if c.a == 0 { 0xff } else { c.a as u32 }
-        };
-        out.push((color, pos, pos + len));
-        pos += len;
-    }
-    if out.is_empty() {
-        out.push((default_color, 0, text.len()));
-    }
-    if let Ok(mut guard) = cache.lock() {
-        if guard.len() >= MAX_ENTRIES {
-            // This is a reuse cache, not document state. Bound it so opening
-            // a large or varied workspace cannot retain highlight spans for
-            // every line ever viewed.
-            guard.clear();
-        }
-        guard.insert(key, out.clone());
-    }
-    out
-}
-
-/// Build a raster path for a stroke, offset into the output canvas.
-fn stroke_path(stroke: &InkStroke, off_x: f32, off_y: f32) -> Option<tiny_skia::Path> {
-    if stroke.points.len() < 2 {
-        return None;
-    }
-    let mut pb = tiny_skia::PathBuilder::new();
-    let first = stroke.points[0];
-    pb.move_to(first.0 + off_x, first.1 + off_y);
-    for p in &stroke.points[1..] {
-        pb.line_to(p.0 + off_x, p.1 + off_y);
-    }
-    pb.finish()
-}
-
-/// Rasterize a same-colour group of highlighter strokes into a tight
-/// bounding-box coverage mask and blend it onto `canvas`.
-///
-/// Each stroke is drawn with the lighten blend so overlapping strokes keep a
-/// single layer of opacity instead of stacking, and only the bounding box of
-/// the group is allocated and scanned.
-fn blend_highlighter_group(
-    canvas: &mut tiny_skia::Pixmap,
-    strokes: &[&InkStroke],
-    color: u32,
-    off_x: f32,
-    off_y: f32,
-) {
-    let canvas_w = canvas.width();
-    let canvas_h = canvas.height();
-    let mut min_x = f32::INFINITY;
-    let mut min_y = f32::INFINITY;
-    let mut max_x = f32::NEG_INFINITY;
-    let mut max_y = f32::NEG_INFINITY;
-    for stroke in strokes {
-        let pad = stroke.width + 2.0;
-        for &(px, py) in &stroke.points {
-            let x = px + off_x;
-            let y = py + off_y;
-            min_x = min_x.min(x - pad);
-            min_y = min_y.min(y - pad);
-            max_x = max_x.max(x + pad);
-            max_y = max_y.max(y + pad);
-        }
-    }
-    if !min_x.is_finite() {
-        return;
-    }
-    let bx0 = (min_x.floor() as i64).clamp(0, canvas_w as i64) as u32;
-    let by0 = (min_y.floor() as i64).clamp(0, canvas_h as i64) as u32;
-    let bx1 = (max_x.ceil() as i64).clamp(0, canvas_w as i64) as u32;
-    let by1 = (max_y.ceil() as i64).clamp(0, canvas_h as i64) as u32;
-    let bw = bx1.saturating_sub(bx0);
-    let bh = by1.saturating_sub(by0);
-    if bw == 0 || bh == 0 {
-        return;
-    }
-
-    let Some(mut mask) = tiny_skia::Pixmap::new(bw, bh) else {
-        return;
-    };
-    let mut paint = tiny_skia::Paint::default();
-    paint.anti_alias = true;
-    paint.set_color(tiny_skia::Color::WHITE);
-    paint.blend_mode = tiny_skia::BlendMode::Lighten;
-
-    let mask_off_x = off_x - bx0 as f32;
-    let mask_off_y = off_y - by0 as f32;
-    for stroke in strokes {
-        let Some(path) = stroke_path(stroke, mask_off_x, mask_off_y) else {
-            continue;
-        };
-        let mut style = tiny_skia::Stroke::default();
-        style.width = stroke.width;
-        style.line_cap = tiny_skia::LineCap::Square;
-        style.line_join = tiny_skia::LineJoin::Bevel;
-        mask.stroke_path(
-            &path,
-            &paint,
-            &style,
-            tiny_skia::Transform::identity(),
-            None,
-        );
-    }
-
-    let hr = (color >> 16) & 0xff;
-    let hg = (color >> 8) & 0xff;
-    let hb = color & 0xff;
-    let mask_pixels = mask.pixels();
-    let dst_stride = canvas_w as usize * 4;
-    let bw_usize = bw as usize;
-    let data = canvas.data_mut();
-    for y in 0..bh as usize {
-        let mask_row = &mask_pixels[y * bw_usize..(y + 1) * bw_usize];
-        let dst_start = (by0 as usize + y) * dst_stride + bx0 as usize * 4;
-        let dst_row = &mut data[dst_start..dst_start + bw_usize * 4];
-        for (mp, p) in mask_row.iter().zip(dst_row.chunks_exact_mut(4)) {
-            let a = mp.alpha();
-            if a == 0 {
-                continue;
-            }
-            // 120 / 255 ≈ 0.47, matching the 0x78 alpha used in live preview.
-            let alpha = (a as u32 * 120 + 127) / 255;
-            let inv = 255 - alpha;
-            p[0] = ((hr * alpha + p[0] as u32 * inv + 127) / 255) as u8;
-            p[1] = ((hg * alpha + p[1] as u32 * inv + 127) / 255) as u8;
-            p[2] = ((hb * alpha + p[2] as u32 * inv + 127) / 255) as u8;
-            p[3] = (alpha + (p[3] as u32 * inv + 127) / 255).min(255) as u8;
-        }
-    }
-}
-
-/// Undo premultiplication in place on an RGBA8 buffer.
-fn unpremultiply_in_place(data: &mut [u8]) {
-    for px in data.chunks_exact_mut(4) {
-        let a = px[3];
-        if a == 255 || a == 0 {
-            continue;
-        }
-        let a16 = a as u16;
-        px[0] = ((px[0] as u16 * 255) / a16).min(255) as u8;
-        px[1] = ((px[1] as u16 * 255) / a16).min(255) as u8;
-        px[2] = ((px[2] as u16 * 255) / a16).min(255) as u8;
-    }
-}
-
-/// Map an `image::ImageFormat` to the `gpui::ImageFormat` used by the viewer.
-fn to_gpui_image_format(format: image::ImageFormat) -> Option<gpui::ImageFormat> {
-    match format {
-        image::ImageFormat::Png => Some(gpui::ImageFormat::Png),
-        image::ImageFormat::Jpeg => Some(gpui::ImageFormat::Jpeg),
-        image::ImageFormat::WebP => Some(gpui::ImageFormat::Webp),
-        image::ImageFormat::Gif => Some(gpui::ImageFormat::Gif),
-        image::ImageFormat::Bmp => Some(gpui::ImageFormat::Bmp),
-        image::ImageFormat::Tiff => Some(gpui::ImageFormat::Tiff),
-        image::ImageFormat::Ico => Some(gpui::ImageFormat::Ico),
-        image::ImageFormat::Pnm => Some(gpui::ImageFormat::Pnm),
-        _ => None,
-    }
-}
-
-/// The file name of a path, for messages.
-fn file_name_of(path: &str) -> String {
-    std::path::Path::new(path)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_string())
-}
-
-/// Whether an orientation swaps the width and the height.
-fn orientation_swaps_axes(orientation: image::metadata::Orientation) -> bool {
-    matches!(
-        orientation,
-        image::metadata::Orientation::Rotate90
-            | image::metadata::Orientation::Rotate270
-            | image::metadata::Orientation::Rotate90FlipH
-            | image::metadata::Orientation::Rotate270FlipH
-    )
-}
-
-/// Whether an image format can store an alpha channel.
-fn format_has_alpha(format: image::ImageFormat) -> bool {
-    !matches!(format, image::ImageFormat::Jpeg | image::ImageFormat::Pnm)
-}
-
-/// Rasterize the annotation strokes onto the image and write the result back.
-///
-/// The image is decoded with the orientation the preview shows, so the file
-/// that comes out looks the same as what the user was annotating, and it
-/// keeps the format it came in with. Returns a ready-to-display `LoadedImage`
-/// when the saved dimensions fit within the viewer's edge budget so the UI
-/// doesn't have to re-read the file from disk.
-fn bake_annotated_image(path: &str, strokes: &[InkStroke]) -> Result<Option<LoadedImage>, String> {
-    const MAX_IMAGE_EDGE: u32 = 8192;
-    let name = file_name_of(path);
-
-    let reader = image::ImageReader::open(path)
-        .map_err(|e| format!("Could not read {name}: {e}"))?
-        .with_guessed_format()
-        .map_err(|e| format!("Could not read {name}: {e}"))?;
-    let format = reader.format().unwrap_or(image::ImageFormat::Png);
-    let mut decoder = reader
-        .into_decoder()
-        .map_err(|e| format!("Could not decode {name}: {e}"))?;
-    let orientation = decoder
-        .orientation()
-        .unwrap_or(image::metadata::Orientation::NoTransforms);
-    let mut source = image::DynamicImage::from_decoder(decoder)
-        .map_err(|e| format!("Could not decode {name}: {e}"))?;
-    // The preview shows the picture upright, so the saved file has to be too.
-    source.apply_orientation(orientation);
-
-    let (img_w, img_h) = (source.width() as f32, source.height() as f32);
-
-    // How far the strokes reach outside the image.
-    let mut min_x = 0.0f32;
-    let mut min_y = 0.0f32;
-    let mut max_x = img_w;
-    let mut max_y = img_h;
-    for stroke in strokes {
-        let pad = stroke.width;
-        for p in &stroke.points {
-            min_x = min_x.min(p.0 - pad);
-            min_y = min_y.min(p.1 - pad);
-            max_x = max_x.max(p.0 + pad);
-            max_y = max_y.max(p.1 + pad);
-        }
-    }
-    let off_x = (-min_x).max(0.0).ceil() as i64;
-    let off_y = (-min_y).max(0.0).ceil() as i64;
-    let canvas_w = (max_x.ceil() as i64 + off_x).max(1) as u32;
-    let canvas_h = (max_y.ceil() as i64 + off_y).max(1) as u32;
-
-    let Some(mut canvas) = tiny_skia::Pixmap::new(canvas_w, canvas_h) else {
-        return Err(format!("Could not make room for the annotations in {name}"));
-    };
-    let has_alpha = format_has_alpha(format);
-    if !has_alpha {
-        // Without an alpha channel the area outside the picture would end up
-        // black, so start from opaque white instead.
-        canvas.fill(tiny_skia::Color::WHITE);
-    }
-
-    // Track whether every pixel in the canvas is guaranteed opaque so we can
-    // skip un-premultiplication and encode opaque PNGs as 3-channel RGB8.
-    let canvas_matches_source =
-        off_x == 0 && off_y == 0 && canvas_w == source.width() && canvas_h == source.height();
-    let mut all_opaque = !has_alpha;
-
-    // Draw the source image into the canvas. Slicing each scanline once lets
-    // LLVM auto-vectorize the row copy without per-pixel bounds checks.
-    {
-        let src_w = source.width() as usize;
-        let src_h = source.height() as usize;
-        let data = canvas.data_mut();
-        let dst_stride = canvas_w as usize * 4;
-        let ox = off_x as usize;
-        let oy = off_y as usize;
-        match source.color() {
-            image::ColorType::Rgb8 => {
-                if canvas_matches_source {
-                    all_opaque = true;
-                }
-                let src = source.as_bytes();
-                for y in 0..src_h {
-                    let src_row = &src[y * src_w * 3..(y + 1) * src_w * 3];
-                    let dst_start = (y + oy) * dst_stride + ox * 4;
-                    let dst_row = &mut data[dst_start..dst_start + src_w * 4];
-                    for (s, d) in src_row.chunks_exact(3).zip(dst_row.chunks_exact_mut(4)) {
-                        d[0] = s[0];
-                        d[1] = s[1];
-                        d[2] = s[2];
-                        d[3] = 255;
-                    }
-                }
-            }
-            image::ColorType::Rgba8 => {
-                let src = source.as_bytes();
-                let mut src_all_opaque = canvas_matches_source;
-                for y in 0..src_h {
-                    let src_row = &src[y * src_w * 4..(y + 1) * src_w * 4];
-                    let dst_start = (y + oy) * dst_stride + ox * 4;
-                    let dst_row = &mut data[dst_start..dst_start + src_w * 4];
-                    if src_row.chunks_exact(4).all(|p| p[3] == 255) {
-                        dst_row.copy_from_slice(src_row);
-                    } else {
-                        src_all_opaque = false;
-                        for (s, d) in src_row.chunks_exact(4).zip(dst_row.chunks_exact_mut(4)) {
-                            let a = s[3] as u16;
-                            // The canvas stores premultiplied colour.
-                            d[0] = ((s[0] as u16 * a) / 255) as u8;
-                            d[1] = ((s[1] as u16 * a) / 255) as u8;
-                            d[2] = ((s[2] as u16 * a) / 255) as u8;
-                            d[3] = a as u8;
-                        }
-                    }
-                }
-                if src_all_opaque {
-                    all_opaque = true;
-                }
-            }
-            _ => {
-                let rgba = source.to_rgba8();
-                let src = rgba.as_raw();
-                let stride = rgba.width() as usize * 4;
-                for y in 0..rgba.height() as usize {
-                    let src_row = &src[y * stride..(y + 1) * stride];
-                    let dst_start = (y + oy) * dst_stride + ox * 4;
-                    let dst_row = &mut data[dst_start..dst_start + stride];
-                    if src_row.chunks_exact(4).all(|p| p[3] == 255) {
-                        dst_row.copy_from_slice(src_row);
-                    } else {
-                        for (s, d) in src_row.chunks_exact(4).zip(dst_row.chunks_exact_mut(4)) {
-                            let a = s[3] as u16;
-                            d[0] = ((s[0] as u16 * a) / 255) as u8;
-                            d[1] = ((s[1] as u16 * a) / 255) as u8;
-                            d[2] = ((s[2] as u16 * a) / 255) as u8;
-                            d[3] = a as u8;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Drop the decoded source buffer before encoding to keep peak memory low.
-    drop(source);
-
-    // The pen is opaque, so it can be drawn straight onto the canvas.
-    for stroke in strokes.iter().filter(|s| s.tool == ink::TOOL_PEN) {
-        let Some(path) = stroke_path(stroke, off_x as f32, off_y as f32) else {
-            continue;
-        };
-        let mut paint = tiny_skia::Paint::default();
-        paint.anti_alias = true;
-        let pen_color = stroke.color;
-        paint.set_color(
-            tiny_skia::Color::from_rgba(
-                ((pen_color >> 16) & 0xff) as f32 / 255.0,
-                ((pen_color >> 8) & 0xff) as f32 / 255.0,
-                (pen_color & 0xff) as f32 / 255.0,
-                1.0,
-            )
-            .unwrap_or(tiny_skia::Color::BLACK),
-        );
-        let mut style = tiny_skia::Stroke::default();
-        style.width = stroke.width;
-        style.line_cap = tiny_skia::LineCap::Round;
-        style.line_join = tiny_skia::LineJoin::Round;
-        canvas.stroke_path(
-            &path,
-            &paint,
-            &style,
-            tiny_skia::Transform::identity(),
-            None,
-        );
-    }
-
-    // The highlighter is translucent, so strokes of the same colour are merged
-    // in a tight bounding-box mask and blended once onto the canvas.
-    let mut hl_groups: Vec<(u32, Vec<&InkStroke>)> = Vec::new();
-    for stroke in strokes.iter().filter(|s| s.tool == ink::TOOL_HIGHLIGHTER) {
-        match hl_groups.iter_mut().find(|(c, _)| *c == stroke.color) {
-            Some((_, group)) => group.push(stroke),
-            None => hl_groups.push((stroke.color, vec![stroke])),
-        }
-    }
-    for (color, group) in hl_groups {
-        blend_highlighter_group(&mut canvas, &group, color, off_x as f32, off_y as f32);
-    }
-
-    // Write it back in the format it came in with. The encoders are tuned for
-    // speed: PNG uses Fast compression with Sub filtering (avoiding the 5x
-    // per-row cost of Adaptive filtering), and opaque images skip
-    // un-premultiplication and encode 3-channel RGB8 directly.
-    let mut encoded: Vec<u8> = Vec::with_capacity((canvas_w as usize * canvas_h as usize) / 2);
-    {
-        let mut writer = std::io::Cursor::new(&mut encoded);
-        match format {
-            image::ImageFormat::Png => {
-                let encoder = image::codecs::png::PngEncoder::new_with_quality(
-                    &mut writer,
-                    image::codecs::png::CompressionType::Fast,
-                    image::codecs::png::FilterType::Sub,
-                );
-                if all_opaque {
-                    let mut rgb: Vec<u8> =
-                        Vec::with_capacity(canvas_w as usize * canvas_h as usize * 3);
-                    for px in canvas.data().chunks_exact(4) {
-                        rgb.extend_from_slice(&px[0..3]);
-                    }
-                    encoder
-                        .write_image(&rgb, canvas_w, canvas_h, image::ExtendedColorType::Rgb8)
-                        .map_err(|e| format!("Could not encode {name}: {e}"))?;
-                } else {
-                    unpremultiply_in_place(canvas.data_mut());
-                    encoder
-                        .write_image(
-                            canvas.data(),
-                            canvas_w,
-                            canvas_h,
-                            image::ExtendedColorType::Rgba8,
-                        )
-                        .map_err(|e| format!("Could not encode {name}: {e}"))?;
-                }
-            }
-            image::ImageFormat::Jpeg => {
-                // The canvas was filled with opaque white, so every pixel is
-                // already opaque and straight RGB.
-                let mut rgb: Vec<u8> =
-                    Vec::with_capacity(canvas_w as usize * canvas_h as usize * 3);
-                for px in canvas.data().chunks_exact(4) {
-                    rgb.extend_from_slice(&px[0..3]);
-                }
-                let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut writer, 85);
-                encoder
-                    .write_image(&rgb, canvas_w, canvas_h, image::ExtendedColorType::Rgb8)
-                    .map_err(|e| format!("Could not encode {name}: {e}"))?;
-            }
-            _ => {
-                if !all_opaque {
-                    unpremultiply_in_place(canvas.data_mut());
-                }
-                let out = image::RgbaImage::from_raw(canvas_w, canvas_h, canvas.take())
-                    .ok_or_else(|| format!("Could not build the picture data for {name}"))?;
-                image::DynamicImage::ImageRgba8(out)
-                    .write_to(&mut writer, format)
-                    .map_err(|e| format!("Could not encode {name}: {e}"))?;
-            }
-        }
-    }
-    std::fs::write(path, &encoded).map_err(|e| format!("Could not save {name}: {e}"))?;
-
-    let loaded = if canvas_w.max(canvas_h) <= MAX_IMAGE_EDGE {
-        to_gpui_image_format(format).map(|gpui_format| LoadedImage {
-            image: Arc::new(gpui::Image::from_bytes(gpui_format, encoded)),
-            width: canvas_w,
-            height: canvas_h,
-        })
-    } else {
-        None
-    };
-    Ok(loaded)
-}
-
-/// Whether a polyline (in window coordinates) overlaps the given rectangle.
-/// Used to skip strokes that are entirely off screen.
-fn build_ink_groups(
-    strokes: &[InkStroke],
-    ix0: f32,
-    iy0: f32,
-    ox: f32,
-    oy: f32,
-    vw: f32,
-    vh: f32,
-    scale_x: f32,
-    scale_y: f32,
-) -> (
-    Vec<(u32, Vec<Vec<(f32, f32)>>)>,
-    Vec<(u32, Vec<Vec<(f32, f32)>>)>,
-) {
-    let mut pen_groups: Vec<(u32, Vec<Vec<(f32, f32)>>)> = Vec::new();
-    let mut hl_groups: Vec<(u32, Vec<Vec<(f32, f32)>>)> = Vec::new();
-    for stroke in strokes {
-        if stroke.points.len() < 2 {
-            continue;
-        }
-        let pts = ink::smooth(&stroke.points);
-        let win: Vec<(f32, f32)> = pts
-            .iter()
-            .map(|p| (ix0 + p.0 * scale_x, iy0 + p.1 * scale_y))
-            .collect();
-        if !visible(&win, ox, oy, vw, vh) {
-            continue;
-        }
-        let w = stroke.width * scale_x;
-        match stroke.tool {
-            ink::TOOL_PEN => {
-                let curve = ink::spline(&win, 0.4, 220);
-                let poly = ink::ribbon(&curve, w * 0.5, false);
-                if poly.len() >= 3 {
-                    match pen_groups.iter_mut().find(|(c, _)| *c == stroke.color) {
-                        Some((_, group)) => group.push(poly),
-                        None => pen_groups.push((stroke.color, vec![poly])),
-                    }
-                }
-            }
-            ink::TOOL_HIGHLIGHTER => {
-                let curve = ink::spline(&win, 1.0, 220);
-                let poly = ink::ribbon(&curve, w * 0.5, true);
-                if poly.len() >= 3 {
-                    match hl_groups.iter_mut().find(|(c, _)| *c == stroke.color) {
-                        Some((_, group)) => group.push(poly),
-                        None => hl_groups.push((stroke.color, vec![poly])),
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    (pen_groups, hl_groups)
-}
-
-fn fill_ink_groups(groups: Vec<(u32, Vec<Vec<(f32, f32)>>)>) -> Vec<InkPath> {
-    groups
-        .into_iter()
-        .filter_map(|(color, group)| ink::fill(&group).map(|path| (color, path)))
-        .collect()
-}
-
-fn visible(points: &[(f32, f32)], x: f32, y: f32, w: f32, h: f32) -> bool {
-    let mut min_x = f32::MAX;
-    let mut min_y = f32::MAX;
-    let mut max_x = f32::MIN;
-    let mut max_y = f32::MIN;
-    for p in points {
-        min_x = min_x.min(p.0);
-        min_y = min_y.min(p.1);
-        max_x = max_x.max(p.0);
-        max_y = max_y.max(p.1);
-    }
-    min_x <= x + w && max_x >= x && min_y <= y + h && max_y >= y
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn paper_syntax_themes_parse_and_highlight() {
-        let light = highlight_line_spans("fn main() { let x = \"hi\"; // note", "rs", false, 0x30302fff);
-        let dark = highlight_line_spans("fn main() { let x = \"hi\"; // note", "rs", true, 0xd2d2ceff);
-        assert!(light.len() > 1);
-        assert!(dark.len() > 1);
-        // Keywords should pick up Paper Light (#5477b8) and Paper Dark (#7897ca).
-        assert!(light.iter().any(|&(c, _, _)| c == 0x5477b8ff));
-        assert!(dark.iter().any(|&(c, _, _)| c == 0x7897caff));
-        // Strings should pick up Paper Light (#b98922) and Paper Dark (#c5a35a).
-        assert!(light.iter().any(|&(c, _, _)| c == 0xb98922ff));
-        assert!(dark.iter().any(|&(c, _, _)| c == 0xc5a35aff));
-    }
 
     #[test]
     fn preview_geometry_reserves_gutter_width() {
@@ -5800,32 +4127,5 @@ mod tests {
         assert!(preview_text_left(&geo) - LINE_NUMBER_GUTTER_WIDTH >= 0.0);
     }
 
-    #[test]
-    fn enter_continues_bulleted_numbered_and_task_lists() {
-        let mut ed = EditorState::new();
-        ed.set_text("- item one");
-        ed.line_end(false);
-        assert_eq!(list_enter_action(&ed), ListEnterAction::Insert("\n- ".into()));
-
-        ed.set_text("- ");
-        ed.line_end(false);
-        assert_eq!(list_enter_action(&ed), ListEnterAction::ClearLine { start: 0, end: 2 });
-
-        ed.set_text("  3. third");
-        ed.line_end(false);
-        assert_eq!(list_enter_action(&ed), ListEnterAction::Insert("\n  4. ".into()));
-
-        ed.set_text("  4. ");
-        ed.line_end(false);
-        assert_eq!(list_enter_action(&ed), ListEnterAction::ClearLine { start: 0, end: 5 });
-
-        ed.set_text("- [x] done");
-        ed.line_end(false);
-        assert_eq!(list_enter_action(&ed), ListEnterAction::Insert("\n- [ ] ".into()));
-
-        ed.set_text("plain paragraph");
-        ed.line_end(false);
-        assert_eq!(list_enter_action(&ed), ListEnterAction::Insert("\n".into()));
-    }
 }
 

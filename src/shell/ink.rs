@@ -144,6 +144,32 @@ impl InkHistory {
         true
     }
 
+    /// Shift every recorded stroke by `(dx, dy)` so undo/redo stays aligned
+    /// after the underlying image is cropped.
+    pub fn translate(&mut self, dx: f32, dy: f32) {
+        if dx == 0.0 && dy == 0.0 {
+            return;
+        }
+        for edit in &mut self.edits {
+            match edit {
+                InkEdit::Added { stroke, .. } => {
+                    for p in &mut stroke.points {
+                        p.0 += dx;
+                        p.1 += dy;
+                    }
+                }
+                InkEdit::Removed(strokes) => {
+                    for stroke in strokes {
+                        for p in &mut stroke.points {
+                            p.0 += dx;
+                            p.1 += dy;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Whether the annotations differ from what is on disk.
     pub fn is_dirty(&self) -> bool {
         self.saved_cursor != Some(self.cursor)
@@ -286,33 +312,36 @@ pub fn smooth(points: &[(f32, f32)]) -> Vec<(f32, f32)> {
     if n < 3 {
         return points.to_vec();
     }
-    // Two passes of a [1, 2, 1] filter.
-    let mut a: Vec<(f32, f32)> = Vec::with_capacity(n);
-    a.push(points[0]);
-    for i in 1..n - 1 {
-        let p = points[i];
-        let q = points[i - 1];
-        let r = points[i + 1];
-        a.push((
-            (q.0 + 2.0 * p.0 + r.0) * 0.25,
-            (q.1 + 2.0 * p.1 + r.1) * 0.25,
-        ));
-    }
-    a.push(points[n - 1]);
-
-    let mut out: Vec<(f32, f32)> = Vec::with_capacity(n);
-    out.push(a[0]);
-    for i in 1..n - 1 {
-        let p = a[i];
-        let q = a[i - 1];
-        let r = a[i + 1];
-        out.push((
-            (q.0 + 2.0 * p.0 + r.0) * 0.25,
-            (q.1 + 2.0 * p.1 + r.1) * 0.25,
-        ));
-    }
-    out.push(a[n - 1]);
-    out
+    let smooth_pass = |src: &[(f32, f32)]| -> Vec<(f32, f32)> {
+        let mut dst: Vec<(f32, f32)> = Vec::with_capacity(src.len());
+        dst.push(src[0]);
+        for i in 1..src.len() - 1 {
+            let q = src[i - 1];
+            let p = src[i];
+            let r = src[i + 1];
+            // Preserve sharp direction reversals so reversing the stroke never
+            // pulls the turnaround point backwards or eats the end of the line.
+            let ax = p.0 - q.0;
+            let ay = p.1 - q.1;
+            let bx = r.0 - p.0;
+            let by = r.1 - p.1;
+            let al = (ax * ax + ay * ay).sqrt();
+            let bl = (bx * bx + by * by).sqrt();
+            let is_reversal = al > 1e-4 && bl > 1e-4 && (ax * bx + ay * by) / (al * bl) < 0.2;
+            if is_reversal {
+                dst.push(p);
+            } else {
+                dst.push((
+                    (q.0 + 2.0 * p.0 + r.0) * 0.25,
+                    (q.1 + 2.0 * p.1 + r.1) * 0.25,
+                ));
+            }
+        }
+        dst.push(src[src.len() - 1]);
+        dst
+    };
+    let a = smooth_pass(points);
+    smooth_pass(&a)
 }
 
 /// Build the silhouette of a stroke: a ribbon of the given half width that
@@ -483,14 +512,10 @@ pub fn ribbon(points: &[(f32, f32)], half: f32, square_cap: bool) -> Vec<(f32, f
     out.extend_from_slice(&left);
 
     // End cap.
-    if square_cap {
-        let ex = end.0 + d_end.0 * half;
-        let ey = end.1 + d_end.1 * half;
-        let ox = left_end.0 - end.0;
-        let oy = left_end.1 - end.1;
-        out.push((ex + ox, ey + oy));
-        out.push((ex - ox, ey - oy));
-    } else {
+    // For the highlighter (`square_cap`), end flush at the cursor (butt cap)
+    // so the tip never overhangs past the cursor and never folds/flips when
+    // quickly reversing direction.
+    if !square_cap {
         let a0 = (left_end.1 - end.1).atan2(left_end.0 - end.0);
         cap_arc(&mut out, end, half, a0, -std::f32::consts::PI);
     }
@@ -500,18 +525,9 @@ pub fn ribbon(points: &[(f32, f32)], half: f32, square_cap: bool) -> Vec<(f32, f
         out.push(p);
     }
 
-    // Start cap.
+    // Start cap (flush butt cap for highlighter; semicircular arc for pen).
     let start = pts[0];
-    if square_cap {
-        let sx = start.0 - d_start.0 * half;
-        let sy = start.1 - d_start.1 * half;
-        let ox = right[0].0 - start.0;
-        let oy = right[0].1 - start.1;
-        // The outline arrives here along the right side, so the corner on that
-        // side comes first; pushing them the other way crosses the shape.
-        out.push((sx + ox, sy + oy));
-        out.push((sx - ox, sy - oy));
-    } else {
+    if !square_cap {
         let a0 = (right[0].1 - start.1).atan2(right[0].0 - start.0);
         // Sweeping backwards makes the cap bulge away from the stroke, so
         // both ends of the stroke are rounded outwards.
@@ -784,5 +800,21 @@ mod tests {
             assert!(v.0.is_finite() && v.1.is_finite());
         }
         assert!(ribbon(&[(5.0, 5.0), (5.0, 5.0)], 5.0, false).is_empty());
+    }
+
+    #[test]
+    fn highlighter_ends_flush_and_keeps_reach_on_reversal() {
+        // Horizontal highlighter stroke should end flush at x=0 and x=100
+        // (cursor is at the edge, not half-width behind the tip).
+        let straight = ribbon(&[(0.0, 0.0), (100.0, 0.0)], 10.0, true);
+        let max_x = straight.iter().map(|v| v.0).fold(f32::NEG_INFINITY, f32::max);
+        let min_x = straight.iter().map(|v| v.0).fold(f32::INFINITY, f32::min);
+        assert!((max_x - 100.0).abs() < 1e-3, "expected flush end at 100, got {max_x}");
+        assert!(min_x.abs() < 1e-3, "expected flush start at 0, got {min_x}");
+
+        // Reversing direction at x=100 should preserve the turnaround reach.
+        let reversed = smooth(&[(0.0, 0.0), (50.0, 0.0), (100.0, 0.0), (60.0, 0.0)]);
+        let peak_x = reversed.iter().map(|v| v.0).fold(f32::NEG_INFINITY, f32::max);
+        assert!((peak_x - 100.0).abs() < 1e-3, "reversal should preserve x=100, got {peak_x}");
     }
 }

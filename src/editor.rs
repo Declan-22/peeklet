@@ -180,6 +180,18 @@ impl EditorState {
         self.cursor
     }
 
+    /// Fast, zero-allocation `(len_bytes, hash)` fingerprint of the current
+    /// buffer contents, used to compare against the last saved state on disk.
+    pub fn content_fingerprint(&self) -> (usize, u64) {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::Hasher;
+        let mut h = DefaultHasher::new();
+        for chunk in self.text.chunks() {
+            h.write(chunk.as_bytes());
+        }
+        (self.text.len_bytes(), h.finish())
+    }
+
     // ----- selection -----
     /// Normalized (min, max) selected char range, if any.
     pub fn selection_range(&self) -> Option<(usize, usize)> {
@@ -543,6 +555,15 @@ impl EditorState {
     }
 }
 
+/// Fast `(len_bytes, hash)` fingerprint matching `EditorState::content_fingerprint`.
+pub fn fingerprint_str(s: &str) -> (usize, u64) {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::Hasher;
+    let mut h = DefaultHasher::new();
+    h.write(s.as_bytes());
+    (s.len(), h.finish())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -645,5 +666,24 @@ mod tests {
         assert_eq!(EditorState::col_to_bytes(&line, 1), 1);
         assert_eq!(EditorState::col_to_bytes(&line, 2), 3);
         assert_eq!(EditorState::col_to_bytes(&line, 99), line.len());
+    }
+
+    #[test]
+    fn fingerprint_tracks_edits_and_reverts() {
+        let mut ed = EditorState::new();
+        ed.set_text("hello world");
+        let saved = fingerprint_str("hello world");
+        assert_eq!(ed.content_fingerprint(), saved);
+
+        ed.insert_str("!");
+        assert_ne!(ed.content_fingerprint(), saved);
+
+        ed.backspace();
+        assert_eq!(ed.content_fingerprint(), saved);
+
+        ed.insert_str("abc");
+        assert_ne!(ed.content_fingerprint(), saved);
+        ed.undo();
+        assert_eq!(ed.content_fingerprint(), saved);
     }
 }

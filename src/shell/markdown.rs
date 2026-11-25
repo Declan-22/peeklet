@@ -9,9 +9,42 @@
 use std::ops::Range;
 
 use gpui::{
-    AnyElement, FontStyle, FontWeight, HighlightStyle, Hsla, MouseButton, StrikethroughStyle,
-    StyledText, UnderlineStyle, div, prelude::*, px, rgba,
+    AnyElement, App, FontStyle, FontWeight, HighlightStyle, Hsla, MouseButton, StrikethroughStyle,
+    StyledText, UnderlineStyle, Window, div, prelude::*, px, rgba, svg,
 };
+
+const TODO_CHECK_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M5 13l4 4L19 7"/></svg>"#;
+
+/// Parse a Markdown task list line (`- [ ] ...`, `* [x] ...`, `+ [X] ...`).
+/// Returns `(check_char_byte_offset, is_checked, content_byte_offset)` if matched.
+pub fn parse_task_line(line: &str) -> Option<(usize, bool, usize)> {
+    let trimmed = line.trim_start();
+    let ws_len = line.len() - trimmed.len();
+    if trimmed.len() < 5
+        || !matches!(trimmed.as_bytes()[0], b'-' | b'*' | b'+')
+        || trimmed.as_bytes()[1] != b' '
+    {
+        return None;
+    }
+    let after = &trimmed[2..];
+    if after.len() < 3 || after.as_bytes()[0] != b'[' || after.as_bytes()[2] != b']' {
+        return None;
+    }
+    let checked = match after.as_bytes()[1] {
+        b' ' => false,
+        b'x' | b'X' => true,
+        _ => return None,
+    };
+    let after_bracket = if after.len() >= 4 {
+        if after.as_bytes()[3] != b' ' {
+            return None;
+        }
+        4
+    } else {
+        3
+    };
+    Some((ws_len + 3, checked, ws_len + 2 + after_bracket))
+}
 
 use crate::theme::Theme;
 
@@ -781,6 +814,7 @@ pub fn render_markdown_wrapped_row(
     row_height: f32,
     font_size: f32,
     t: &Theme,
+    on_toggle_task: Option<Box<dyn Fn(&mut Window, &mut App)>>,
 ) -> AnyElement {
     // Code fence delimiter line.
     if is_fence_line(full_line) {
@@ -933,13 +967,10 @@ pub fn render_markdown_wrapped_row(
         && trimmed.as_bytes()[1] == b' '
     {
         let indent_px = ((indent_spaces / 2) as f32 * 16.0).min(64.0);
-        let after_full = &trimmed[2..];
-        let (is_task, checked) = if after_full.starts_with("[ ] ") {
-            (true, false)
-        } else if after_full.starts_with("[x] ") || after_full.starts_with("[X] ") {
-            (true, true)
-        } else {
-            (false, false)
+        let task_info = parse_task_line(full_line);
+        let (is_task, checked) = match task_info {
+            Some((_, is_checked, _)) => (true, is_checked),
+            None => (false, false),
         };
         let content = if is_first_wrap_row {
             let r = row_text.trim_start();
@@ -948,8 +979,14 @@ pub fn render_markdown_wrapped_row(
             } else {
                 r
             };
-            if is_task && after.len() >= 4 {
-                &after[4..]
+            if is_task {
+                if after.len() >= 4 {
+                    &after[4..]
+                } else if after.len() >= 3 {
+                    &after[3..]
+                } else {
+                    ""
+                }
             } else {
                 after
             }
@@ -959,19 +996,49 @@ pub fn render_markdown_wrapped_row(
         let parsed = parse_inline(content, t);
         let marker = if !is_first_wrap_row {
             div()
-                .w(px(if is_task { 13.0 } else { 12.0 }))
+                .w(px(if is_task { 15.0 } else { 12.0 }))
                 .flex_shrink_0()
                 .into_any_element()
         } else if is_task {
-            div()
-                .w(px(13.))
-                .h(px(13.))
-                .rounded(px(3.5))
+            let mut box_el = div()
+                .w(px(15.))
+                .h(px(15.))
+                .rounded(px(4.))
                 .border_1()
-                .border_color(rgba(if checked { t.accent } else { t.component_border_color }))
-                .bg(rgba(if checked { t.accent } else { 0x00000000 }))
+                .border_color(rgba(if checked {
+                    t.accent
+                } else {
+                    t.component_border_color
+                }))
+                .bg(rgba(if checked {
+                    t.accent
+                } else {
+                    t.bg_secondary
+                }))
+                .flex()
+                .items_center()
+                .justify_center()
                 .flex_shrink_0()
-                .into_any_element()
+                .cursor_pointer()
+                .hover(|s| {
+                    s.border_color(rgba(t.accent))
+                });
+            if checked {
+                box_el = box_el.child(
+                    svg()
+                        .data(TODO_CHECK_SVG)
+                        .w(px(10.))
+                        .h(px(10.))
+                        .text_color(rgba(0xffffffff)),
+                );
+            }
+            if let Some(toggle) = on_toggle_task {
+                box_el = box_el.on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                    toggle(window, cx);
+                    cx.stop_propagation();
+                });
+            }
+            box_el.into_any_element()
         } else {
             div()
                 .w(px(12.))
@@ -984,6 +1051,20 @@ pub fn render_markdown_wrapped_row(
                 .child("•")
                 .into_any_element()
         };
+        let mut text_div = div()
+            .flex_1()
+            .whitespace_nowrap()
+            .overflow_hidden()
+            .font_family(crate::theme::FONT_TEXT)
+            .text_size(px(font_size))
+            .text_color(rgba(if checked {
+                t.text_secondary
+            } else {
+                t.text_primary
+            }));
+        if checked {
+            text_div = text_div.line_through();
+        }
         return div()
             .w_full()
             .h(px(row_height))
@@ -991,18 +1072,9 @@ pub fn render_markdown_wrapped_row(
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(6.))
+            .gap(px(if is_task { 8.0 } else { 6.0 }))
             .child(marker)
-            .child(
-                div()
-                    .flex_1()
-                    .whitespace_nowrap()
-                    .overflow_hidden()
-                    .font_family(crate::theme::FONT_TEXT)
-                    .text_size(px(font_size))
-                    .text_color(rgba(if checked { t.text_secondary } else { t.text_primary }))
-                    .child(render_inline_element(parsed)),
-            )
+            .child(text_div.child(render_inline_element(parsed)))
             .into_any_element();
     }
 
@@ -1145,5 +1217,15 @@ mod tests {
             row_spans.iter().filter(|&&(c, _, _)| c == accent).count(),
             3
         );
+    }
+
+    #[test]
+    fn parses_task_list_lines() {
+        assert_eq!(parse_task_line("- [ ] Buy milk"), Some((3, false, 6)));
+        assert_eq!(parse_task_line("  * [x] Ship it"), Some((5, true, 8)));
+        assert_eq!(parse_task_line("+ [X] Done"), Some((3, true, 6)));
+        assert_eq!(parse_task_line("- [ ]"), Some((3, false, 5)));
+        assert_eq!(parse_task_line("- plain bullet"), None);
+        assert_eq!(parse_task_line("regular text"), None);
     }
 }
