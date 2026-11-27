@@ -3,4 +3,7 @@ pub mod state;
 pub mod theme;
 
 pub use state::{active, init, mode, toggle};
-pub use theme::{FONT_MONO, FONT_TEXT, FONT_UI, Theme, ThemeMode, WEIGHT_MEDIUM, fade_in, lerp_rgb};
+pub use theme::{
+    FONT_MONO, FONT_SERIF, FONT_TEXT, FONT_UI, Theme, ThemeMode, WEIGHT_MEDIUM, fade_in, lerp_rgb,
+    with_alpha,
+};

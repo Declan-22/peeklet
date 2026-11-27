@@ -13,6 +13,7 @@ pub mod panels;
 pub mod root;
 pub mod svg_view;
 pub mod syntax;
-mod welcome;
+pub mod tooltip;
+pub mod welcome;
 
 pub use root::RootView;

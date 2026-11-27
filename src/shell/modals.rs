@@ -33,8 +33,8 @@ pub(super) fn settings_tab_button(
         }))
         .border_1()
         .border_color(rgba(if active { t.border_color } else { 0x00000000 }))
-        .bg(rgba(if active { t.bg_darker } else { 0x00000000 }))
-        .hover(|s| s.bg(rgba(t.menu_hover_bg)))
+        .bg(rgba(if active { t.bg_hover } else { 0x00000000 }))
+        .hover(|s| s.bg(rgba(t.bg_hover)))
         .on_mouse_down(MouseButton::Left, move |_, _, cx| {
             let _ = shell.update(cx, |root, cx| {
                 root.settings_tab = index;
@@ -98,9 +98,9 @@ pub(super) fn settings_toggle(
             .border_color(rgba(if value {
                 t.accent
             } else {
-                t.component_border_color
+                t.border_strong
             }))
-            .bg(rgba(if value { t.accent } else { t.bg_darker }))
+            .bg(rgba(if value { t.accent } else { t.bg_hover }))
             .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                 let _ = shell2.update(cx, |root, cx| match kind {
                     "wrap_text" => root.set_wrap_text_files(!value, cx),
@@ -143,9 +143,9 @@ pub(super) fn modal_button(
         .rounded(px(10.))
         .cursor_pointer()
         .border_1()
-        .border_color(rgba(t.chrome_border_color))
-        .bg(rgba(t.menu_hover_bg))
-        .hover(|s| s.bg(rgba(t.bg_secondary)))
+        .border_color(rgba(t.border_subtle))
+        .bg(rgba(t.bg_hover))
+        .hover(|s| s.bg(rgba(t.bg_sunken)))
         .on_mouse_down(MouseButton::Left, move |_, _, cx| {
             cb(cx);
         })

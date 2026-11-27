@@ -65,9 +65,9 @@ impl AppMenu {
             .px(px(PANEL_PADDING_X))
             .py(px(PANEL_PADDING_Y))
             .gap(px(ITEM_GAP))
-            .bg(rgba(t.bg_primary))
+            .bg(rgba(t.bg_canvas))
             .border_1()
-            .border_color(rgba(t.menu_border_color))
+            .border_color(rgba(t.border_subtle))
             .rounded(px(10.))
             .shadow(vec![t.shadow_lg()])
             .opacity(opacity)
@@ -97,7 +97,7 @@ impl AppMenu {
             .map(|s| s.read(cx).fade(&format!("menu-entry-{index}")))
             .unwrap_or(0.0);
         let k = hov.max(if is_active { 1.0 } else { 0.0 });
-        let bg = lerp_rgb(t.bg_primary, t.menu_hover_bg, k);
+        let bg = lerp_rgb(t.bg_canvas, t.bg_hover, k);
 
         div()
             .id(SharedString::from(format!("app-menu-entry-{index}")))
@@ -206,9 +206,9 @@ fn render_submenu(
         .px(px(PANEL_PADDING_X))
         .py(px(PANEL_PADDING_Y))
         .gap(px(ITEM_GAP))
-        .bg(rgba(t.bg_primary))
+        .bg(rgba(t.bg_canvas))
         .border_1()
-        .border_color(rgba(t.menu_border_color))
+        .border_color(rgba(t.border_subtle))
         .rounded(px(10.))
         .shadow(vec![t.shadow_sm()])
         .opacity(opacity)
@@ -239,7 +239,7 @@ fn render_item(
             .h(px(1.))
             .mx(px(10.))
             .my(px(5.))
-            .bg(rgba(t.menu_border_color))
+            .bg(rgba(t.border_subtle))
             .into_any_element(),
         MenuItem::Entry(entry) => {
             let action = entry.action.boxed_clone();
@@ -247,7 +247,7 @@ fn render_item(
                 .upgrade()
                 .map(|s| s.read(cx).fade(&format!("submenu-{index}")))
                 .unwrap_or(0.0);
-            let bg = lerp_rgb(t.bg_primary, t.menu_hover_bg, k);
+            let bg = lerp_rgb(t.bg_canvas, t.bg_hover, k);
 
             div()
                 .id(SharedString::from(format!("submenu-item-{index}")))
@@ -304,7 +304,7 @@ fn shortcut_hint(shortcut: SharedString, t: Theme) -> gpui::AnyElement {
         .text_xs()
         .font_family(crate::theme::FONT_UI)
         .font_weight(FontWeight::NORMAL)
-        .text_color(rgba(t.empty_text_primary))
+        .text_color(rgba(t.text_muted))
         .child(pretty)
         .into_any_element()
 }

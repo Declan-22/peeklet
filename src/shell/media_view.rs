@@ -5,12 +5,10 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, CursorStyle, ImageSource, MouseButton, MouseDownEvent,
-    MouseExitEvent, MouseUpEvent, ObjectFit, ScrollWheelEvent, WeakEntity, Window, div, img,
-    prelude::*, px, rgba, svg,
+    AnyElement, App, ClipboardItem, Context, CursorStyle, FontWeight, ImageSource, MouseButton,
+    MouseDownEvent, MouseExitEvent, MouseUpEvent, ObjectFit, ScrollWheelEvent, WeakEntity, Window,
+    div, img, prelude::*, px, rgba, svg,
 };
-
-use crate::theme::WEIGHT_MEDIUM;
 
 use super::chrome::{TOOLBAR_HEIGHT, TOP_BAR_HEIGHT};
 use super::ink::{self, InkStroke};
@@ -100,7 +98,7 @@ impl RootView {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(rgba(t.bg_primary))
+                .bg(rgba(t.bg_canvas))
                 .child(div().text_sm().text_color(rgba(t.text_secondary)).child(
                     if self.pdf_load_errors.contains(path) {
                         "Unable to preview this PDF"
@@ -136,7 +134,7 @@ impl RootView {
             .gap(px(16.))
             .py(px(16.))
             .overflow_y_scroll()
-            .bg(rgba(t.bg_primary))
+            .bg(rgba(t.bg_canvas))
             .children(children)
             .into_any_element()
     }
@@ -209,7 +207,7 @@ impl RootView {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(rgba(t.bg_primary))
+                .bg(rgba(t.bg_canvas))
                 .child(
                     div()
                         .text_sm()
@@ -265,7 +263,7 @@ impl RootView {
             .min_h(px(0.))
             .relative()
             .overflow_hidden()
-            .bg(rgba(t.bg_primary))
+            .bg(rgba(t.bg_canvas))
             .on_mouse_down(MouseButton::Right, {
                 let root = root.clone();
                 move |event: &MouseDownEvent, _, cx| {
@@ -476,6 +474,8 @@ impl RootView {
                 image_h,
                 left,
                 top,
+                view_w,
+                view_h,
                 scale_x,
                 scale_y,
                 root,
@@ -797,10 +797,10 @@ impl RootView {
                 .px(px(8.))
                 .rounded(px(8.))
                 .text_sm()
-                .font_weight(WEIGHT_MEDIUM)
-                .text_color(rgba(t.text_primary))
+                .font_weight(FontWeight(450.0))
+                .text_color(rgba(t.text_secondary))
                 .cursor_pointer()
-                .hover(|s| s.bg(rgba(t.menu_hover_bg)))
+                .hover(|s| s.bg(rgba(t.bg_hover)).text_color(rgba(t.text_primary)))
                 .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                     on_click(window, cx);
                     cx.stop_propagation();
@@ -827,7 +827,7 @@ impl RootView {
             .px(px(4.))
             .py(px(4.))
             .gap(px(2.))
-            .bg(rgba(t.bg_primary))
+            .bg(rgba(t.bg_canvas))
             .border_1()
             .border_color(rgba(t.border_color))
             .rounded(px(10.))
@@ -1047,6 +1047,8 @@ impl RootView {
         image_h: f32,
         left: f32,
         top: f32,
+        view_w: f32,
+        view_h: f32,
         scale_x: f32,
         scale_y: f32,
         root: WeakEntity<RootView>,
@@ -1068,6 +1070,8 @@ impl RootView {
         let sy1 = top + rect.3 * scale_y;
         let cw = (sx1 - sx0).max(1.0);
         let ch = (sy1 - sy0).max(1.0);
+        let px_w = (rect.2 - rect.0).round().max(1.0) as u32;
+        let px_h = (rect.3 - rect.1).round().max(1.0) as u32;
 
         const DARK: u32 = 0x00000088;
         const ARM: f32 = 12.0; // Corner L-handle arm length
@@ -1324,6 +1328,60 @@ impl RootView {
                                 .h_full()
                                 .rounded(px(1.))
                                 .bg(rgba(t.accent)),
+                        ),
+                )
+                // Live pixel width pill tucked inside the bottom edge of the crop box.
+                .child({
+                    const PILL_H: f32 = 22.0;
+                    let bottom_y = (sy1 - PILL_H - 8.0).max(sy0 + 6.0);
+                    div()
+                        .absolute()
+                        .left(px(sx0))
+                        .top(px(bottom_y))
+                        .w(px(cw))
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div()
+                                .px(px(6.))
+                                .py(px(2.))
+                                .rounded(px(6.))
+                                .bg(rgba(t.bg_canvas))
+                                .border_1()
+                                .border_color(rgba(t.border_color))
+                                .shadow(vec![t.shadow_sm()])
+                                .font_family(crate::theme::FONT_MONO)
+                                .text_size(px(11.))
+                                .text_color(rgba(t.text_primary))
+                                .whitespace_nowrap()
+                                .child(format!("{px_w}px")),
+                        )
+                })
+                // Live pixel height pill tucked inside the right edge of the crop box.
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(sx0))
+                        .top(px(sy0))
+                        .w(px((cw - 8.0).max(1.0)))
+                        .h(px(ch))
+                        .flex()
+                        .items_center()
+                        .justify_end()
+                        .child(
+                            div()
+                                .px(px(6.))
+                                .py(px(2.))
+                                .rounded(px(6.))
+                                .bg(rgba(t.bg_canvas))
+                                .border_1()
+                                .border_color(rgba(t.border_color))
+                                .shadow(vec![t.shadow_sm()])
+                                .font_family(crate::theme::FONT_MONO)
+                                .text_size(px(11.))
+                                .text_color(rgba(t.text_primary))
+                                .whitespace_nowrap()
+                                .child(format!("{px_h}px")),
                         ),
                 )
                 .into_any_element(),

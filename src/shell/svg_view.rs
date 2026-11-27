@@ -246,7 +246,7 @@ impl RootView {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(rgba(t.bg_primary))
+                .bg(rgba(t.bg_canvas))
                 .child(
                     div()
                         .text_sm()
@@ -267,7 +267,7 @@ impl RootView {
             .items_center()
             .justify_center()
             .overflow_hidden()
-            .bg(rgba(t.bg_primary))
+            .bg(rgba(t.bg_canvas))
             .child(
                 img(ImageSource::from(image))
                     .size_full()

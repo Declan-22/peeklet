@@ -13,6 +13,7 @@ use super::dropdown::{ENTRY_HEIGHT, PANEL_PADDING_X, PANEL_PADDING_Y};
 use super::ink;
 use super::panels::{ICON_PDF, PanelKind};
 use super::root::{INK_PALETTE, INK_SIZE_MIN, MarkdownViewMode, RootView, Tab};
+use super::tooltip::render_anchored_tooltip;
 use crate::theme::WEIGHT_MEDIUM;
 
 pub const TOP_BAR_HEIGHT: f32 = 36.0;
@@ -296,7 +297,7 @@ impl gpui::RenderOnce for TopBar {
             .flex_row()
             .items_center()
             .relative()
-            .bg(rgba(t.bg_secondary))
+            .bg(rgba(t.bg_sunken))
             // Empty space in the title bar is draggable. Interactive children
             // (tabs, menu, and window controls) retain their own hit areas.
             .window_control_area(WindowControlArea::Drag)
@@ -316,7 +317,7 @@ impl gpui::RenderOnce for TopBar {
                     .left_0()
                     .right_0()
                     .h(px(1.))
-                    .bg(rgba(t.chrome_border_color)),
+                    .bg(rgba(t.border_subtle)),
             )
             .child(render_history_buttons(
                 t,
@@ -365,7 +366,7 @@ impl gpui::RenderOnce for TopBar {
                             .w(px(2.))
                             .h(px(FOLDER_SEPARATOR_HEIGHT))
                             .rounded(px(2.))
-                            .bg(rgba(t.chrome_border_color)),
+                            .bg(rgba(t.border_subtle)),
                     ),
             )
             .child(TabBar {
@@ -395,7 +396,7 @@ pub fn render_sidebar_controls(
         .flex()
         .flex_row()
         .items_center()
-        .bg(rgba(t.bg_tertiary))
+        .bg(rgba(t.bg_elevated))
         .child(render_history_buttons(
             t,
             root.clone(),
@@ -440,7 +441,7 @@ fn render_menu_button(
     // Active fade follows the open/close animation; hover fade is a tween.
     let act = animation.clamp(0., 1.);
     let k = act.max(hover_fade);
-    let bg = crate::theme::lerp_rgb(t.bg_secondary, t.menu_hover_bg, k);
+    let bg = crate::theme::lerp_rgb(t.bg_sunken, t.bg_hover, k);
 
     div()
         .id("app-menu-button")
@@ -474,7 +475,7 @@ fn render_menu_button(
                 .w(px(TOP_BAR_ICON_SIZE))
                 .h(px(TOP_BAR_ICON_SIZE))
                 .text_color(rgba(crate::theme::lerp_rgb(
-                    t.empty_text_primary,
+                    t.text_muted,
                     t.text_primary,
                     k,
                 ))),
@@ -499,8 +500,8 @@ fn render_sidebar_button(
         .rounded(px(6.))
         .cursor_pointer()
         .bg(rgba(crate::theme::lerp_rgb(
-            t.bg_secondary,
-            t.menu_hover_bg,
+            t.bg_sunken,
+            t.bg_hover,
             fade,
         )))
         .on_hover({
@@ -523,7 +524,7 @@ fn render_sidebar_button(
                 .w(px(TOP_BAR_ICON_SIZE))
                 .h(px(TOP_BAR_ICON_SIZE))
                 .text_color(rgba(crate::theme::lerp_rgb(
-                    t.empty_text_primary,
+                    t.text_muted,
                     t.text_primary,
                     fade,
                 ))),
@@ -548,8 +549,8 @@ fn render_settings_button(
         .rounded(px(6.))
         .cursor_pointer()
         .bg(rgba(crate::theme::lerp_rgb(
-            t.bg_secondary,
-            t.menu_hover_bg,
+            t.bg_sunken,
+            t.bg_hover,
             fade,
         )))
         .on_hover({
@@ -572,7 +573,7 @@ fn render_settings_button(
                 .w(px(TOP_BAR_ICON_SIZE))
                 .h(px(TOP_BAR_ICON_SIZE))
                 .text_color(rgba(crate::theme::lerp_rgb(
-                    t.empty_text_primary,
+                    t.text_muted,
                     t.text_primary,
                     fade,
                 ))),
@@ -603,8 +604,8 @@ fn render_history_buttons(
             .cursor_pointer()
             .text_sm()
             .bg(rgba(crate::theme::lerp_rgb(
-                t.bg_secondary,
-                t.menu_hover_bg,
+                t.bg_sunken,
+                t.bg_hover,
                 fade,
             )))
             .on_hover({
@@ -635,9 +636,9 @@ fn render_history_buttons(
                     .h(px(TOP_BAR_ICON_SIZE))
                     .text_color(rgba(crate::theme::lerp_rgb(
                         if enabled {
-                            t.empty_text_primary
+                            t.text_muted
                         } else {
-                            t.empty_text_secondary
+                            t.text_faint
                         },
                         t.text_primary,
                         fade,
@@ -653,7 +654,7 @@ fn render_history_buttons(
         .ml(px(6.))
         .child(button("tab-undo", can_undo))
         .child(button("tab-redo", can_redo))
-        .child(tab_divider(t.chrome_border_color))
+        .child(tab_divider(t.border_subtle))
         .into_any_element()
 }
 
@@ -671,7 +672,7 @@ fn render_window_controls(t: crate::theme::Theme, _cx: &App) -> AnyElement {
             .items_center()
             .justify_center()
             .cursor_pointer()
-            .hover(|s| s.bg(rgba(t.menu_hover_bg)))
+            .hover(|s| s.bg(rgba(t.bg_hover)))
             .on_mouse_down(MouseButton::Left, |_, _, cx| {
                 cx.stop_propagation();
             })
@@ -695,9 +696,9 @@ fn render_window_controls(t: crate::theme::Theme, _cx: &App) -> AnyElement {
                     .flex()
                     .flex_row()
                     .items_stretch()
-                    .bg(rgba(t.bg_secondary))
+                    .bg(rgba(t.bg_sunken))
                     .border_b_1()
-                    .border_color(rgba(t.chrome_border_color))
+                    .border_color(rgba(t.border_subtle))
                     .child(control(
                         "window-minimize",
                         div()
@@ -837,7 +838,7 @@ impl gpui::RenderOnce for TabBar {
                                         if is_active {
                                             s
                                         } else {
-                                            s.bg(rgba(t.menu_hover_bg))
+                                            s.bg(rgba(t.bg_hover))
                                         }
                                     })
                                     .on_hover({
@@ -860,26 +861,26 @@ impl gpui::RenderOnce for TabBar {
                                         // Inactive tabs get a solid bg-tertiary folder shape so
                                         // they are not transparent.
                                         let p = self.tabs.len() - i;
-                                        tab.child(deferred(folder_tab_shape(t.bg_secondary)).with_priority(p))
+                                        tab.child(deferred(folder_tab_shape(t.bg_sunken)).with_priority(p))
                                     })
                                     .when(is_hovered && !is_active, |tab| {
                                         let p = self.tabs.len() - i;
-                                        tab.child(deferred(folder_tab_shape(t.menu_hover_bg)).with_priority(p))
+                                        tab.child(deferred(folder_tab_shape(t.bg_hover)).with_priority(p))
                                     })
                                     .when(!is_active, |tab| {
                                         // Outline painted last so it stays visible on hover.
                                         let p = self.tabs.len() - i;
-                                        tab.child(deferred(folder_tab_outline(t.chrome_border_color, i == 0, false)).with_priority(p))
+                                        tab.child(deferred(folder_tab_outline(t.border_subtle, i == 0, false)).with_priority(p))
                                     })
                                     .when(is_active, |tab| {
                                         // Deferred active-tab painting keeps its convex corners
                                         // above every other tab regardless of position.
                                         tab.child(
-                                            deferred(folder_tab_shape(t.bg_primary))
+                                            deferred(folder_tab_shape(t.bg_canvas))
                                                 .with_priority(1000),
                                         )
                                         .child(
-                                            deferred(folder_tab_outline(t.chrome_border_color, true, true))
+                                            deferred(folder_tab_outline(t.border_subtle, true, true))
                                                 .with_priority(1000),
                                         )
                                     })
@@ -993,7 +994,7 @@ impl gpui::RenderOnce for TabBar {
                                                                 t.text_secondary
                                                             }))
                                                             .when(close_hovered, |button| {
-                                                                button.bg(rgba(t.bg_secondary))
+                                                                button.bg(rgba(t.bg_sunken))
                                                             })
                                                             .on_hover({
                                                                 let root = root.clone();
@@ -1068,10 +1069,10 @@ impl gpui::RenderOnce for TabBar {
                                         .bg(gpui::linear_gradient(
                                             90.0,
                                             gpui::linear_color_stop(
-                                                rgba(t.bg_secondary & 0xffffff00),
+                                                rgba(t.bg_sunken & 0xffffff00),
                                                 0.0,
                                             ),
-                                            gpui::linear_color_stop(rgba(t.bg_secondary), 1.0),
+                                            gpui::linear_color_stop(rgba(t.bg_sunken), 1.0),
                                         )),
                                 )
                                 .child(
@@ -1084,11 +1085,11 @@ impl gpui::RenderOnce for TabBar {
                                         .bg(gpui::linear_gradient(
                                             90.0,
                                             gpui::linear_color_stop(
-                                                rgba(t.chrome_border_color & 0xffffff00),
+                                                rgba(t.border_subtle & 0xffffff00),
                                                 0.0,
                                             ),
                                             gpui::linear_color_stop(
-                                                rgba(t.chrome_border_color),
+                                                rgba(t.border_subtle),
                                                 1.0,
                                             ),
                                         )),
@@ -1115,9 +1116,19 @@ const TOOLBAR_ICON_PEN: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" widt
 	</g>
 </svg>"#;
 
+const TOOLBAR_ICON_PEN_TIP: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
+	<path d="M0 0h24v24H0z" fill="none" />
+	<path fill="currentColor" d="M7.579 7h8.843c0 1.769.327 2.789 1.198 3.773c.904 1.022 1.356 1.532 1.379 2.02c.023.487-.316.945-.992 1.86l-4.22 5.705C12.977 21.453 12.573 22 12 22s-.977-.547-1.787-1.642l-4.22-5.705c-.676-.915-1.015-1.373-.992-1.86s.475-.998 1.379-2.02C7.25 9.79 7.579 8.77 7.579 7Z" />
+</svg>"#;
+
 const TOOLBAR_ICON_HIGHLIGHTER: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
 	<path d="M0 0h24v24H0z" fill="none" />
 	<path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="m6.678 16.207l2.115 2.115m-2.115-2.115L2.5 20.5h4l2.293-2.178m-2.115-2.115c-.39-.39-.383-1.02-.043-1.455c.792-1.014 1.08-1.93 1.164-2.614c.093-.752.275-1.565.81-2.1l.892-.89m-.708 9.174c.39.39 1.02.383 1.455.043c1.014-.792 1.93-1.08 2.614-1.164c.752-.093 1.565-.275 2.1-.81l.89-.892m0 0l-6.35-6.35m6.35 6.35a1 1 0 0 0 1.414 0l4.234-4.234M9.501 9.148a1 1 0 0 1 0-1.414L13.735 3.5" />
+</svg>"#;
+
+const TOOLBAR_ICON_HIGHLIGHTER_TIP: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
+	<path d="M0 0h24v24H0z" fill="none" />
+	<path fill="currentColor" d="M2.5 20.5L6.678 16.207c-.39-.39-.383-1.02-.043-1.455c.792-1.014 1.08-1.93 1.164-2.614c.093-.752.275-1.565.81-2.1l.892-.89l6.35 6.35L14.962 16.391C14.427 16.926 13.614 17.108 12.862 17.201C12.178 17.285 11.262 17.573 10.248 18.365C9.813 18.705 9.183 18.712 8.793 18.322L6.5 20.5Z" />
 </svg>"#;
 
 const TOOLBAR_ICON_ERASER: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24">
@@ -1274,11 +1285,32 @@ impl gpui::RenderOnce for Toolbar {
         let right_occ = root_upgrade.as_ref().map(|r| r.read(cx).right_occupancy()).unwrap_or(0.0);
         let content_w = (window.viewport_size().width.as_f32() - left_occ - right_occ).max(0.0);
 
+        let (tooltip_display, tooltip_progress) = root_upgrade
+            .as_ref()
+            .map(|r| {
+                let s = r.read(cx);
+                (s.toolbar_tooltip_display, s.toolbar_tooltip_progress)
+            })
+            .unwrap_or((None, 0.0));
+        let show_tooltip = |id: &'static str,
+                            label: &'static str,
+                            shortcut: Option<&'static str>,
+                            anchor_w: f32| {
+            (tooltip_display == Some(id) && tooltip_progress > 0.005)
+                .then(|| render_anchored_tooltip(label, shortcut, anchor_w, tooltip_progress, &t))
+        };
+
         let root = self.root.clone();
-        let tool_button = |root: WeakEntity<RootView>, index: usize, icon: &'static [u8], tooltip: &'static str, active: bool| {
+        let tool_button = |root: WeakEntity<RootView>,
+                           id: &'static str,
+                           index: usize,
+                           icon: &'static [u8],
+                           label: &'static str,
+                           shortcut: Option<&'static str>| {
             let is_active = active_tool == index;
-            div()
-                .id(format!("toolbar-tool-{}", index))
+            let root_hover = root.clone();
+            let btn = div()
+                .id(id)
                 .w(px(28.))
                 .h(px(28.))
                 .flex()
@@ -1288,10 +1320,21 @@ impl gpui::RenderOnce for Toolbar {
                 .cursor_pointer()
                 .border_1()
                 .border_color(rgba(if is_active { t.border_color } else { 0x00000000 }))
-                .bg(rgba(if is_active { t.bg_darker } else { t.bg_primary }))
-                .hover(|s| s.bg(rgba(t.bg_darker)))
+                .bg(rgba(if is_active { t.bg_hover } else { t.bg_canvas }))
+                .hover(|s| s.bg(rgba(t.bg_hover)))
+                .on_hover(move |hovered, _, cx| {
+                    let _ = root_hover.update(cx, |root, cx| {
+                        let next = if *hovered && root.image_toolbar_tool != index {
+                            Some(id)
+                        } else {
+                            None
+                        };
+                        root.set_toolbar_tooltip_hover(next, cx);
+                    });
+                })
                 .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                     let _ = root.update(cx, |root, cx| {
+                        root.set_toolbar_tooltip_hover(None, cx);
                         // Clicking the tool that is already active opens its
                         // colour and size settings.
                         if index == 5 {
@@ -1320,13 +1363,56 @@ impl gpui::RenderOnce for Toolbar {
                     });
                     cx.stop_propagation();
                 })
-                .child(
-                    svg()
-                        .data(icon)
+                .child({
+                    let tip_fill = if is_active {
+                        let tip_svg = match index {
+                            1 => Some(TOOLBAR_ICON_PEN_TIP),
+                            2 => Some(TOOLBAR_ICON_HIGHLIGHTER_TIP),
+                            _ => None,
+                        };
+                        tip_svg.and_then(|svg_data| {
+                            root_upgrade.as_ref().map(|r| {
+                                let c = (r.read(cx).ink_color(index as u8) << 8) | 0xff;
+                                (svg_data, c)
+                            })
+                        })
+                    } else {
+                        None
+                    };
+                    div()
+                        .relative()
                         .w(px(19.))
                         .h(px(19.))
-                        .text_color(rgba(if is_active { t.text_primary } else { t.text_secondary })),
-                )
+                        .when_some(tip_fill, |el, (tip_svg, tip_color)| {
+                            el.child(
+                                svg()
+                                    .data(tip_svg)
+                                    .absolute()
+                                    .inset_0()
+                                    .w(px(19.))
+                                    .h(px(19.))
+                                    .text_color(rgba(tip_color)),
+                            )
+                        })
+                        .child(
+                            svg()
+                                .data(icon)
+                                .w(px(19.))
+                                .h(px(19.))
+                                .text_color(rgba(if is_active {
+                                    t.text_primary
+                                } else {
+                                    t.text_secondary
+                                })),
+                        )
+                });
+            let mut wrap = div().relative().child(btn);
+            if !is_active {
+                if let Some(tip) = show_tooltip(id, label, shortcut, 28.0) {
+                    wrap = wrap.child(tip);
+                }
+            }
+            wrap
         };
 
         let mut bar = div()
@@ -1342,20 +1428,30 @@ impl gpui::RenderOnce for Toolbar {
             .justify_center()
             .gap(px(4.))
             .px(px(8.))
-            .bg(rgba(t.bg_primary))
+            .bg(rgba(t.bg_canvas))
             .border_b_1()
-            .border_color(rgba(t.chrome_border_color));
+            .border_color(rgba(t.border_subtle));
 
         if is_image {
             // Cursor (0)
-            bar = bar.child(tool_button(root.clone(), 0, TOOLBAR_ICON_CURSOR, "Cursor", active_tool == 0));
+            bar = bar.child(tool_button(
+                root.clone(),
+                "toolbar-tool-0",
+                0,
+                TOOLBAR_ICON_CURSOR,
+                "Cursor",
+                Some("1"),
+            ));
             // Pen (1) and Highlighter (2): clicking the active tool opens
             // its colour and size settings.
-            for (index, icon) in [(1usize, TOOLBAR_ICON_PEN), (2, TOOLBAR_ICON_HIGHLIGHTER)] {
+            for (id, index, icon, label, key) in [
+                ("toolbar-tool-1", 1usize, TOOLBAR_ICON_PEN, "Pen Tool", "2"),
+                ("toolbar-tool-2", 2, TOOLBAR_ICON_HIGHLIGHTER, "Highlighter", "3"),
+            ] {
                 let root_for_popup = root.clone();
                 let mut wrap = div()
                     .relative()
-                    .child(tool_button(root.clone(), index, icon, if index == 1 { "Pen" } else { "Highlighter" }, active_tool == index));
+                    .child(tool_button(root.clone(), id, index, icon, label, Some(key)));
                 if ink_popup_display == Some(index as u8) && ink_popup_progress > 0.005 {
                     let colour = root_upgrade
                         .as_ref()
@@ -1384,10 +1480,18 @@ impl gpui::RenderOnce for Toolbar {
                 bar = bar.child(wrap);
             }
             // Eraser (3)
-            bar = bar.child(tool_button(root.clone(), 3, TOOLBAR_ICON_ERASER, "Eraser", active_tool == 3));
+            bar = bar.child(tool_button(
+                root.clone(),
+                "toolbar-tool-3",
+                3,
+                TOOLBAR_ICON_ERASER,
+                "Eraser",
+                Some("4"),
+            ));
             // Shapes (4) with dropdown
             {
                 let root_for_shape = root.clone();
+                let root_shape_hover = root.clone();
                 let shapes_active = active_tool == 4;
                 let shape_btn = div()
                     .id("toolbar-tool-shapes")
@@ -1400,10 +1504,21 @@ impl gpui::RenderOnce for Toolbar {
                     .cursor_pointer()
                     .border_1()
                     .border_color(rgba(if shapes_active { t.border_color } else { 0x00000000 }))
-                    .bg(rgba(if shapes_active { t.bg_darker } else { t.bg_primary }))
-                    .hover(|s| s.bg(rgba(t.bg_darker)))
+                    .bg(rgba(if shapes_active { t.bg_hover } else { t.bg_canvas }))
+                    .hover(|s| s.bg(rgba(t.bg_hover)))
+                    .on_hover(move |hovered, _, cx| {
+                        let _ = root_shape_hover.update(cx, |root, cx| {
+                            let next = if *hovered && root.image_toolbar_tool != 4 {
+                                Some("toolbar-tool-shapes")
+                            } else {
+                                None
+                            };
+                            root.set_toolbar_tooltip_hover(next, cx);
+                        });
+                    })
                     .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                         let _ = root_for_shape.update(cx, |root, cx| {
+                            root.set_toolbar_tooltip_hover(None, cx);
                             root.image_toolbar_tool = 4;
                             root.image_shapes_dropdown_open = !root.image_shapes_dropdown_open;
                             cx.notify();
@@ -1418,6 +1533,12 @@ impl gpui::RenderOnce for Toolbar {
                             .text_color(rgba(if shapes_active { t.text_primary } else { t.text_secondary })),
                     );
                 let mut shapes_wrap = div().relative().child(shape_btn);
+                if !shapes_active {
+                    if let Some(tip) = show_tooltip("toolbar-tool-shapes", "Shapes", Some("5"), 28.0)
+                    {
+                        shapes_wrap = shapes_wrap.child(tip);
+                    }
+                }
                 if shapes_open {
                     let root_for_opt = root.clone();
                     let selected_shape = root_upgrade.as_ref().map(|r| r.read(cx).image_shapes_selected).unwrap_or(0);
@@ -1437,8 +1558,8 @@ impl gpui::RenderOnce for Toolbar {
                             .font_weight(WEIGHT_MEDIUM)
                             .text_color(rgba(t.text_primary))
                             .cursor_pointer()
-                            .bg(rgba(if is_active { t.bg_tertiary } else { t.bg_primary }))
-                            .hover(|s| s.bg(rgba(t.menu_hover_bg)))
+                            .bg(rgba(if is_active { t.bg_elevated } else { t.bg_canvas }))
+                            .hover(|s| s.bg(rgba(t.bg_hover)))
                             .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                                 let _ = root.update(cx, |root, cx| {
                                     root.image_shapes_selected = index;
@@ -1470,9 +1591,9 @@ impl gpui::RenderOnce for Toolbar {
                                 .px(px(PANEL_PADDING_X))
                                 .py(px(PANEL_PADDING_Y))
                                 .gap(px(2.0))
-                                .bg(rgba(t.bg_primary))
+                                .bg(rgba(t.bg_canvas))
                                 .border_1()
-                                .border_color(rgba(t.menu_border_color))
+                                .border_color(rgba(t.border_subtle))
                                 .rounded(px(10.))
                                 .shadow(vec![t.shadow_lg()])
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -1492,10 +1613,17 @@ impl gpui::RenderOnce for Toolbar {
                     .w(px(2.))
                     .h(px(16.))
                     .mx(px(6.))
-                    .bg(rgba(t.chrome_border_color)),
+                    .bg(rgba(t.border_subtle)),
             );
             // Crop (5)
-            bar = bar.child(tool_button(root.clone(), 5, TOOLBAR_ICON_CROP, "Crop", active_tool == 5));
+            bar = bar.child(tool_button(
+                root.clone(),
+                "toolbar-tool-5",
+                5,
+                TOOLBAR_ICON_CROP,
+                "Crop",
+                Some("6"),
+            ));
 
             // Far-right Cancel / Save buttons when Crop is active.
             if active_tool == 5 {
@@ -1522,12 +1650,12 @@ impl gpui::RenderOnce for Toolbar {
                                 .rounded(px(7.))
                                 .border_1()
                                 .border_color(rgba(t.border_color))
-                                .bg(rgba(t.bg_primary))
+                                .bg(rgba(t.bg_canvas))
                                 .text_xs()
                                 .font_weight(WEIGHT_MEDIUM)
                                 .text_color(rgba(t.text_secondary))
                                 .cursor_pointer()
-                                .hover(|s| s.bg(rgba(t.bg_darker)).text_color(rgba(t.text_primary)))
+                                .hover(|s| s.bg(rgba(t.bg_hover)).text_color(rgba(t.text_primary)))
                                 .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                                     let _ = root_cancel.update(cx, |root, cx| {
                                         root.cancel_image_crop(cx);
@@ -1550,7 +1678,7 @@ impl gpui::RenderOnce for Toolbar {
                                 .bg(rgba(t.accent))
                                 .text_xs()
                                 .font_weight(WEIGHT_MEDIUM)
-                                .text_color(rgba(0xffffffff))
+                                .text_color(rgba(t.accent_text))
                                 .cursor_pointer()
                                 .hover(|s| s.opacity(0.9))
                                 .on_mouse_down(MouseButton::Left, move |_, _, cx| {
@@ -1566,14 +1694,160 @@ impl gpui::RenderOnce for Toolbar {
         }
 
         if is_markdown {
-            let md_heading_open = root_upgrade
-                .as_ref()
-                .map(|r| r.read(cx).md_heading_dropdown_open)
-                .unwrap_or(false);
+            let (md_dropdown, md_dropdown_display, md_dropdown_progress, active_md_font) =
+                root_upgrade
+                    .as_ref()
+                    .map(|r| {
+                        let s = r.read(cx);
+                        (
+                            s.md_dropdown,
+                            s.md_dropdown_display,
+                            s.md_dropdown_progress,
+                            s.md_font,
+                        )
+                    })
+                    .unwrap_or((None, None, 0.0, super::root::MarkdownFont::Sans));
+            let md_font_open = md_dropdown == Some(0);
+            let md_heading_open = md_dropdown == Some(1);
             let active_heading = root_upgrade
                 .as_ref()
                 .map(|r| r.read(cx).active_markdown_heading_level())
                 .unwrap_or(0);
+
+            let root_font = root.clone();
+            let root_font_hover = root.clone();
+            let mut font_wrap = div().relative().child(
+                div()
+                    .id("toolbar-md-font")
+                    .w(px(68.))
+                    .h(px(28.))
+                    .px(px(10.))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .rounded(px(8.))
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(rgba(if md_font_open {
+                        t.border_subtle
+                    } else {
+                        0x00000000
+                    }))
+                    .bg(rgba(if md_font_open {
+                        t.bg_hover
+                    } else {
+                        t.bg_canvas
+                    }))
+                    .hover(|s| s.bg(rgba(t.bg_hover)))
+                    .on_hover(move |hovered, _, cx| {
+                        let _ = root_font_hover.update(cx, |root, cx| {
+                            let next = if *hovered && root.md_dropdown != Some(0) {
+                                Some("toolbar-md-font")
+                            } else {
+                                None
+                            };
+                            root.set_toolbar_tooltip_hover(next, cx);
+                        });
+                    })
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        let _ = root_font.update(cx, |root, cx| {
+                            root.set_toolbar_tooltip_hover(None, cx);
+                            let next = if root.md_dropdown == Some(0) {
+                                None
+                            } else {
+                                Some(0)
+                            };
+                            root.set_md_dropdown(next, cx);
+                        });
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        div()
+                            .text_size(px(if active_md_font == super::root::MarkdownFont::Sans {
+                                14.0
+                            } else {
+                                13.0
+                            }))
+                            .font_family(active_md_font.family())
+                            .font_weight(WEIGHT_MEDIUM)
+                            .text_color(rgba(t.text_secondary))
+                            .child(active_md_font.label()),
+                    )
+                    .child(
+                        svg()
+                            .data(TOOLBAR_ICON_CHEVRON)
+                            .w(px(12.))
+                            .h(px(12.))
+                            .text_color(rgba(t.text_secondary)),
+                    ),
+            );
+            if !md_font_open {
+                if let Some(tip) = show_tooltip("toolbar-md-font", "Font", None, 68.0) {
+                    font_wrap = font_wrap.child(tip);
+                }
+            }
+            if md_dropdown_display == Some(0) && md_dropdown_progress > 0.005 {
+                let mut font_menu = div()
+                    .absolute()
+                    .top(px(30.))
+                    .left(px(0.))
+                    .w(px(104.))
+                    .opacity(md_dropdown_progress)
+                    .occlude()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .px(px(PANEL_PADDING_X))
+                    .py(px(PANEL_PADDING_Y))
+                    .bg(rgba(t.bg_canvas))
+                    .border_1()
+                    .border_color(rgba(t.border_subtle))
+                    .rounded(px(10.))
+                    .shadow(vec![t.shadow_lg()])
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+                let font_items = [
+                    super::root::MarkdownFont::Sans,
+                    super::root::MarkdownFont::Serif,
+                    super::root::MarkdownFont::Mono,
+                ];
+                for font_opt in font_items {
+                    let selected = active_md_font == font_opt;
+                    let root_item = root.clone();
+                    font_menu = font_menu.child(
+                        div()
+                            .id(format!("toolbar-md-font-{}", font_opt.as_str()))
+                            .w_full()
+                            .h(px(ENTRY_HEIGHT))
+                            .px(px(8.))
+                            .rounded(px(6.))
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .bg(rgba(if selected { t.bg_hover } else { 0x00000000 }))
+                            .hover(|s| s.bg(rgba(t.bg_hover)))
+                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                let _ = root_item.update(cx, |root, cx| {
+                                    root.set_md_font(font_opt, cx);
+                                });
+                                cx.stop_propagation();
+                            })
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .font_family(font_opt.family())
+                                    .font_weight(gpui::FontWeight::NORMAL)
+                                    .text_color(rgba(if selected {
+                                        t.text_primary
+                                    } else {
+                                        t.text_secondary
+                                    }))
+                                    .child(font_opt.label()),
+                            ),
+                    );
+                }
+                font_wrap = font_wrap.child(deferred(font_menu).with_priority(1000));
+            }
 
             let heading_indicator = if active_heading > 0 {
                 div()
@@ -1602,6 +1876,7 @@ impl gpui::RenderOnce for Toolbar {
                     .into_any_element()
             };
             let root_heading = root.clone();
+            let root_heading_hover = root.clone();
             let mut heading_wrap = div().relative().child(
                 div()
                     .id("toolbar-md-heading")
@@ -1615,17 +1890,36 @@ impl gpui::RenderOnce for Toolbar {
                     .rounded(px(8.))
                     .cursor_pointer()
                     .border_1()
-                    .border_color(rgba(t.border_color))
-                    .bg(rgba(if md_heading_open {
-                        t.bg_darker
+                    .border_color(rgba(if md_heading_open {
+                        t.border_subtle
                     } else {
-                        t.bg_primary
+                        0x00000000
                     }))
-                    .hover(|s| s.bg(rgba(t.bg_darker)))
+                    .bg(rgba(if md_heading_open {
+                        t.bg_hover
+                    } else {
+                        t.bg_canvas
+                    }))
+                    .hover(|s| s.bg(rgba(t.bg_hover)))
+                    .on_hover(move |hovered, _, cx| {
+                        let _ = root_heading_hover.update(cx, |root, cx| {
+                            let next = if *hovered && root.md_dropdown != Some(1) {
+                                Some("toolbar-md-heading")
+                            } else {
+                                None
+                            };
+                            root.set_toolbar_tooltip_hover(next, cx);
+                        });
+                    })
                     .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                         let _ = root_heading.update(cx, |root, cx| {
-                            root.md_heading_dropdown_open = !root.md_heading_dropdown_open;
-                            cx.notify();
+                            root.set_toolbar_tooltip_hover(None, cx);
+                            let next = if root.md_dropdown == Some(1) {
+                                None
+                            } else {
+                                Some(1)
+                            };
+                            root.set_md_dropdown(next, cx);
                         });
                         cx.stop_propagation();
                     })
@@ -1638,21 +1932,27 @@ impl gpui::RenderOnce for Toolbar {
                             .text_color(rgba(t.text_secondary)),
                     ),
             );
-            if md_heading_open {
+            if !md_heading_open {
+                if let Some(tip) = show_tooltip("toolbar-md-heading", "Text Style", None, 56.0) {
+                    heading_wrap = heading_wrap.child(tip);
+                }
+            }
+            if md_dropdown_display == Some(1) && md_dropdown_progress > 0.005 {
                 let mut menu = div()
                     .absolute()
                     .top(px(30.))
                     .left(px(0.))
                     .w(px(128.))
+                    .opacity(md_dropdown_progress)
                     .occlude()
                     .flex()
                     .flex_col()
                     .gap(px(2.))
                     .px(px(PANEL_PADDING_X))
                     .py(px(PANEL_PADDING_Y))
-                    .bg(rgba(t.bg_primary))
+                    .bg(rgba(t.bg_canvas))
                     .border_1()
-                    .border_color(rgba(t.component_border_color))
+                    .border_color(rgba(t.border_subtle))
                     .rounded(px(10.))
                     .shadow(vec![t.shadow_lg()])
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
@@ -1678,8 +1978,8 @@ impl gpui::RenderOnce for Toolbar {
                             .flex()
                             .items_center()
                             .cursor_pointer()
-                            .bg(rgba(if selected { t.bg_darker } else { 0x00000000 }))
-                            .hover(|s| s.bg(rgba(t.menu_hover_bg)))
+                            .bg(rgba(if selected { t.bg_hover } else { 0x00000000 }))
+                            .hover(|s| s.bg(rgba(t.bg_hover)))
                             .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                                 let _ = root_item.update(cx, |root, cx| {
                                     root.md_set_heading(level, cx);
@@ -1708,9 +2008,12 @@ impl gpui::RenderOnce for Toolbar {
 
             let md_action = |id: &'static str,
                              icon: &'static [u8],
+                             label: &'static str,
+                             shortcut: Option<&'static str>,
                              action: Box<dyn Fn(&mut RootView, &mut gpui::Context<RootView>)>| {
                 let root_click = root.clone();
-                div()
+                let root_hover = root.clone();
+                let btn = div()
                     .id(id)
                     .w(px(28.))
                     .h(px(28.))
@@ -1719,10 +2022,16 @@ impl gpui::RenderOnce for Toolbar {
                     .justify_center()
                     .rounded(px(8.))
                     .cursor_pointer()
-                    .bg(rgba(t.bg_primary))
-                    .hover(|s| s.bg(rgba(t.bg_darker)))
+                    .bg(rgba(t.bg_canvas))
+                    .hover(|s| s.bg(rgba(t.bg_hover)))
+                    .on_hover(move |hovered, _, cx| {
+                        let _ = root_hover.update(cx, |root, cx| {
+                            root.set_toolbar_tooltip_hover(if *hovered { Some(id) } else { None }, cx);
+                        });
+                    })
                     .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                         let _ = root_click.update(cx, |root, cx| {
+                            root.set_toolbar_tooltip_hover(None, cx);
                             action(root, cx);
                         });
                         cx.stop_propagation();
@@ -1733,36 +2042,50 @@ impl gpui::RenderOnce for Toolbar {
                             .w(px(16.))
                             .h(px(16.))
                             .text_color(rgba(t.text_secondary)),
-                    )
+                    );
+                let mut wrap = div().relative().child(btn);
+                if let Some(tip) = show_tooltip(id, label, shortcut, 28.0) {
+                    wrap = wrap.child(tip);
+                }
+                wrap
             };
 
             bar = bar
+                .child(font_wrap)
                 .child(heading_wrap)
                 .child(
                     div()
                         .w(px(1.))
                         .h(px(16.))
                         .mx(px(4.))
-                        .bg(rgba(t.chrome_border_color)),
+                        .bg(rgba(t.border_subtle)),
                 )
                 .child(md_action(
                     "toolbar-md-bold",
                     TOOLBAR_ICON_MD_BOLD,
+                    "Bold",
+                    Some("Ctrl B"),
                     Box::new(|r, cx| r.md_wrap_inline("**", "**", cx)),
                 ))
                 .child(md_action(
                     "toolbar-md-italic",
                     TOOLBAR_ICON_MD_ITALIC,
+                    "Italic",
+                    Some("Ctrl I"),
                     Box::new(|r, cx| r.md_wrap_inline("*", "*", cx)),
                 ))
                 .child(md_action(
                     "toolbar-md-strike",
                     TOOLBAR_ICON_MD_STRIKE,
+                    "Strikethrough",
+                    Some("Ctrl Shift S"),
                     Box::new(|r, cx| r.md_wrap_inline("~~", "~~", cx)),
                 ))
                 .child(md_action(
                     "toolbar-md-link",
                     TOOLBAR_ICON_MD_LINK,
+                    "Link",
+                    Some("Ctrl K"),
                     Box::new(|r, cx| r.md_insert_link(cx)),
                 ))
                 .child(
@@ -1770,38 +2093,52 @@ impl gpui::RenderOnce for Toolbar {
                         .w(px(1.))
                         .h(px(16.))
                         .mx(px(4.))
-                        .bg(rgba(t.chrome_border_color)),
+                        .bg(rgba(t.border_subtle)),
                 )
                 .child(md_action(
                     "toolbar-md-quote",
                     TOOLBAR_ICON_MD_QUOTE,
+                    "Blockquote",
+                    None,
                     Box::new(|r, cx| r.md_toggle_line_prefix("> ", false, cx)),
                 ))
                 .child(md_action(
                     "toolbar-md-code",
                     TOOLBAR_ICON_MD_CODE,
+                    "Code",
+                    Some("Ctrl E"),
                     Box::new(|r, cx| r.md_toggle_code(cx)),
                 ))
                 .child(md_action(
                     "toolbar-md-bullet",
                     TOOLBAR_ICON_MD_BULLET_LIST,
+                    "Bullet List",
+                    Some("Ctrl Shift 8"),
                     Box::new(|r, cx| r.md_toggle_line_prefix("- ", false, cx)),
                 ))
                 .child(md_action(
                     "toolbar-md-numbered",
                     TOOLBAR_ICON_MD_NUMBERED_LIST,
+                    "Numbered List",
+                    Some("Ctrl Shift 7"),
                     Box::new(|r, cx| r.md_toggle_line_prefix("1. ", true, cx)),
                 ))
                 .child(md_action(
                     "toolbar-md-todo",
                     TOOLBAR_ICON_MD_TODO_LIST,
+                    "Task List",
+                    Some("Ctrl Shift 9"),
                     Box::new(|r, cx| r.md_toggle_task_list(cx)),
                 ));
 
-            let md_toggle = |id: &'static str, icon: &'static [u8], mode: MarkdownViewMode| {
+            let md_toggle = |id: &'static str,
+                             icon: &'static [u8],
+                             label: &'static str,
+                             mode: MarkdownViewMode| {
                 let is_active = md_mode == mode;
                 let root_click = root.clone();
-                div()
+                let root_hover = root.clone();
+                let btn = div()
                     .id(id)
                     .w(px(28.))
                     .h(px(28.))
@@ -1812,10 +2149,21 @@ impl gpui::RenderOnce for Toolbar {
                     .cursor_pointer()
                     .border_1()
                     .border_color(rgba(if is_active { t.border_color } else { 0x00000000 }))
-                    .bg(rgba(if is_active { t.bg_darker } else { t.bg_primary }))
-                    .hover(|s| s.bg(rgba(t.bg_darker)))
+                    .bg(rgba(if is_active { t.bg_hover } else { t.bg_canvas }))
+                    .hover(|s| s.bg(rgba(t.bg_hover)))
+                    .on_hover(move |hovered, _, cx| {
+                        let _ = root_hover.update(cx, |root, cx| {
+                            let next = if *hovered && root.markdown_mode != mode {
+                                Some(id)
+                            } else {
+                                None
+                            };
+                            root.set_toolbar_tooltip_hover(next, cx);
+                        });
+                    })
                     .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                         let _ = root_click.update(cx, |root, cx| {
+                            root.set_toolbar_tooltip_hover(None, cx);
                             root.toggle_markdown_mode(mode, cx);
                         });
                         cx.stop_propagation();
@@ -1826,7 +2174,14 @@ impl gpui::RenderOnce for Toolbar {
                             .w(px(17.))
                             .h(px(17.))
                             .text_color(rgba(if is_active { t.text_primary } else { t.text_secondary })),
-                    )
+                    );
+                let mut wrap = div().relative().child(btn);
+                if !is_active {
+                    if let Some(tip) = show_tooltip(id, label, None, 28.0) {
+                        wrap = wrap.child(tip);
+                    }
+                }
+                wrap
             };
 
             bar = bar.child(
@@ -1839,11 +2194,63 @@ impl gpui::RenderOnce for Toolbar {
                     .flex_row()
                     .items_center()
                     .gap(px(4.))
-                    .child(md_toggle("toolbar-md-split", TOOLBAR_ICON_MD_SPLIT, MarkdownViewMode::Split))
-                    .child(md_toggle("toolbar-md-stacked", TOOLBAR_ICON_MD_STACKED, MarkdownViewMode::Stacked)),
+                    .child(md_toggle("toolbar-md-split", TOOLBAR_ICON_MD_SPLIT, "Split View", MarkdownViewMode::Split))
+                    .child(md_toggle("toolbar-md-stacked", TOOLBAR_ICON_MD_STACKED, "Live Preview", MarkdownViewMode::Stacked)),
             );
         } else if is_svg {
             let root_click = root.clone();
+            let root_hover = root.clone();
+            let svg_btn = div()
+                .id("toolbar-svg-split")
+                .w(px(28.))
+                .h(px(28.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(8.))
+                .cursor_pointer()
+                .border_1()
+                .border_color(rgba(if svg_split {
+                    t.border_color
+                } else {
+                    0x00000000
+                }))
+                .bg(rgba(if svg_split { t.bg_hover } else { t.bg_canvas }))
+                .hover(|s| s.bg(rgba(t.bg_hover)))
+                .on_hover(move |hovered, _, cx| {
+                    let _ = root_hover.update(cx, |root, cx| {
+                        let next = if *hovered && !root.svg_split_view {
+                            Some("toolbar-svg-split")
+                        } else {
+                            None
+                        };
+                        root.set_toolbar_tooltip_hover(next, cx);
+                    });
+                })
+                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                    let _ = root_click.update(cx, |root, cx| {
+                        root.set_toolbar_tooltip_hover(None, cx);
+                        root.toggle_svg_split_view(cx);
+                    });
+                    cx.stop_propagation();
+                })
+                .child(
+                    svg()
+                        .data(TOOLBAR_ICON_MD_SPLIT)
+                        .w(px(17.))
+                        .h(px(17.))
+                        .text_color(rgba(if svg_split {
+                            t.text_primary
+                        } else {
+                            t.text_secondary
+                        })),
+                );
+            let mut svg_wrap = div().relative().child(svg_btn);
+            if !svg_split {
+                if let Some(tip) = show_tooltip("toolbar-svg-split", "Split View", None, 28.0) {
+                    svg_wrap = svg_wrap.child(tip);
+                }
+            }
             bar = bar.child(
                 div()
                     .absolute()
@@ -1854,42 +2261,7 @@ impl gpui::RenderOnce for Toolbar {
                     .flex_row()
                     .items_center()
                     .gap(px(4.))
-                    .child(
-                        div()
-                            .id("toolbar-svg-split")
-                            .w(px(28.))
-                            .h(px(28.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(8.))
-                            .cursor_pointer()
-                            .border_1()
-                            .border_color(rgba(if svg_split {
-                                t.border_color
-                            } else {
-                                0x00000000
-                            }))
-                            .bg(rgba(if svg_split { t.bg_darker } else { t.bg_primary }))
-                            .hover(|s| s.bg(rgba(t.bg_darker)))
-                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                                let _ = root_click.update(cx, |root, cx| {
-                                    root.toggle_svg_split_view(cx);
-                                });
-                                cx.stop_propagation();
-                            })
-                            .child(
-                                svg()
-                                    .data(TOOLBAR_ICON_MD_SPLIT)
-                                    .w(px(17.))
-                                    .h(px(17.))
-                                    .text_color(rgba(if svg_split {
-                                        t.text_primary
-                                    } else {
-                                        t.text_secondary
-                                    })),
-                            ),
-                    ),
+                    .child(svg_wrap),
             );
         }
 
@@ -2034,7 +2406,7 @@ fn ink_settings_popup(
         .w(px(slider_width))
         .h(px(INK_SLIDER_HEIGHT))
         .border_1()
-        .border_color(rgba(t.component_border_color))
+        .border_color(rgba(t.border_color))
         .rounded(px(8.))
         .on_mouse_down(MouseButton::Left, move |ev, _window, cx| {
             let raw = INK_SIZE_MIN
@@ -2095,7 +2467,7 @@ fn ink_settings_popup(
                 .child(
                     div()
                         .group_hover("ink-toggle", |style| {
-                            style.bg(rgba(t.empty_text_primary))
+                            style.bg(rgba(t.text_muted))
                         })
                         .absolute()
                         .left(px(INK_TOGGLE_GRAB))
@@ -2120,7 +2492,7 @@ fn ink_settings_popup(
                 .whitespace_nowrap()
                 .text_sm()
                 .font_weight(WEIGHT_MEDIUM)
-                .text_color(rgba(t.empty_text_primary))
+                .text_color(rgba(t.text_muted))
                 .child(format!("{}px", thickness as i32)),
         )
         .child(probe);
@@ -2210,10 +2582,10 @@ fn ink_settings_popup(
 
     // Subtle vertical dotted divider aligned right at the original modal left
     // edge (x = 0 relative to the tool button).
-    let dot_alpha = (((t.component_border_color & 0xff) as f32) * progress)
+    let dot_alpha = (((t.border_strong & 0xff) as f32) * progress)
         .round()
         .clamp(0.0, 255.0) as u32;
-    let dot_rgba = (t.component_border_color & 0xffffff00) | dot_alpha;
+    let dot_rgba = (t.border_strong & 0xffffff00) | dot_alpha;
     let dotted_divider = div()
         .w(px(INK_DIVIDER_WIDTH))
         .flex_shrink_0()
@@ -2258,7 +2630,7 @@ fn ink_settings_popup(
                     div()
                         .ml(px(INK_SLIDER_PADDING))
                         .text_xs()
-                        .text_color(rgba(t.empty_text_primary))
+                        .text_color(rgba(t.text_muted))
                         .child("Thickness"),
                 )
                 .child(slider),
@@ -2278,9 +2650,9 @@ fn ink_settings_popup(
             .flex()
             .flex_row()
             .items_stretch()
-            .bg(rgba(t.bg_primary))
+            .bg(rgba(t.bg_canvas))
             .border_1()
-            .border_color(rgba(t.component_border_color))
+            .border_color(rgba(t.border_color))
             .rounded(px(10.))
             .shadow(vec![t.shadow_lg()])
             .on_mouse_down(MouseButton::Left, |_ev, _window, cx| cx.stop_propagation())
@@ -2311,9 +2683,9 @@ impl gpui::RenderOnce for BottomBar {
             .flex_row()
             .items_center()
             .px(px(6.))
-            .bg(rgba(t.bg_secondary))
+            .bg(rgba(t.bg_sunken))
             .border_t_1()
-            .border_color(rgba(t.chrome_border_color))
+            .border_color(rgba(t.border_subtle))
             .children(self.root.upgrade().and_then(|root| {
                 let left_occ = root.read(cx).left_occupancy();
                 let status = root.read(cx).bottom_status();
@@ -2326,13 +2698,13 @@ impl gpui::RenderOnce for BottomBar {
                         .gap(px(4.));
                     for (i, item) in items.iter().enumerate() {
                         if i > 0 {
-                            row = row.child(tab_divider(t.chrome_border_color));
+                            row = row.child(tab_divider(t.border_subtle));
                         }
                         row = row.child(
                             div()
                                 .text_xs()
                                 .font_weight(WEIGHT_MEDIUM)
-                                .text_color(rgba(t.empty_text_primary))
+                                .text_color(rgba(t.text_muted))
                                 .child(item.clone()),
                         );
                     }
@@ -2365,9 +2737,9 @@ impl gpui::RenderOnce for SidebarBottomBar {
             .flex_row()
             .items_center()
             .px(px(6.))
-            .bg(rgba(t.bg_secondary))
+            .bg(rgba(t.bg_sunken))
             .border_t_1()
-            .border_color(rgba(t.chrome_border_color))
+            .border_color(rgba(t.border_subtle))
             .when(is_pdf, |bar| bar.child(
                 div()
                     .id("sidebar-pdf-toggle")
@@ -2378,8 +2750,8 @@ impl gpui::RenderOnce for SidebarBottomBar {
                     .justify_center()
                     .rounded(px(5.))
                     .cursor_pointer()
-                    .when(pdf_active, |button| button.bg(rgba(t.bg_tertiary)))
-                    .hover(|button| button.bg(rgba(t.bg_tertiary)))
+                    .when(pdf_active, |button| button.bg(rgba(t.bg_elevated)))
+                    .hover(|button| button.bg(rgba(t.bg_elevated)))
                     .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                         let _ = root.update(cx, |root, cx| root.toggle_panel(PanelKind::PdfPages, cx));
                         cx.stop_propagation();

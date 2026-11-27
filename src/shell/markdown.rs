@@ -396,7 +396,7 @@ fn parse_inline_into(
                         base,
                         HighlightStyle {
                             color: Some(Hsla::from(rgba(t.accent))),
-                            background_color: Some(Hsla::from(rgba(t.bg_secondary))),
+                            background_color: Some(Hsla::from(rgba(t.bg_sunken))),
                             ..Default::default()
                         },
                     );
@@ -462,7 +462,7 @@ fn parse_inline_into(
                     let style = merge_style(
                         base,
                         HighlightStyle {
-                            font_weight: Some(FontWeight::BOLD),
+                            font_weight: Some(FontWeight::SEMIBOLD),
                             font_style: Some(FontStyle::Italic),
                             ..Default::default()
                         },
@@ -484,7 +484,7 @@ fn parse_inline_into(
                     let style = merge_style(
                         base,
                         HighlightStyle {
-                            font_weight: Some(FontWeight::BOLD),
+                            font_weight: Some(FontWeight::SEMIBOLD),
                             ..Default::default()
                         },
                     );
@@ -647,6 +647,7 @@ pub fn render_markdown_table(
     header_cells: &[&str],
     body_rows: &[Vec<&str>],
     font_size: f32,
+    font_family: &'static str,
     t: &Theme,
 ) -> AnyElement {
     let col_count = header_cells
@@ -660,7 +661,7 @@ pub fn render_markdown_table(
             .flex()
             .flex_row()
             .items_stretch()
-            .bg(rgba(if is_header { t.bg_secondary } else { t.bg_primary }));
+            .bg(rgba(if is_header { t.bg_sunken } else { t.bg_canvas }));
         if !is_last {
             row = row.border_b_1().border_color(rgba(t.border_color));
         }
@@ -672,7 +673,7 @@ pub fn render_markdown_table(
                 .min_w(px(0.))
                 .px(px(10.))
                 .py(px(6.))
-                .font_family(crate::theme::FONT_TEXT)
+                .font_family(font_family)
                 .text_size(px(font_size - 0.5))
                 .font_weight(if is_header {
                     FontWeight::SEMIBOLD
@@ -715,6 +716,7 @@ pub fn render_markdown_table_line(
     is_first_wrap_row: bool,
     row_height: f32,
     font_size: f32,
+    font_family: &'static str,
     t: &Theme,
 ) -> AnyElement {
     if !is_first_wrap_row {
@@ -744,7 +746,7 @@ pub fn render_markdown_table_line(
                 .border_l_1()
                 .border_r_1()
                 .border_color(rgba(t.border_color))
-                .bg(rgba(if is_header { t.bg_secondary } else { t.bg_primary }));
+                .bg(rgba(if is_header { t.bg_sunken } else { t.bg_canvas }));
             if is_header {
                 row = row.border_t_1().rounded_t(px(6.));
             }
@@ -764,7 +766,7 @@ pub fn render_markdown_table_line(
                     .items_center()
                     .whitespace_nowrap()
                     .overflow_hidden()
-                    .font_family(crate::theme::FONT_TEXT)
+                    .font_family(font_family)
                     .text_size(px(font_size - 0.5))
                     .font_weight(if is_header {
                         FontWeight::SEMIBOLD
@@ -813,6 +815,7 @@ pub fn render_markdown_wrapped_row(
     quote_pos: QuotePos,
     row_height: f32,
     font_size: f32,
+    font_family: &'static str,
     t: &Theme,
     on_toggle_task: Option<Box<dyn Fn(&mut Window, &mut App)>>,
 ) -> AnyElement {
@@ -852,7 +855,7 @@ pub fn render_markdown_wrapped_row(
             .items_center()
             .whitespace_nowrap()
             .overflow_hidden()
-            .bg(rgba(t.bg_secondary))
+            .bg(rgba(t.bg_sunken))
             .font_family(crate::theme::FONT_MONO)
             .text_size(px(font_size - 1.0))
             .text_color(rgba(t.text_primary))
@@ -870,7 +873,7 @@ pub fn render_markdown_wrapped_row(
             .h(px(row_height))
             .flex()
             .items_center()
-            .child(div().w_full().h(px(1.)).bg(rgba(t.chrome_border_color)))
+            .child(div().w_full().h(px(1.)).bg(rgba(t.border_subtle)))
             .into_any_element();
     }
 
@@ -907,9 +910,9 @@ pub fn render_markdown_wrapped_row(
                 .items_center()
                 .whitespace_nowrap()
                 .overflow_hidden()
-                .font_family(crate::theme::FONT_TEXT)
+                .font_family(font_family)
                 .text_size(px(size))
-                .font_weight(FontWeight::BOLD)
+                .font_weight(FontWeight::SEMIBOLD)
                 .text_color(rgba(t.text_primary))
                 .child(render_inline_element(parsed))
                 .into_any_element();
@@ -953,7 +956,7 @@ pub fn render_markdown_wrapped_row(
                     .items_center()
                     .whitespace_nowrap()
                     .overflow_hidden()
-                    .font_family(crate::theme::FONT_TEXT)
+                    .font_family(font_family)
                     .text_size(px(font_size))
                     .text_color(rgba(t.text_secondary))
                     .child(render_inline_element(parsed)),
@@ -1008,12 +1011,12 @@ pub fn render_markdown_wrapped_row(
                 .border_color(rgba(if checked {
                     t.accent
                 } else {
-                    t.component_border_color
+                    t.border_strong
                 }))
                 .bg(rgba(if checked {
                     t.accent
                 } else {
-                    t.bg_secondary
+                    t.bg_sunken
                 }))
                 .flex()
                 .items_center()
@@ -1029,7 +1032,7 @@ pub fn render_markdown_wrapped_row(
                         .data(TODO_CHECK_SVG)
                         .w(px(10.))
                         .h(px(10.))
-                        .text_color(rgba(0xffffffff)),
+                        .text_color(rgba(t.accent_text)),
                 );
             }
             if let Some(toggle) = on_toggle_task {
@@ -1055,7 +1058,7 @@ pub fn render_markdown_wrapped_row(
             .flex_1()
             .whitespace_nowrap()
             .overflow_hidden()
-            .font_family(crate::theme::FONT_TEXT)
+            .font_family(font_family)
             .text_size(px(font_size))
             .text_color(rgba(if checked {
                 t.text_secondary
@@ -1110,7 +1113,7 @@ pub fn render_markdown_wrapped_row(
             .child(
                 div()
                     .flex_shrink_0()
-                    .font_family(crate::theme::FONT_TEXT)
+                    .font_family(font_family)
                     .text_size(px(font_size))
                     .text_color(rgba(if is_first_wrap_row { t.accent } else { 0x00000000 }))
                     .child(num_label),
@@ -1120,7 +1123,7 @@ pub fn render_markdown_wrapped_row(
                     .flex_1()
                     .whitespace_nowrap()
                     .overflow_hidden()
-                    .font_family(crate::theme::FONT_TEXT)
+                    .font_family(font_family)
                     .text_size(px(font_size))
                     .text_color(rgba(t.text_primary))
                     .child(render_inline_element(parsed)),
@@ -1137,7 +1140,7 @@ pub fn render_markdown_wrapped_row(
         .items_center()
         .whitespace_nowrap()
         .overflow_hidden()
-        .font_family(crate::theme::FONT_TEXT)
+        .font_family(font_family)
         .text_size(px(font_size))
         .font_weight(FontWeight::NORMAL)
         .text_color(rgba(t.text_primary))
@@ -1180,7 +1183,7 @@ mod tests {
         assert_eq!(parsed.text, "POST /preview?device_id=X");
         assert_eq!(parsed.highlights.len(), 1);
         let style = parsed.highlights[0].1;
-        assert_eq!(style.font_weight, Some(FontWeight::BOLD));
+        assert_eq!(style.font_weight, Some(FontWeight::SEMIBOLD));
         assert!(style.background_color.is_some());
         assert!(style.color.is_some());
     }

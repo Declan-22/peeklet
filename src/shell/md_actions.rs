@@ -11,7 +11,7 @@ impl RootView {
     /// Wrap or unwrap the current selection (or insert empty delimiters at the
     /// cursor) with inline Markdown markers like `**`, `*`, `~~`, or `` ` ``.
     pub fn md_wrap_inline(&mut self, prefix: &str, suffix: &str, cx: &mut Context<Self>) {
-        self.md_heading_dropdown_open = false;
+        self.set_md_dropdown(None, cx);
         let Some(ed) = self.active_editor_mut() else {
             return;
         };
@@ -74,7 +74,7 @@ impl RootView {
 
     /// Insert or wrap a Markdown link `[label](url)`.
     pub fn md_insert_link(&mut self, cx: &mut Context<Self>) {
-        self.md_heading_dropdown_open = false;
+        self.set_md_dropdown(None, cx);
         let Some(ed) = self.active_editor_mut() else {
             return;
         };
@@ -94,7 +94,7 @@ impl RootView {
     /// Toggle inline code (single line) or a fenced code block (multi-line
     /// selection or empty line).
     pub fn md_toggle_code(&mut self, cx: &mut Context<Self>) {
-        self.md_heading_dropdown_open = false;
+        self.set_md_dropdown(None, cx);
         let is_multiline = self
             .active_editor_mut()
             .and_then(|ed| ed.selected_text())
@@ -108,7 +108,7 @@ impl RootView {
 
     /// Set the current line's heading level (`0` = paragraph, `1..=6` = H1..H6).
     pub fn md_set_heading(&mut self, level: usize, cx: &mut Context<Self>) {
-        self.md_heading_dropdown_open = false;
+        self.set_md_dropdown(None, cx);
         let Some(ed) = self.active_editor_mut() else {
             return;
         };
@@ -154,7 +154,7 @@ impl RootView {
     /// Toggle a line-start prefix (`> `, `- `, or `1. `) on the current line
     /// or all lines covered by the selection.
     pub fn md_toggle_line_prefix(&mut self, prefix: &str, numbered: bool, cx: &mut Context<Self>) {
-        self.md_heading_dropdown_open = false;
+        self.set_md_dropdown(None, cx);
         let Some(ed) = self.active_editor_mut() else {
             return;
         };
@@ -244,7 +244,7 @@ impl RootView {
     /// selected lines. Converts plain `- ` bullets to `- [ ] `, and strips
     /// `- [ ] ` / `- [x] ` when all selected lines are already tasks.
     pub fn md_toggle_task_list(&mut self, cx: &mut Context<Self>) {
-        self.md_heading_dropdown_open = false;
+        self.set_md_dropdown(None, cx);
         let Some(ed) = self.active_editor_mut() else {
             return;
         };

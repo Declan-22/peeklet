@@ -33,7 +33,7 @@ impl RootView {
                         .text_color(rgba(t.text_secondary))
                         .child(label),
                 )
-                .child(div().flex_1().h(px(1.)).bg(rgba(t.chrome_border_color)))
+                .child(div().flex_1().h(px(1.)).bg(rgba(t.border_subtle)))
         };
 
         let action_button = |id: &'static str, icon: &'static [u8], label: &'static str| {
@@ -48,7 +48,7 @@ impl RootView {
                 .px(px(6.))
                 .rounded(px(6.))
                 .cursor_pointer()
-                .hover(|s| s.bg(rgba(t.menu_hover_bg)))
+                .hover(|s| s.bg(rgba(t.bg_hover)))
                 .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                     let root = root.clone();
                     cx.spawn(async move |cx| {
@@ -92,7 +92,7 @@ impl RootView {
             .items_center()
             .justify_center()
             .overflow_hidden()
-            .bg(rgba(t.bg_primary))
+            .bg(rgba(t.bg_canvas))
             .child(
                 div()
                     .w_full()
@@ -132,7 +132,7 @@ impl RootView {
                                     .rounded(px(6.))
                                     .cursor_pointer()
                                     .overflow_hidden()
-                                    .hover(|s| s.bg(rgba(t.menu_hover_bg)))
+                                    .hover(|s| s.bg(rgba(t.bg_hover)))
                                     .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                                         let _ = root.update(cx, |root, cx| {
                                             root.open_file_path(path.clone(), cx);

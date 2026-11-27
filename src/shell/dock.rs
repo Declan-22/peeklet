@@ -64,8 +64,8 @@ impl DockView {
                     .justify_center()
                     .rounded(px(5.))
                     .border_1()
-                    .border_color(rgba(t.chrome_border_color))
-                    .bg(rgba(t.bg_secondary))
+                    .border_color(rgba(t.border_subtle))
+                    .bg(rgba(t.bg_sunken))
                     .child(
                         div()
                             .w(px(thumb_width.min(208.)))
@@ -142,7 +142,7 @@ impl DockView {
                         .text_sm()
                         .font_weight(WEIGHT_MEDIUM)
                         .text_color(rgba(t.text_secondary))
-                        .hover(|s| s.bg(rgba(t.menu_hover_bg)))
+                        .hover(|s| s.bg(rgba(t.bg_hover)))
                         .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                             // Mouse handlers run while the view tree is still
                             // borrowed. Queue the action so the native picker
@@ -206,7 +206,7 @@ fn project_row(root: WeakEntity<RootView>, entry: ProjectEntry, t: crate::theme:
         .text_color(rgba(t.text_secondary))
         .whitespace_nowrap()
         .overflow_hidden()
-        .hover(|s| s.bg(rgba(t.menu_hover_bg)))
+        .hover(|s| s.bg(rgba(t.bg_hover)))
         .on_mouse_down(MouseButton::Left, move |_, _, cx| {
             let _ = root.update(cx, |root, cx| {
                 if is_dir {
@@ -217,7 +217,7 @@ fn project_row(root: WeakEntity<RootView>, entry: ProjectEntry, t: crate::theme:
             });
             cx.stop_propagation();
         })
-        .child(div().w(px(10.)).text_color(rgba(t.empty_text_secondary)).child(marker))
+        .child(div().w(px(10.)).text_color(rgba(t.text_faint)).child(marker))
         .child(entry.name)
         .into_any_element()
 }
@@ -261,12 +261,12 @@ impl gpui::RenderOnce for DockView {
             .flex_col()
             .overflow_hidden()
             .bg(rgba(if side == DockSide::Left {
-                t.bg_primary
+                t.bg_canvas
             } else {
-                t.bg_secondary
+                t.bg_sunken
             }))
             // 1px separator where the dock meets the tab bar / manuscript.
-            .border_color(rgba(t.chrome_border_color))
+            .border_color(rgba(t.border_subtle))
             .when(side == DockSide::Left, |p| p.border_r_1())
             .when(side == DockSide::Right, |p| p.border_l_1())
             .when_some(self.header, |panel, header| panel.child(header))

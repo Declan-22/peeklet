@@ -97,6 +97,47 @@ pub enum MarkdownViewMode {
     Stacked,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MarkdownFont {
+    Sans,
+    Serif,
+    Mono,
+}
+
+impl MarkdownFont {
+    pub fn family(self) -> &'static str {
+        match self {
+            Self::Sans => crate::theme::FONT_TEXT,
+            Self::Serif => crate::theme::FONT_SERIF,
+            Self::Mono => crate::theme::FONT_MONO,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Sans => "Sans",
+            Self::Serif => "Serif",
+            Self::Mono => "Mono",
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sans => "sans",
+            Self::Serif => "serif",
+            Self::Mono => "mono",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "serif" => Self::Serif,
+            "mono" => Self::Mono,
+            _ => Self::Sans,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ViewerKind {
     Text,
@@ -246,12 +287,14 @@ fn measure_text(
     color: Hsla,
     size: f32,
     weight: FontWeight,
-    mono: bool,
+    font_family: &'static str,
 ) -> f32 {
     if text.is_empty() {
         return 0.0;
     }
-    shape_row(window, text, color, size, weight, mono).width().as_f32()
+    shape_row(window, text, color, size, weight, font_family)
+        .width()
+        .as_f32()
 }
 
 /// Shape one preview run. Callers split edges from the returned layout
@@ -262,10 +305,10 @@ fn shape_row(
     color: Hsla,
     size: f32,
     weight: FontWeight,
-    mono: bool,
+    font_family: &'static str,
 ) -> ShapedLine {
     let font = Font {
-        family: (if mono { crate::theme::FONT_MONO } else { crate::theme::FONT_TEXT }).into(),
+        family: font_family.into(),
         features: FontFeatures::default(),
         fallbacks: None,
         weight,
@@ -464,6 +507,8 @@ pub struct RootView {
     pub windows_open_with: bool,
     /// Active view mode for Markdown files (Plain, Split, or Stacked).
     pub markdown_mode: MarkdownViewMode,
+    /// Selected font style for Markdown files (Sans, Serif, or Mono).
+    pub md_font: MarkdownFont,
     /// Whether SVG Split View (code + live SVG preview) is enabled.
     pub svg_split_view: bool,
     /// Cached prepared SVG preview keyed by `(tab_id, editor_version, text_primary)`.
@@ -472,12 +517,26 @@ pub struct RootView {
     md_split_ratio: f32,
     /// True while dragging the Markdown Split view divider.
     md_split_dragging: bool,
-    /// True while the Markdown heading dropdown menu in the toolbar is open.
-    pub md_heading_dropdown_open: bool,
-    /// Cached printable-ASCII glyph widths for O(N) zero-shaping line wrapping
-    /// while resizing the sidebar or split divider on large wrapped files.
-    ascii_char_widths: Option<[f32; 128]>,
-    ascii_max_width: f32,
+    /// Currently open Markdown toolbar dropdown (`Some(0)` = font, `Some(1)` = heading).
+    pub md_dropdown: Option<u8>,
+    /// Dropdown currently being rendered (stays `Some` while fading out).
+    pub md_dropdown_display: Option<u8>,
+    /// Open/close fade progress in `0.0..=1.0` (matches `ink_popup_progress`).
+    pub md_dropdown_progress: f32,
+    md_dropdown_animating: bool,
+    /// Toolbar button ID currently hovered for delayed tooltip display.
+    pub toolbar_tooltip_hover: Option<&'static str>,
+    /// Toolbar button ID whose tooltip is logically open (target opacity 1.0).
+    pub toolbar_tooltip_visible: Option<&'static str>,
+    /// Toolbar button ID currently rendered (stays `Some` while fading out).
+    pub toolbar_tooltip_display: Option<&'static str>,
+    /// Tooltip fade-in / fade-out opacity in `0.0..=1.0`.
+    pub toolbar_tooltip_progress: f32,
+    toolbar_tooltip_animating: bool,
+    toolbar_tooltip_gen: u64,
+    /// Cached printable-ASCII glyph widths per font family for O(N) zero-shaping
+    /// line wrapping while resizing the sidebar or split divider on large wrapped files.
+    ascii_char_widths: HashMap<&'static str, ([f32; 128], f32)>,
     pub active_menu: Option<usize>,
     pub menu_animation: f32,
     pub icon_animation: f32,
@@ -563,6 +622,11 @@ impl RootView {
         let line_numbers = store.get("editor.line_numbers").map(|v| v == "true").unwrap_or(true);
         let syntax_highlighting = store.get("editor.syntax_highlighting").map(|v| v == "true").unwrap_or(true);
         let windows_open_with = store.get("windows.open_with").as_deref() != Some("disabled");
+        let md_font = store
+            .get("markdown.font")
+            .as_deref()
+            .map(MarkdownFont::from_str)
+            .unwrap_or(MarkdownFont::Sans);
         let project_root = None;
         let project_expanded = HashSet::new();
 
@@ -660,13 +724,22 @@ impl RootView {
             syntax_highlighting,
             windows_open_with,
             markdown_mode: MarkdownViewMode::Plain,
+            md_font,
             svg_split_view: true,
             svg_preview_cache: None,
             md_split_ratio: 0.5,
             md_split_dragging: false,
-            md_heading_dropdown_open: false,
-            ascii_char_widths: None,
-            ascii_max_width: 0.0,
+            md_dropdown: None,
+            md_dropdown_display: None,
+            md_dropdown_progress: 0.0,
+            md_dropdown_animating: false,
+            toolbar_tooltip_hover: None,
+            toolbar_tooltip_visible: None,
+            toolbar_tooltip_display: None,
+            toolbar_tooltip_progress: 0.0,
+            toolbar_tooltip_animating: false,
+            toolbar_tooltip_gen: 0,
+            ascii_char_widths: HashMap::new(),
             active_menu: None,
             menu_animation: 0.0,
             icon_animation: 0.0,
@@ -956,8 +1029,78 @@ impl RootView {
         (self.caret_blink_epoch.elapsed().as_millis() / HALF_PERIOD_MS) % 2 == 0
     }
 
+    /// Switch the active image-toolbar tool via keyboard shortcut (`1`–`6`).
+    fn select_image_tool(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.set_toolbar_tooltip_hover(None, cx);
+        if index == 5 {
+            if self.image_toolbar_tool == 5 {
+                self.cancel_image_crop(cx);
+            } else {
+                self.begin_image_crop(cx);
+            }
+        } else {
+            if self.image_toolbar_tool == 5 {
+                self.cancel_image_crop(cx);
+            }
+            self.image_toolbar_tool = index;
+            self.set_ink_popup(None, cx);
+        }
+        self.image_shapes_dropdown_open = false;
+        cx.notify();
+    }
+
     fn handle_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let mods = &ev.keystroke.modifiers;
+        // Image viewer tool shortcuts (`1`–`6`, plus `Escape` / `Enter` in crop mode).
+        if self.active_is_image() && !self.settings_open && self.close_confirm.is_none() {
+            let no_mods = !mods.control && !mods.platform && !mods.alt && !mods.shift;
+            if no_mods {
+                match ev.keystroke.key.as_str() {
+                    "1" => {
+                        self.select_image_tool(0, cx);
+                        return;
+                    }
+                    "2" => {
+                        self.select_image_tool(1, cx);
+                        return;
+                    }
+                    "3" => {
+                        self.select_image_tool(2, cx);
+                        return;
+                    }
+                    "4" => {
+                        self.select_image_tool(3, cx);
+                        return;
+                    }
+                    "5" => {
+                        self.select_image_tool(4, cx);
+                        return;
+                    }
+                    "6" => {
+                        self.select_image_tool(5, cx);
+                        return;
+                    }
+                    "escape" => {
+                        if self.image_toolbar_tool == 5 {
+                            self.cancel_image_crop(cx);
+                        } else {
+                            self.set_ink_popup(None, cx);
+                            if self.image_shapes_dropdown_open {
+                                self.image_shapes_dropdown_open = false;
+                                cx.notify();
+                            }
+                        }
+                        return;
+                    }
+                    "enter" if self.image_toolbar_tool == 5 => {
+                        self.save_image_crop(cx);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            return;
+        }
         // Clipboard + select-all chords bypass the buffer entirely.
         if (mods.control || mods.platform) && !mods.alt {
             match ev.keystroke.key.as_str() {
@@ -1026,8 +1169,20 @@ impl RootView {
                     self.md_toggle_code(cx);
                     return;
                 }
-                "x" if self.active_is_markdown() && mods.shift => {
+                "s" | "x" if self.active_is_markdown() && mods.shift => {
                     self.md_wrap_inline("~~", "~~", cx);
+                    return;
+                }
+                "7" | "&" if self.active_is_markdown() && mods.shift => {
+                    self.md_toggle_line_prefix("1. ", true, cx);
+                    return;
+                }
+                "8" | "*" if self.active_is_markdown() && mods.shift => {
+                    self.md_toggle_line_prefix("- ", false, cx);
+                    return;
+                }
+                "9" | "(" if self.active_is_markdown() && mods.shift => {
+                    self.md_toggle_task_list(cx);
                     return;
                 }
                 "l" if self.active_is_markdown() && !mods.shift => {
@@ -1118,11 +1273,11 @@ impl RootView {
 
     /// Vertical movement by visual (wrapped) row, preserving pixel x.
     fn move_visual(&mut self, dir: i32, extend: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab_id) = self
+        let Some((tab_id, font_family)) = self
             .tabs
             .get(self.active_tab)
             .filter(|tab| tab.title != "Welcome")
-            .map(|tab| tab.id)
+            .map(|tab| (tab.id, self.font_family_for_path(tab.path.as_deref())))
         else {
             return;
         };
@@ -1137,7 +1292,7 @@ impl RootView {
             let text = ed.line_text(line);
             let size = PREVIEW_FONT_SIZE;
             let weight = FontWeight::NORMAL;
-            let mut w = |s: &str| measure_text(window, s, color, size, weight, false);
+            let mut w = |s: &str| measure_text(window, s, color, size, weight, font_family);
             rows.extend(
                 crate::editor::wrap_line(line, &text, geo.measure, &mut w)
                     .into_iter()
@@ -1167,7 +1322,7 @@ impl RootView {
         let x = if row_slice.is_empty() {
             0.0
         } else {
-            shape_row(window, row_slice, color, size, weight, false)
+            shape_row(window, row_slice, color, size, weight, font_family)
                 .x_for_index(rel.min(row_slice.len()))
                 .as_f32()
         };
@@ -1177,7 +1332,7 @@ impl RootView {
         let lo = if target_slice.is_empty() || x <= 0.0 {
             0
         } else {
-            shape_row(window, target_slice, color, target_size, target_weight, false)
+            shape_row(window, target_slice, color, target_size, target_weight, font_family)
                 .closest_index_for_x(px(x))
         };
         ed.set_cursor_line_byte(target_row.buffer_line, target_row.start_byte + lo, extend);
@@ -1313,6 +1468,11 @@ impl RootView {
         // more rows below the pointer.
         let y_view = y_win - TOP_BAR_HEIGHT - TOOLBAR_HEIGHT;
         let view_h = Self::viewport_h(window);
+        let font_family = self.font_family_for_path(
+            self.tabs
+                .get(self.active_tab)
+                .and_then(|tab| tab.path.as_deref()),
+        );
         let ed = self.editors.entry(tab_id).or_insert_with(EditorState::new);
         let (buffer_line, row_start, row_end) = if geo.measure == f32::MAX {
             // Unwrapped: visual rows map 1-to-1 to buffer lines in O(1).
@@ -1356,7 +1516,7 @@ impl RootView {
         let byte = if row_slice.is_empty() || x_text <= 0.0 {
             0
         } else {
-            shape_row(window, row_slice, color, PREVIEW_FONT_SIZE, FontWeight::NORMAL, false)
+            shape_row(window, row_slice, color, PREVIEW_FONT_SIZE, FontWeight::NORMAL, font_family)
                 .closest_index_for_x(px(x_text))
         };
         let old_cursor = ed.cursor();
@@ -1511,6 +1671,152 @@ impl RootView {
     pub fn toggle_settings(&mut self, cx: &mut Context<Self>) {
         self.settings_open = !self.settings_open;
         cx.notify();
+    }
+
+    pub fn font_family_for_path(&self, path: Option<&str>) -> &'static str {
+        match path {
+            Some(p) if is_code_path(p) => crate::theme::FONT_MONO,
+            Some(p) if markdown::is_markdown_path(p) => self.md_font.family(),
+            _ => crate::theme::FONT_TEXT,
+        }
+    }
+
+    pub fn set_md_font(&mut self, font: MarkdownFont, cx: &mut Context<Self>) {
+        self.md_font = font;
+        self.set_md_dropdown(None, cx);
+        self.store.set("markdown.font", font.as_str());
+        self.editor_version = self.editor_version.wrapping_add(1);
+        cx.notify();
+    }
+
+    /// Track toolbar button hover and fade its anchored tooltip in after a short delay.
+    pub fn set_toolbar_tooltip_hover(
+        &mut self,
+        id: Option<&'static str>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.toolbar_tooltip_hover == id {
+            return;
+        }
+        self.toolbar_tooltip_hover = id;
+        self.toolbar_tooltip_gen = self.toolbar_tooltip_gen.wrapping_add(1);
+        let epoch = self.toolbar_tooltip_gen;
+        if self.toolbar_tooltip_visible.is_some() {
+            self.toolbar_tooltip_visible = None;
+            self.animate_toolbar_tooltip(cx);
+        }
+        if let Some(target_id) = id {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(450))
+                    .await;
+                let _ = this.update(cx, |root, cx| {
+                    if root.toolbar_tooltip_gen == epoch
+                        && root.toolbar_tooltip_hover == Some(target_id)
+                    {
+                        if root.toolbar_tooltip_display != Some(target_id) {
+                            root.toolbar_tooltip_display = Some(target_id);
+                            root.toolbar_tooltip_progress = 0.0;
+                        }
+                        root.toolbar_tooltip_visible = Some(target_id);
+                        root.animate_toolbar_tooltip(cx);
+                    }
+                });
+            })
+            .detach();
+        }
+    }
+
+    fn animate_toolbar_tooltip(&mut self, cx: &mut Context<Self>) {
+        if self.toolbar_tooltip_animating {
+            cx.notify();
+            return;
+        }
+        self.toolbar_tooltip_animating = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(12))
+                    .await;
+                let mut done = false;
+                let alive = this
+                    .update(cx, |root, cx| {
+                        let target = if root.toolbar_tooltip_visible.is_some() {
+                            1.0
+                        } else {
+                            0.0
+                        };
+                        let delta = target - root.toolbar_tooltip_progress;
+                        if delta.abs() < 0.01 {
+                            root.toolbar_tooltip_progress = target;
+                            if target == 0.0 {
+                                root.toolbar_tooltip_display = None;
+                            }
+                            root.toolbar_tooltip_animating = false;
+                            done = true;
+                        } else {
+                            root.toolbar_tooltip_progress += delta * 0.30;
+                        }
+                        cx.notify();
+                    })
+                    .is_ok();
+                if !alive || done {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Open or close a Markdown toolbar dropdown (`Some(0)` = font, `Some(1)` = heading)
+    /// with the same smooth fade transition as the stroke editor popup.
+    pub fn set_md_dropdown(&mut self, next: Option<u8>, cx: &mut Context<Self>) {
+        if self.md_dropdown == next {
+            return;
+        }
+        self.md_dropdown = next;
+        if let Some(which) = next {
+            if self.md_dropdown_display != Some(which) {
+                self.md_dropdown_display = Some(which);
+                self.md_dropdown_progress = 0.0;
+            }
+        }
+        if self.md_dropdown_animating {
+            cx.notify();
+            return;
+        }
+        self.md_dropdown_animating = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(12))
+                    .await;
+                let mut done = false;
+                let alive = this
+                    .update(cx, |root, cx| {
+                        let target = if root.md_dropdown.is_some() { 1.0 } else { 0.0 };
+                        let delta = target - root.md_dropdown_progress;
+                        if delta.abs() < 0.01 {
+                            root.md_dropdown_progress = target;
+                            if target == 0.0 {
+                                root.md_dropdown_display = None;
+                            }
+                            root.md_dropdown_animating = false;
+                            done = true;
+                        } else {
+                            root.md_dropdown_progress += delta * 0.30;
+                        }
+                        cx.notify();
+                    })
+                    .is_ok();
+                if !alive || done {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     pub fn set_wrap_text_files(&mut self, value: bool, cx: &mut Context<Self>) {
@@ -1833,7 +2139,7 @@ impl RootView {
         } else {
             target
         };
-        self.md_heading_dropdown_open = false;
+        self.set_md_dropdown(None, cx);
         self.cached_wrap_key = (usize::MAX, 0, 0);
         cx.notify();
     }
@@ -2848,7 +3154,13 @@ impl RootView {
                             primary_hsla,
                             PREVIEW_FONT_SIZE,
                             FontWeight::NORMAL,
-                            false,
+                            if is_code {
+                                crate::theme::FONT_MONO
+                            } else if is_markdown {
+                                self.md_font.family()
+                            } else {
+                                crate::theme::FONT_TEXT
+                            },
                         ))
                     };
                     let caret = if needs_caret {
@@ -2932,6 +3244,7 @@ impl RootView {
                             &header_cells,
                             &body_cells,
                             PREVIEW_FONT_SIZE,
+                            self.md_font.family(),
                             &t,
                         ));
                         while idx < visible_rows.len() && visible_rows[idx].buffer_line <= end_line {
@@ -2947,6 +3260,7 @@ impl RootView {
                             row.is_first_wrap_row,
                             PREVIEW_LINE_HEIGHT,
                             PREVIEW_FONT_SIZE,
+                            self.md_font.family(),
                             &t,
                         ));
                         idx += 1;
@@ -2987,6 +3301,7 @@ impl RootView {
                     q_pos,
                     PREVIEW_LINE_HEIGHT,
                     PREVIEW_FONT_SIZE,
+                    self.md_font.family(),
                     &t,
                     task_cb,
                 ));
@@ -3005,7 +3320,7 @@ impl RootView {
             .items_center()
             .relative()
             .overflow_hidden()
-            .bg(rgba(t.bg_primary))
+            .bg(rgba(t.bg_canvas))
             .cursor_text()
             .child(
                 div()
@@ -3015,7 +3330,6 @@ impl RootView {
                     .flex_1()
                     .min_h(px(0.))
                     .overflow_hidden()
-                    .track_focus(&focus)
                     .on_mouse_down(MouseButton::Left, {
                         let root = root.clone();
                         let fh = focus.clone();
@@ -3062,9 +3376,6 @@ impl RootView {
                             }
                         },
                     ))
-                    .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
-                        this.handle_key(ev, window, cx);
-                    }))
                     .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, window, cx| {
                         this.handle_wheel(ev, window, cx);
                     }))
@@ -3143,6 +3454,7 @@ impl RootView {
                                                     row.is_first_wrap_row,
                                                     PREVIEW_LINE_HEIGHT,
                                                     PREVIEW_FONT_SIZE,
+                                                    self.md_font.family(),
                                                     &t,
                                                 );
                                             }
@@ -3182,6 +3494,7 @@ impl RootView {
                                                 q_pos,
                                                 PREVIEW_LINE_HEIGHT,
                                                 PREVIEW_FONT_SIZE,
+                                                self.md_font.family(),
                                                 &t,
                                                 task_cb,
                                             );
@@ -3202,11 +3515,16 @@ impl RootView {
                                             .items_center()
                                             .whitespace_nowrap()
                                             .overflow_hidden()
-                                            .font_family(crate::theme::FONT_TEXT)
+                                            .font_family(if is_code {
+                                                crate::theme::FONT_MONO
+                                            } else if is_markdown {
+                                                self.md_font.family()
+                                            } else {
+                                                crate::theme::FONT_TEXT
+                                            })
                                             .text_size(px(PREVIEW_FONT_SIZE))
                                             .font_weight(FontWeight::NORMAL)
                                             .text_color(rgba(t.text_primary))
-                                            .child(styled)
                                             .when_some(row.sel_px, |r, range| {
                                                 let (x0, x1) = range;
                                                 r.child(
@@ -3219,6 +3537,7 @@ impl RootView {
                                                         .bg(rgba(t.selection)),
                                                 )
                                             })
+                                            .child(styled)
                                             .when_some(
                                                 row.caret.filter(|_| show_caret),
                                                 |r, (x, h)| {
@@ -3283,7 +3602,7 @@ impl RootView {
                                             div()
                                                 .w(px(1.))
                                                 .h_full()
-                                                .bg(rgba(t.chrome_border_color)),
+                                                .bg(rgba(t.border_subtle)),
                                         ),
                                 )
                             })
@@ -3452,7 +3771,7 @@ impl RootView {
                                 div()
                                     .w(px(1.))
                                     .h_full()
-                                    .bg(rgba(t.chrome_border_color)),
+                                    .bg(rgba(t.border_subtle)),
                             ),
                     )
                 })
@@ -3529,11 +3848,17 @@ impl Render for RootView {
                     )
             })
             .map(|tab| tab.id);
+        let active_font_family = self.font_family_for_path(
+            self.tabs
+                .get(self.active_tab)
+                .and_then(|tab| tab.path.as_deref()),
+        );
         let measure_bits = geo.measure.to_bits();
         let wrap_key = (self.active_tab, self.editor_version, measure_bits);
-        // Populate the printable-ASCII glyph width LUT once so wrapping and
-        // unwrapped horizontal scroll bounds run with zero per-line font shaping.
-        if active_text_tab_id.is_some() && self.ascii_char_widths.is_none() {
+        // Populate the printable-ASCII glyph width LUT once per font family
+        // so wrapping and unwrapped horizontal scroll bounds run with zero per-line shaping.
+        if active_text_tab_id.is_some() && !self.ascii_char_widths.contains_key(active_font_family)
+        {
             let color = Hsla::from(rgba(t.text_primary));
             let mut lut = [0.0f32; 128];
             let mut max_w = 0.0f32;
@@ -3541,16 +3866,29 @@ impl Render for RootView {
             for b in 32u8..=126u8 {
                 buf[0] = b;
                 let s = std::str::from_utf8(&buf).unwrap();
-                let w = measure_text(window, s, color, PREVIEW_FONT_SIZE, FontWeight::NORMAL, false);
+                let w = measure_text(
+                    window,
+                    s,
+                    color,
+                    PREVIEW_FONT_SIZE,
+                    FontWeight::NORMAL,
+                    active_font_family,
+                );
                 lut[b as usize] = w;
                 if w > max_w {
                     max_w = w;
                 }
             }
             lut[b'\t' as usize] = lut[b' ' as usize] * 4.0;
-            self.ascii_char_widths = Some(lut);
-            self.ascii_max_width = max_w.max(1.0);
+            self.ascii_char_widths
+                .insert(active_font_family, (lut, max_w.max(1.0)));
         }
+
+        let (active_lut, active_max_w) = self
+            .ascii_char_widths
+            .get(active_font_family)
+            .copied()
+            .unwrap_or(([8.0; 128], 8.0));
 
         let wrap_cache: Option<Rc<EditorWrapCache>> =
             if active_text_tab_id.is_none() || geo.measure == f32::MAX {
@@ -3559,8 +3897,8 @@ impl Render for RootView {
                 self.cached_wrap.clone()
             } else {
                 let color = Hsla::from(rgba(t.text_primary));
-                let lut = self.ascii_char_widths.unwrap_or([8.0; 128]);
-                let max_w = self.ascii_max_width;
+                let lut = active_lut;
+                let max_w = active_max_w;
 
             let built = active_text_tab_id.map(|id| {
                 let ed = self.editors.entry(id).or_insert_with(EditorState::new);
@@ -3582,7 +3920,14 @@ impl Render for RootView {
                         }
                     } else {
                         let mut width_of = |s: &str| {
-                            measure_text(window, s, color, PREVIEW_FONT_SIZE, FontWeight::NORMAL, false)
+                            measure_text(
+                                window,
+                                s,
+                                color,
+                                PREVIEW_FONT_SIZE,
+                                FontWeight::NORMAL,
+                                active_font_family,
+                            )
                         };
                         for row in crate::editor::wrap_line(line_no, &text, geo.measure, &mut width_of) {
                             rows.push((row.buffer_line, row.start_byte, row.end_byte));
@@ -3602,7 +3947,7 @@ impl Render for RootView {
                 let max_key = (self.active_tab, self.editor_version);
                 if self.cached_max_line_key != max_key {
                     let ed = self.editors.entry(id).or_insert_with(EditorState::new);
-                    let lut = self.ascii_char_widths.unwrap_or([8.0; 128]);
+                    let lut = active_lut;
                     let mut widest = 0.0f32;
                     for line_no in 0..ed.len_lines() {
                         let text = ed.line_text(line_no);
@@ -3645,9 +3990,9 @@ impl Render for RootView {
             header: Some(
                 div()
                     .h(px(TOP_BAR_HEIGHT))
-                    .bg(rgba(t.bg_primary))
+                    .bg(rgba(t.bg_canvas))
                     .border_b_1()
-                    .border_color(rgba(t.chrome_border_color))
+                    .border_color(rgba(t.border_subtle))
                     .into_any_element(),
             ),
             footer: Some(SidebarBottomBar { root: root.clone() }.into_any_element()),
@@ -3655,12 +4000,16 @@ impl Render for RootView {
 
         div()
             .id("root")
+            .track_focus(&self.focus)
             .size_full()
             .flex()
             .flex_col()
             .font_weight(FontWeight::NORMAL)
-            .bg(rgba(t.bg_primary))
+            .bg(rgba(t.bg_canvas))
             .text_color(rgba(t.text_primary))
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                this.handle_key(ev, window, cx);
+            }))
             // Track drags across the entire window (including over the top and
             // bottom bars) so scrollbar/split/sidebar drags never stall until
             // the left button is actually released.
@@ -3702,10 +4051,7 @@ impl Render for RootView {
                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                         this.close_menu(cx);
                         this.set_ink_popup(None, cx);
-                        if this.md_heading_dropdown_open {
-                            this.md_heading_dropdown_open = false;
-                            cx.notify();
-                        }
+                        this.set_md_dropdown(None, cx);
                     }))
                     .child(
                         div()
@@ -3734,7 +4080,7 @@ impl Render for RootView {
                         .bottom(px(0.))
                         .left(px(0.))
                         .w(px(sidebar_width))
-                        .bg(rgba(t.bg_primary))
+                        .bg(rgba(t.bg_canvas))
                         .child(dock),
                 )
             })
@@ -3806,7 +4152,7 @@ impl Render for RootView {
                         .child(
                             div()
                                 .w(px(420.)).rounded(px(20.))
-                                .bg(rgba(t.bg_primary)).border_1().border_color(rgba(t.chrome_border_color))
+                                .bg(rgba(t.bg_canvas)).border_1().border_color(rgba(t.border_subtle))
                                 .p(px(10.)).flex().flex_col().gap(px(8.))
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .child(div().child(format!("Do you want to save changes to \"{}\"?", file_name)))
@@ -3872,9 +4218,9 @@ impl Render for RootView {
                                     .w(px(620.))
                                     .h(px(410.))
                                     .rounded(px(12.))
-                                    .bg(rgba(t.bg_primary))
+                                    .bg(rgba(t.bg_canvas))
                                     .border_1()
-                                    .border_color(rgba(t.component_border_color))
+                                    .border_color(rgba(t.border_strong))
                                     .shadow(vec![t.shadow_lg()])
                                     .flex()
                                     .flex_row()
@@ -3884,9 +4230,9 @@ impl Render for RootView {
                                         div()
                                             .w(px(168.))
                                             .h_full()
-                                            .bg(rgba(t.bg_secondary))
+                                            .bg(rgba(t.bg_sunken))
                                             .border_r_1()
-                                            .border_color(rgba(t.chrome_border_color))
+                                            .border_color(rgba(t.border_subtle))
                                             .flex()
                                             .flex_col()
                                             .p(px(12.))
@@ -3897,7 +4243,7 @@ impl Render for RootView {
                                                     .pb(px(6.))
                                                     .text_xs()
                                                     .font_weight(WEIGHT_MEDIUM)
-                                                    .text_color(rgba(t.empty_text_secondary))
+                                                    .text_color(rgba(t.text_faint))
                                                     .child("Settings"),
                                             )
                                             .child(settings_tab_button(t, shell.clone(), 0, "General", tab == 0))
@@ -3914,7 +4260,7 @@ impl Render for RootView {
                                                     .px(px(20.))
                                                     .py(px(14.))
                                                     .border_b_1()
-                                                    .border_color(rgba(t.chrome_border_color))
+                                                    .border_color(rgba(t.border_subtle))
                                                     .flex()
                                                     .flex_row()
                                                     .items_center()
@@ -3938,7 +4284,7 @@ impl Render for RootView {
                                                             .cursor_pointer()
                                                             .text_sm()
                                                             .text_color(rgba(t.text_secondary))
-                                                            .hover(|s| s.bg(rgba(t.bg_darker)).text_color(rgba(t.text_primary)))
+                                                            .hover(|s| s.bg(rgba(t.bg_hover)).text_color(rgba(t.text_primary)))
                                                             .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                                                                 let _ = shell_close.update(cx, |root, cx| {
                                                                     root.settings_open = false;
@@ -3989,7 +4335,7 @@ impl Render for RootView {
                                                                     div()
                                                                         .p(px(2.))
                                                                         .rounded(px(8.))
-                                                                        .bg(rgba(t.bg_secondary))
+                                                                        .bg(rgba(t.bg_sunken))
                                                                         .border_1()
                                                                         .border_color(rgba(t.border_color))
                                                                         .flex()
@@ -4004,7 +4350,7 @@ impl Render for RootView {
                                                                                 .cursor_pointer()
                                                                                 .text_xs()
                                                                                 .font_weight(WEIGHT_MEDIUM)
-                                                                                .bg(rgba(if !is_dark { t.bg_primary } else { 0x00000000 }))
+                                                                                .bg(rgba(if !is_dark { t.bg_canvas } else { 0x00000000 }))
                                                                                 .text_color(rgba(if !is_dark { t.text_primary } else { t.text_secondary }))
                                                                                 .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                                                                                     crate::theme::state::set_mode(ThemeMode::Light, cx);
@@ -4024,7 +4370,7 @@ impl Render for RootView {
                                                                                 .cursor_pointer()
                                                                                 .text_xs()
                                                                                 .font_weight(WEIGHT_MEDIUM)
-                                                                                .bg(rgba(if is_dark { t.bg_primary } else { 0x00000000 }))
+                                                                                .bg(rgba(if is_dark { t.bg_canvas } else { 0x00000000 }))
                                                                                 .text_color(rgba(if is_dark { t.text_primary } else { t.text_secondary }))
                                                                                 .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                                                                                     crate::theme::state::set_mode(ThemeMode::Dark, cx);

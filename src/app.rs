@@ -94,8 +94,12 @@ pub fn run() {
 
 fn load_fonts(cx: &mut App) {
     let fonts: Vec<Cow<'static, [u8]>> = vec![
-        Cow::Borrowed(include_bytes!("../assets/fonts/Geist-VariableFont_wght.ttf")),
-        Cow::Borrowed(include_bytes!("../assets/fonts/PaperMono-Regular.ttf")),
+        Cow::Borrowed(include_bytes!("../assets/fonts/GoogleSansFlex-VariableFont.ttf")),
+        Cow::Borrowed(include_bytes!("../assets/fonts/GeistMono-Regular.ttf")),
+        Cow::Borrowed(include_bytes!("../assets/fonts/LibreBaskerville-VariableFont.ttf")),
+        Cow::Borrowed(include_bytes!(
+            "../assets/fonts/LibreBaskerville-Italic-VariableFont.ttf"
+        )),
     ];
     cx.text_system()
         .add_fonts(fonts)
